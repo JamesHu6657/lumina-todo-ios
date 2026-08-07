@@ -1304,7 +1304,7 @@ function render(){
   sortNote.textContent = history
     ? "按完成时间倒序"
     : sortable
-      ? (isTouchUi ? "长按左侧手柄可排序" : "拖动手柄可排序")
+      ? (isTouchUi ? "长按手柄可排序" : "拖动手柄可排序")
       : "筛选中，排序已锁定";
 
   if (history) renderHistoryStat(visible);

@@ -46,7 +46,7 @@
   /* ---- status sort hint ---- */
   function fixSortHint() {
     const note = document.getElementById("sortNote");
-    if (note && isTouch) note.textContent = "长按左侧手柄可排序";
+    if (note && isTouch) note.textContent = "长按手柄可排序";
   }
 
   /* ---- undo title ---- */
@@ -276,15 +276,65 @@
     };
   }
 
-  /* ---- chat keyboard ---- */
+  /* ---- keyboard: keep focused fields above soft keyboard ---- */
+  function focusScrollIntoView(el) {
+    if (!el || el.disabled) return;
+    // 等键盘/visualViewport 稳定后再滚
+    const run = () => {
+      try {
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch {
+        el.scrollIntoView(true);
+      }
+    };
+    setTimeout(run, 120);
+    setTimeout(run, 320);
+  }
   function chatKeyboard() {
     const input = document.getElementById("chatInput");
-    if (!input) return;
-    input.addEventListener("focus", () => {
-      setTimeout(() => {
-        input.scrollIntoView({ block: "center", behavior: "smooth" });
-      }, 300);
-    });
+    if (!input || input._luminaFocusScroll) return;
+    input._luminaFocusScroll = true;
+    input.addEventListener("focus", () => focusScrollIntoView(input));
+  }
+  function mainFieldKeyboard() {
+    const bind = (el) => {
+      if (!el || el._luminaFocusScroll) return;
+      el._luminaFocusScroll = true;
+      el.addEventListener("focus", () => focusScrollIntoView(el));
+    };
+    bind(document.getElementById("todoInput"));
+    bind(document.getElementById("searchInput"));
+    // 行内编辑框是模板克隆，用捕获一次绑定
+    if (!document._luminaRowEditFocus) {
+      document._luminaRowEditFocus = true;
+      document.addEventListener(
+        "focusin",
+        (e) => {
+          const t = e.target;
+          if (t && t.classList && t.classList.contains("row-edit")) {
+            focusScrollIntoView(t);
+          }
+        },
+        true
+      );
+    }
+  }
+
+  /* ---- list scroll dims floating pet so it never covers text ---- */
+  function listScrollPetDim() {
+    const scroller = document.getElementById("scroller");
+    const root = document.documentElement;
+    if (!scroller || scroller._luminaPetDim) return;
+    scroller._luminaPetDim = true;
+    let timer = null;
+    const onScroll = () => {
+      root.classList.add("is-list-scrolling");
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        root.classList.remove("is-list-scrolling");
+      }, 420);
+    };
+    scroller.addEventListener("scroll", onScroll, { passive: true });
   }
 
   /* ---- prevent double-tap zoom on controls ---- */
@@ -355,6 +405,8 @@
     enableTouchSort();
     patchAppReorder();
     chatKeyboard();
+    mainFieldKeyboard();
+    listScrollPetDim();
     preventDblZoom();
     initCapacitor();
 

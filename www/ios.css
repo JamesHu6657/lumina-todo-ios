@@ -1,9 +1,10 @@
 /* ============================================================================
-   Lumina Todo · iOS 专用样式
-   - 安全区 / 动态视口
-   - 触控热区
-   - 浮动桌宠
-   - 设置面板
+   Lumina Todo · iOS / 窄屏 WebView 适配
+   - 安全区 / 动态视口（--vvh）
+   - 禁止整页横向溢出；chips 单独横滑
+   - 触控热区 ≥44pt（视觉可小于热区）
+   - 待办行 flex：勾选 | 正文 | 操作
+   - 浮动立绘不挡字、不截点击
    ========================================================================== */
 
 :root{
@@ -12,44 +13,67 @@
   --sal: env(safe-area-inset-left, 0px);
   --sar: env(safe-area-inset-right, 0px);
   --vvh: 100dvh;
+  --ios-pad-x: 12px;
+  --ios-hit: 44px;
 }
 
+/* ── 根层：限宽 + 禁整页横滑 ── */
 html.is-ios-app,
 html.is-ios-app body{
+  width: 100%;
+  max-width: 100%;
   height: var(--vvh);
   max-height: var(--vvh);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: hidden;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
   -webkit-text-size-adjust: 100%;
   touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+html.is-ios-app input,
+html.is-ios-app textarea,
+html.is-ios-app select,
+html.is-ios-app [contenteditable="true"]{
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 html.is-ios-app .app{
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   height: 100%;
   max-height: 100%;
-  padding-top: var(--sat);
+  overflow-x: hidden;
+  box-sizing: border-box;
+  /* 左右安全区只在这里加一次；子元素用固定 --ios-pad-x，避免双重 inset */
   padding-left: var(--sal);
   padding-right: var(--sar);
-  padding-bottom: var(--sab);
-  box-sizing: border-box;
+  padding-top: 0;
+  padding-bottom: 0;
 }
 
-/* 触控：行内工具默认可见一点，避免必须 hover */
+html.is-ios-app .side,
+html.is-ios-app .main,
+html.is-ios-app .status,
+html.is-ios-app .scroller,
+html.is-ios-app .list,
+html.is-ios-app .toolbar,
+html.is-ios-app .composer,
+html.is-ios-app .side-scroll,
+html.is-ios-app .pomo,
+html.is-ios-app .brand{
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* ── 触控：列表工具默认可见（无需 hover） ── */
 html.is-touch .row .row-tools{
   opacity: 1;
-}
-html.is-touch .tool,
-html.is-touch .tb-btn,
-html.is-touch .pomo-btn,
-html.is-touch .nav-item,
-html.is-touch .check{
-  min-height: 36px;
-  min-width: 36px;
-}
-html.is-touch .tool.grip{
-  min-width: 40px;
-  touch-action: pan-y;
+  pointer-events: auto;
 }
 html.is-touch .row.is-dragging .tool.grip{
   touch-action: none;
@@ -61,28 +85,41 @@ html.is-touch .row.dragging{
   transform: scale(1.01);
 }
 
-/* 手机上侧栏角色仍被 styles 隐藏时，用浮动桌宠补回 */
+/* ── 浮动桌宠：装饰层，绝不挡交互 ── */
 .float-pet{
   display: none;
   position: fixed;
-  right: max(10px, var(--sar));
+  right: max(4px, var(--sar));
   bottom: calc(52px + var(--sab));
-  width: 88px;
-  height: 110px;
+  width: min(34vw, 108px);
+  max-width: 38vw;
+  height: min(24dvh, 128px);
   border: none;
   padding: 0;
   background: transparent;
-  z-index: 40;
+  z-index: 1;
+  pointer-events: none;
   -webkit-user-select: none;
   user-select: none;
+  opacity: .36;
+  transition: opacity 200ms var(--e-out);
 }
 @media (max-width: 900px){
   html.is-ios-app .float-pet{ display: block; }
-  /* 侧栏角色占位仍隐藏，省空间；桌宠走 float */
   html.is-ios-app .chara{ display: none !important; }
 }
 @media (min-width: 901px){
   html.is-ios-app .float-pet{ display: none !important; }
+}
+@media (max-width: 390px){
+  html.is-ios-app .float-pet{
+    opacity: .14;
+    width: min(26vw, 80px);
+    height: min(18dvh, 88px);
+  }
+}
+html.is-ios-app.is-list-scrolling .float-pet{
+  opacity: .08;
 }
 .float-pet-art{
   width: 100%;
@@ -90,18 +127,15 @@ html.is-touch .row.dragging{
   background-size: contain;
   background-repeat: no-repeat;
   background-position: bottom center;
-  filter: drop-shadow(0 8px 16px var(--char-glow, rgba(0 0 0 / .25)));
-  transition: transform 220ms var(--e-out);
-}
-.float-pet:active .float-pet-art{
-  transform: scale(0.96) rotate(-2deg);
+  filter: drop-shadow(0 6px 12px var(--char-glow, rgb(0 0 0 / .22)));
+  pointer-events: none;
 }
 .float-pet-bubble{
   position: absolute;
-  right: 78px;
-  bottom: 70px;
-  max-width: 140px;
-  padding: 7px 10px;
+  right: 72px;
+  bottom: 64px;
+  max-width: min(132px, 40vw);
+  padding: 6px 9px;
   border-radius: 12px 12px 4px 12px;
   background: var(--lift-solid, #fff);
   color: var(--ink);
@@ -112,33 +146,41 @@ html.is-touch .row.dragging{
   text-align: left;
   pointer-events: none;
   white-space: pre-wrap;
+  overflow: hidden;
 }
 
-/* 聊天抽屉：安全区 + 键盘 */
+/* ── 聊天 / Toast / 设置 ── */
 html.is-ios-app .chat-drawer{
   padding-top: var(--sat);
   padding-bottom: var(--sab);
   max-height: var(--vvh);
+  width: min(400px, 100%);
+  max-width: 100%;
 }
 html.is-ios-app .chat-composer{
-  padding-bottom: max(8px, env(safe-area-inset-bottom));
+  padding-bottom: max(8px, var(--sab));
 }
+/* iOS 聚焦放大：输入框 ≥16px */
 html.is-ios-app .chat-input,
-html.is-ios-app #chatInput{
-  font-size: 16px; /* 防止 iOS 聚焦自动放大 */
+html.is-ios-app #chatInput,
+html.is-ios-app #todoInput,
+html.is-ios-app #searchInput,
+html.is-ios-app .row-edit,
+html.is-ios-app .settings-input{
+  font-size: 16px;
 }
-
-/* Toast 抬离 Home 指示条 */
 html.is-ios-app .toast{
-  bottom: calc(48px + var(--sab));
+  bottom: calc(52px + var(--sab));
+  max-width: min(420px, calc(100% - 24px));
+  box-sizing: border-box;
+  left: 50%;
+  right: auto;
+  transform: translate(-50%, 12px);
+}
+html.is-ios-app .toast.show{
+  transform: translate(-50%, 0);
 }
 
-/* 状态栏 */
-html.is-ios-app .status{
-  padding-bottom: max(4px, calc(var(--sab) * 0.35));
-}
-
-/* 设置面板 */
 .settings-backdrop{
   position: fixed; inset: 0;
   background: oklch(10% .02 280 / .45);
@@ -158,6 +200,8 @@ html.is-ios-app .status{
   display: flex;
   flex-direction: column;
   padding-bottom: var(--sab);
+  padding-left: max(var(--ios-pad-x), var(--sal));
+  padding-right: max(var(--ios-pad-x), var(--sar));
   animation: settings-up 280ms var(--e-out);
 }
 @keyframes settings-up{
@@ -166,14 +210,12 @@ html.is-ios-app .status{
 }
 .settings-head{
   display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 16px 8px;
+  padding: 14px 4px 8px;
   border-bottom: 1px solid var(--line-soft);
 }
-.settings-title{
-  margin: 0; font-size: 16px; font-weight: 700;
-}
+.settings-title{ margin: 0; font-size: 16px; font-weight: 700; }
 .settings-close{
-  width: 36px; height: 36px; border-radius: 99px;
+  width: var(--ios-hit); height: var(--ios-hit); border-radius: 99px;
   border: 1.5px solid var(--line);
   background: var(--lift-strong);
   color: var(--ink-2);
@@ -181,13 +223,13 @@ html.is-ios-app .status{
 }
 .settings-body{
   overflow: auto;
-  padding: 8px 16px 20px;
+  padding: 8px 4px 20px;
   -webkit-overflow-scrolling: touch;
 }
 .settings-sec{ margin: 14px 0 18px; }
 .settings-sec h3{
   margin: 0 0 6px; font-size: 13px; letter-spacing: .04em;
-  color: var(--ink-2); text-transform: none;
+  color: var(--ink-2);
 }
 .settings-hint{
   margin: 0 0 10px; font-size: 12px; line-height: 1.45; color: var(--ink-3);
@@ -201,7 +243,7 @@ html.is-ios-app .status{
 }
 .settings-input{
   width: 100%; box-sizing: border-box;
-  height: 42px; padding: 0 12px;
+  height: var(--ios-hit); padding: 0 12px;
   border-radius: 11px;
   border: 1.5px solid var(--line);
   background: var(--sunk);
@@ -216,11 +258,9 @@ html.is-ios-app .status{
 .settings-mask{
   margin: 6px 0 0; font-size: 11.5px; color: var(--ink-3); min-height: 1.2em;
 }
-.settings-row{
-  display: flex; gap: 8px; margin-top: 10px;
-}
+.settings-row{ display: flex; gap: 8px; margin-top: 10px; }
 .settings-btn{
-  flex: 1; height: 40px; border-radius: 99px;
+  flex: 1; min-height: var(--ios-hit); border-radius: 99px;
   border: 1.5px solid var(--accent);
   background: var(--accent); color: var(--accent-on);
   font-size: 13px; font-weight: 600;
@@ -230,14 +270,406 @@ html.is-ios-app .status{
 }
 body.settings-open .app{ pointer-events: none; }
 
-/* 横屏窄高：仍显示 float pet 缩小版 */
-@media (max-height: 500px) and (max-width: 900px){
-  .float-pet{ width: 64px; height: 80px; bottom: calc(40px + var(--sab)); }
-  .float-pet-bubble{ display: none; }
+/* ==========================================================================
+   ≤900px：手机竖栏布局强化（与 styles.css 响应式配合）
+   ========================================================================== */
+@media (max-width: 900px){
+  /* 顶安全区：手机顶是 brand */
+  html.is-ios-app .brand{
+    padding-top: calc(12px + var(--sat));
+    padding-left: var(--ios-pad-x);
+    padding-right: var(--ios-pad-x);
+  }
+  html.is-ios-app .brand-txt{ min-width: 0; overflow: hidden; }
+  html.is-ios-app .brand-name,
+  html.is-ios-app .brand-sub{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html.is-ios-app .side{
+    overflow-x: hidden;
+  }
+  html.is-ios-app .side-scroll{
+    overflow-x: hidden;
+    overflow-y: visible;
+    padding-left: var(--ios-pad-x);
+    padding-right: var(--ios-pad-x);
+  }
+
+  /* chips 横滑：只滚自己，不顶破页面 */
+  html.is-ios-app .side-group[data-group="smart"]{
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+    margin: 0;
+  }
+  html.is-ios-app .side-group[data-group="smart"]::-webkit-scrollbar{
+    display: none;
+    width: 0;
+    height: 0;
+  }
+  html.is-ios-app .side-group[data-group="smart"] .nav-item{
+    flex: 0 0 auto;
+    width: auto;
+    min-width: max-content;
+    min-height: var(--ios-hit);
+    height: var(--ios-hit);
+    padding: 0 14px;
+    scroll-snap-align: start;
+    box-sizing: border-box;
+  }
+  html.is-ios-app .side-group[data-group="smart"] .nav-item .label{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app .side-group[data-group="smart"] .nav-item .n{
+    flex: none;
+  }
+
+  /* 番茄钟 */
+  html.is-ios-app .pomo{
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    box-sizing: border-box;
+    padding: 8px var(--ios-pad-x) 10px;
+  }
+  html.is-ios-app .pomo-top{
+    flex: 1 1 132px;
+    min-width: 0;
+    max-width: 100%;
+  }
+  html.is-ios-app .pomo-info{ min-width: 0; overflow: hidden; }
+  html.is-ios-app .pomo-time,
+  html.is-ios-app .pomo-sub{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app .pomo-ctrl{
+    flex: 1 1 auto;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+  }
+  html.is-ios-app .pomo-btn.primary{
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: var(--ios-hit);
+    height: var(--ios-hit);
+    padding: 0 12px;
+  }
+  html.is-ios-app .pomo-btn.primary span{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app .pomo-btn.icon{
+    flex: 0 0 var(--ios-hit);
+    width: var(--ios-hit);
+    min-width: var(--ios-hit);
+    height: var(--ios-hit);
+  }
+
+  html.is-ios-app .side-foot{
+    padding-left: var(--ios-pad-x);
+    padding-right: var(--ios-pad-x);
+  }
+  html.is-ios-app .foot-btn{
+    min-height: var(--ios-hit);
+    min-width: var(--ios-hit);
+  }
+
+  /* 工具栏 */
+  html.is-ios-app .toolbar{
+    height: auto;
+    min-height: 48px;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px var(--ios-pad-x);
+  }
+  html.is-ios-app .tb-title{
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+  }
+  html.is-ios-app .tb-title h1{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 16px;
+  }
+  html.is-ios-app .search{
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+    height: var(--ios-hit);
+  }
+  html.is-ios-app .tb-btn{
+    min-width: var(--ios-hit);
+    min-height: var(--ios-hit);
+    height: var(--ios-hit);
+  }
+
+  html.is-ios-app .composer{
+    padding: 10px var(--ios-pad-x) 0;
+  }
+  html.is-ios-app .composer-opts{
+    flex-wrap: wrap;
+    padding-left: var(--ios-pad-x);
+    padding-right: var(--ios-pad-x);
+  }
+  html.is-ios-app .composer-main{ min-height: 46px; }
+  html.is-ios-app .prio-btn,
+  html.is-ios-app .add-btn,
+  html.is-ios-app .range-btn{
+    min-height: 36px;
+  }
+  html.is-ios-app .add-btn{
+    min-height: var(--ios-hit);
+    min-width: 72px;
+  }
+
+  html.is-ios-app .history-bar{
+    margin: 10px var(--ios-pad-x) 0;
+    max-width: none;
+    box-sizing: border-box;
+  }
+  html.is-ios-app .notice{
+    margin-left: var(--ios-pad-x);
+    margin-right: var(--ios-pad-x);
+    box-sizing: border-box;
+  }
+
+  /* 列表 */
+  html.is-ios-app .scroller{
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  html.is-ios-app .list{
+    padding: 8px var(--ios-pad-x) 40px;
+    box-sizing: border-box;
+  }
+
+  /*
+    待办行：[勾选热区] [flag+正文 flex:1] [操作 shrink:0]
+    meta 整行折下，避免挤操作按钮
+  */
+  html.is-ios-app .row{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 6px;
+    row-gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 8px 6px;
+  }
+
+  /* 视觉圆 ≈22px，热区 44×44 */
+  html.is-ios-app .check{
+    position: relative;
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    min-height: 22px;
+    flex: 0 0 22px;
+    margin: 11px; /* 四周扩到 44 布局占位 */
+    box-sizing: border-box;
+  }
+  html.is-ios-app .check::before{
+    content: "";
+    position: absolute;
+    inset: -11px;
+  }
+
+  html.is-ios-app .flag{
+    flex: 0 0 auto;
+    margin-left: 0;
+  }
+
+  html.is-ios-app .row-text,
+  html.is-ios-app .row-edit{
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: 15px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app .row-edit{ font-size: 16px; }
+
+  /* 操作区：取消 absolute，保留全部按钮（改/删/专注/上传/手柄） */
+  html.is-ios-app .row-tools{
+    position: static;
+    transform: none;
+    top: auto;
+    right: auto;
+    flex: 0 0 auto;
+    order: 4;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    background: none;
+    padding-left: 0;
+    max-width: 100%;
+  }
+  html.is-ios-app .tool{
+    width: var(--ios-hit);
+    height: var(--ios-hit);
+    min-width: var(--ios-hit);
+    min-height: var(--ios-hit);
+    flex: 0 0 var(--ios-hit);
+  }
+  html.is-ios-app .tool.grip{
+    touch-action: pan-y;
+  }
+
+  /* meta 第二行；全 hidden 时尽量不占位（iOS 15.4+ :has） */
+  html.is-ios-app .row-meta{
+    flex: 1 1 100%;
+    order: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+    padding-left: 44px; /* 对齐勾选热区右缘 */
+    overflow: hidden;
+  }
+  html.is-ios-app .row-meta:not(:has(> :not([hidden]))){
+    display: none;
+  }
+  html.is-ios-app .row-meta > *{
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 底栏 */
+  html.is-ios-app .status{
+    height: auto;
+    min-height: 36px;
+    flex-wrap: nowrap;
+    gap: 8px;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+    padding-top: 8px;
+    padding-bottom: calc(12px + var(--sab));
+    padding-left: var(--ios-pad-x);
+    padding-right: var(--ios-pad-x);
+    font-size: 12px;
+  }
+  html.is-ios-app .status-seg{
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app #sortNote{
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  html.is-ios-app .status-right{
+    flex: 0 0 auto;
+    margin-left: auto;
+    max-width: 40%;
+  }
+  html.is-ios-app .store-chip{
+    min-height: 32px;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  html.is-ios-app #storeLabel{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.is-ios-app .mini-track{ width: 36px; }
+
+  html.is-ios-app .empty-title{ font-size: 15px; }
+  html.is-ios-app .empty-body{ font-size: 13px; }
 }
 
-/* 减少动效 */
+/* SE / 更窄：操作钮略收，保证一行放得下 focus+cu+grip+edit+delete */
+@media (max-width: 390px){
+  html.is-ios-app .tool{
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    flex-basis: 40px;
+  }
+  html.is-ios-app .pomo-btn.primary span{
+    max-width: 6.5em;
+  }
+  html.is-ios-app .status-right .saved-flash{ display: none; }
+  html.is-ios-app #storeLabel{
+    max-width: 4.5em;
+  }
+}
+
+/* 横屏 */
+@media (max-width: 900px) and (orientation: landscape){
+  html.is-ios-app .float-pet{
+    width: min(20vw, 88px);
+    height: min(32dvh, 92px);
+    opacity: .16;
+  }
+  html.is-ios-app .brand{
+    padding-top: calc(8px + var(--sat));
+  }
+  html.is-ios-app .pomo{
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  html.is-ios-app .side-foot{ display: none; }
+  html.is-ios-app .tool{
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    flex-basis: 40px;
+  }
+}
+
+/* 矮屏 */
+@media (max-height: 500px) and (max-width: 900px){
+  html.is-ios-app .float-pet{
+    width: min(20vw, 72px);
+    height: min(26dvh, 76px);
+    bottom: calc(40px + var(--sab));
+    opacity: .12;
+  }
+  html.is-ios-app .float-pet-bubble{ display: none; }
+}
+
 @media (prefers-reduced-motion: reduce){
   .settings-sheet{ animation: none; }
-  .float-pet-art{ transition: none; }
+  .float-pet{ transition: none; }
 }
