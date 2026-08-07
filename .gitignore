@@ -15,3 +15,8 @@ ios/App/build/
 ios/DerivedData/
 *.xcuserstate
 xcuserdata/
+
+_push_batches/
+_tools/
+scripts/_gh_push_complete.js
+
