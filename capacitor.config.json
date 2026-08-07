@@ -8,13 +8,16 @@
     "iosScheme": "capacitor"
   },
   "ios": {
-    "contentInset": "automatic",
+    "contentInset": "never",
     "preferredContentMode": "mobile",
     "backgroundColor": "#1a1630",
     "scrollEnabled": true,
     "allowsLinkPreview": false
   },
   "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    },
     "Keyboard": {
       "resize": "body",
       "style": "DARK",

@@ -64,6 +64,98 @@
     return err?.name === "AbortError" || err?.name === "TimeoutError";
   }
 
+  /**
+   * 把 fetch / 原生 HTTP 失败整理成可读信息（真机「Load failed」往往是 CSP/CORS/网络）。
+   * @returns {{ code: string, message: string, status?: number }}
+   */
+  function classifyRequestError(err, { url, status, bodySnippet } = {}) {
+    const name = err?.name || "";
+    const raw = String(err?.message || err || "");
+    const lower = raw.toLowerCase();
+    const st = Number.isFinite(status) ? status : Number.isFinite(err?.status) ? err.status : null;
+
+    if (isAbortLike(err) || name === "TimeoutError") {
+      return {
+        code: name === "TimeoutError" || /timeout/i.test(raw) ? "TIMEOUT" : "ABORTED",
+        message: name === "TimeoutError" || /timeout/i.test(raw) ? "请求超时" : "已停止",
+        status: st || undefined,
+      };
+    }
+    if (err?.code === "NO_KEY") {
+      return { code: "NO_KEY", message: raw };
+    }
+    if (st === 401 || st === 403) {
+      return {
+        code: "AUTH",
+        message: `鉴权失败（HTTP ${st}）：API Key 无效或无权限。${bodySnippet ? " " + bodySnippet.slice(0, 120) : ""}`.trim(),
+        status: st,
+      };
+    }
+    if (st === 404) {
+      return {
+        code: "NOT_FOUND",
+        message: `资源不存在（HTTP 404）：请检查模型名或接口路径。${bodySnippet ? " " + bodySnippet.slice(0, 120) : ""}`.trim(),
+        status: 404,
+      };
+    }
+    if (st === 429) {
+      return {
+        code: "RATE_LIMIT_REMOTE",
+        message: `远程限流（HTTP 429）：请稍后再试。${bodySnippet ? " " + bodySnippet.slice(0, 120) : ""}`.trim(),
+        status: 429,
+      };
+    }
+    if (st != null && st >= 500) {
+      return {
+        code: "SERVER",
+        message: `服务端错误（HTTP ${st}）。${bodySnippet ? " " + bodySnippet.slice(0, 120) : ""}`.trim(),
+        status: st,
+      };
+    }
+    if (st != null && st >= 400) {
+      return {
+        code: "HTTP_" + st,
+        message: `API ${st}: ${(bodySnippet || raw).slice(0, 200)}`,
+        status: st,
+      };
+    }
+    // WebKit：CSP / CORS / 断网 均常表现为 TypeError: Load failed
+    if (
+      name === "TypeError" ||
+      /load failed|failed to fetch|networkerror|network request failed|the internet connection appears to be offline/i.test(
+        lower
+      )
+    ) {
+      return {
+        code: "NETWORK",
+        message:
+          "网络不可达或请求被拦截（CSP/CORS/离线）。若 Console 含 Content Security Policy 则为 CSP；含 CORS / Access-Control 则为跨域；否则检查网络与 CapacitorHttp。原文: " +
+          raw.slice(0, 120),
+      };
+    }
+    return {
+      code: err?.code || "REQUEST_FAILED",
+      message: redactSecrets(raw).slice(0, 400),
+      status: st || undefined,
+    };
+  }
+
+  function logRequestFailure(tag, err, meta = {}) {
+    try {
+      console.error("[luminaAI]", tag, {
+        name: err?.name,
+        message: err?.message,
+        code: err?.code,
+        status: err?.status ?? meta.status,
+        url: meta.url || AI_ENDPOINT,
+        stack: err?.stack,
+        raw: err,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
   function getTools() {
     const pack = globalThis.LUMINA_AGENT_TOOLS;
     return (pack && pack.tools) || [];
@@ -487,22 +579,36 @@
       );
     }
 
+    // 预检触发头：Authorization + application/json 足以触发 CORS preflight。
+    // 真机 origin=capacitor://localhost 时，OpenCode 对 /chat/completions 的 OPTIONS
+    // 曾返回 404 且无 ACAO → TypeError: Load failed。
+    // 修复：capacitor.config 启用 CapacitorHttp（原生层发请求，绕开 CORS）。
+    // 注意：原生 HTTP 会缓冲完整响应；SSE 仍可按全文解析，但不会边下边显。
+    // 仅保留必要头，不附加 x-* 自定义头。
+    const headers = {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    };
+    // Accept 为 CORS 安全列表头，不单独触发 preflight；流式时声明 SSE 偏好
+    if (stream) headers.Accept = "text/event-stream";
+
     let res;
     try {
       res = await fetch(AI_ENDPOINT, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-          Accept: stream ? "text/event-stream" : "application/json",
-        },
+        headers,
         body: JSON.stringify(body),
         signal: linkAc.signal,
       });
     } catch (err) {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
-      throw err;
+      const classified = classifyRequestError(err, { url: AI_ENDPOINT });
+      logRequestFailure("fetch failed", err, { url: AI_ENDPOINT });
+      const e = new Error(classified.message);
+      e.code = classified.code;
+      e.cause = err;
+      throw e;
     }
     if (stream && timer) {
       clearTimeout(timer);
@@ -521,10 +627,18 @@
       if (res.status === 401 || res.status === 403) {
         keyCache = { value: null, at: 0 };
       }
-      const err = new Error(
-        `API ${res.status}: ${redactSecrets(detail).slice(0, 400) || res.statusText}`
-      );
+      const classified = classifyRequestError(null, {
+        url: AI_ENDPOINT,
+        status: res.status,
+        bodySnippet: redactSecrets(detail),
+      });
+      logRequestFailure("HTTP error", { name: "HttpError", message: classified.message, status: res.status }, {
+        url: AI_ENDPOINT,
+        status: res.status,
+      });
+      const err = new Error(classified.message);
       err.status = res.status;
+      err.code = classified.code;
       throw err;
     }
 
@@ -950,14 +1064,21 @@
             timedOut: err?.name === "TimeoutError",
             requestId,
             error: err?.name === "TimeoutError" ? "请求超时" : "已停止",
+            code: err?.name === "TimeoutError" ? "TIMEOUT" : "ABORTED",
           };
         }
         if (err?.code === "NO_KEY") return { requestId, ...noKeyError() };
+        const classified = classifyRequestError(err, {
+          url: AI_ENDPOINT,
+          status: err?.status,
+        });
+        logRequestFailure("complete", err, { url: AI_ENDPOINT, status: err?.status });
         return {
           ok: false,
           requestId,
-          error: redactSecrets(err?.message || String(err)),
-          code: err?.code,
+          error: classified.message,
+          code: classified.code || err?.code,
+          status: classified.status || err?.status,
         };
       } finally {
         link?.dispose?.();
@@ -1059,7 +1180,12 @@
             });
             return;
           }
-          emitError(requestId, redactSecrets(err?.message || String(err)));
+          const classified = classifyRequestError(err, {
+            url: AI_ENDPOINT,
+            status: err?.status,
+          });
+          logRequestFailure("chat stream", err, { url: AI_ENDPOINT, status: err?.status });
+          emitError(requestId, classified.message);
         } finally {
           link?.dispose?.();
           endRequest(requestId, entry);

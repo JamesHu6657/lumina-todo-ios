@@ -69,6 +69,17 @@
           </div>
         </section>
         <section class="settings-sec">
+          <h3>数据</h3>
+          <p class="settings-hint">手机顶栏已收拢；备份与导入请在这里操作。</p>
+          <div class="settings-row">
+            <button type="button" class="settings-btn ghost" id="setExport">导出备份</button>
+            <button type="button" class="settings-btn ghost" id="setImport">导入</button>
+          </div>
+          <div class="settings-row">
+            <button type="button" class="settings-btn ghost" id="setClearDone">清除已完成</button>
+          </div>
+        </section>
+        <section class="settings-sec">
           <h3>关于</h3>
           <p class="settings-hint">リスト · Lumina Todo iOS 1.0 · 本地待办 + 角色搭档 + 番茄钟 + AI Agent</p>
         </section>
@@ -203,6 +214,17 @@
       refreshMasks();
     });
 
+    // 数据：转发到主界面已有按钮（顶栏 foot 在手机上已隐藏以省空间）
+    document.getElementById("setExport")?.addEventListener("click", () => {
+      document.getElementById("exportBtn")?.click();
+    });
+    document.getElementById("setImport")?.addEventListener("click", () => {
+      document.getElementById("importBtn")?.click();
+    });
+    document.getElementById("setClearDone")?.addEventListener("click", () => {
+      document.getElementById("clearCompleted")?.click();
+    });
+
     // 工具栏按钮
     const toolbar = document.querySelector(".toolbar .tb-actions") || document.querySelector(".toolbar");
     if (toolbar && !document.getElementById("settingsBtn")) {
@@ -211,8 +233,12 @@
       btn.type = "button";
       btn.title = "设置";
       btn.setAttribute("aria-label", "设置");
+      // 齿轮（替换原先太阳射线图标）
       btn.innerHTML =
-        '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.2M12 19v2.2M4.2 12H2M22 12h-2.2M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M5.6 18.4l1.6-1.6M16.8 7.2l1.6-1.6"/></svg>';
+        '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<path d="M12 15.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8Z"/>' +
+        '<path d="M19.55 12.95v-1.9l-1.9-.38a6.2 6.2 0 0 0-.58-1.4l1.1-1.6-1.35-1.35-1.6 1.1a6.2 6.2 0 0 0-1.4-.58L13 4.45h-2l-.37 1.9a6.2 6.2 0 0 0-1.4.58l-1.6-1.1-1.35 1.35 1.1 1.6a6.2 6.2 0 0 0-.58 1.4l-1.9.37v1.9l1.9.38c.1.5.3.97.58 1.4l-1.1 1.6 1.35 1.35 1.6-1.1c.43.28.9.48 1.4.58l.37 1.9h2l.38-1.9c.5-.1.97-.3 1.4-.58l1.6 1.1 1.35-1.35-1.1-1.6c.28-.43.48-.9.58-1.4l1.9-.38Z"/>' +
+        "</svg>";
       btn.addEventListener("click", open);
       // 插到主题按钮前
       const theme = document.getElementById("themeBtn");

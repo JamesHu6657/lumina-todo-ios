@@ -13,6 +13,7 @@
   --sal: env(safe-area-inset-left, 0px);
   --sar: env(safe-area-inset-right, 0px);
   --vvh: 100dvh;
+  --kb: 0px; /* 软键盘高度（mobile-ux 写入） */
   --ios-pad-x: 12px;
   --ios-hit: 44px;
 }
@@ -274,28 +275,26 @@ body.settings-open .app{ pointer-events: none; }
    ≤900px：手机竖栏布局强化（与 styles.css 响应式配合）
    ========================================================================== */
 @media (max-width: 900px){
-  /* 顶安全区：手机顶是 brand */
+  /*
+    顶栏：隐藏「星屑の栞」品牌块，把 safe-area 交给 chips 行。
+    原先 brand + contentInset + sat 叠出一大块空白。
+  */
   html.is-ios-app .brand{
-    padding-top: calc(12px + var(--sat));
-    padding-left: var(--ios-pad-x);
-    padding-right: var(--ios-pad-x);
+    display: none !important;
   }
-  html.is-ios-app .brand-txt{ min-width: 0; overflow: hidden; }
-  html.is-ios-app .brand-name,
-  html.is-ios-app .brand-sub{
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   html.is-ios-app .side{
     overflow-x: hidden;
+    /* 侧栏整体顶安全区：chips / 番茄紧贴状态栏下 */
+    padding-top: max(6px, var(--sat));
   }
   html.is-ios-app .side-scroll{
     overflow-x: hidden;
     overflow-y: visible;
-    padding-left: var(--ios-pad-x);
-    padding-right: var(--ios-pad-x);
+    padding: 2px var(--ios-pad-x) 6px;
+  }
+  /* 手机不需要导出/导入/清完成占一整行：设置与长按足够；省垂直空间 */
+  html.is-ios-app .side-foot{
+    display: none !important;
   }
 
   /* chips 横滑：只滚自己，不顶破页面 */
@@ -339,14 +338,14 @@ body.settings-open .app{ pointer-events: none; }
     flex: none;
   }
 
-  /* 番茄钟 */
+  /* 番茄钟：略收紧 */
   html.is-ios-app .pomo{
     flex-direction: row;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px 10px;
+    gap: 6px 8px;
     box-sizing: border-box;
-    padding: 8px var(--ios-pad-x) 10px;
+    padding: 4px var(--ios-pad-x) 8px;
   }
   html.is-ios-app .pomo-top{
     flex: 1 1 132px;
@@ -388,10 +387,6 @@ body.settings-open .app{ pointer-events: none; }
     height: var(--ios-hit);
   }
 
-  html.is-ios-app .side-foot{
-    padding-left: var(--ios-pad-x);
-    padding-right: var(--ios-pad-x);
-  }
   html.is-ios-app .foot-btn{
     min-height: var(--ios-hit);
     min-width: var(--ios-hit);
@@ -400,10 +395,10 @@ body.settings-open .app{ pointer-events: none; }
   /* 工具栏 */
   html.is-ios-app .toolbar{
     height: auto;
-    min-height: 48px;
+    min-height: 44px;
     flex-wrap: wrap;
-    gap: 8px;
-    padding: 8px var(--ios-pad-x);
+    gap: 6px;
+    padding: 6px var(--ios-pad-x) 4px;
   }
   html.is-ios-app .tb-title{
     min-width: 0;
@@ -429,14 +424,14 @@ body.settings-open .app{ pointer-events: none; }
   }
 
   html.is-ios-app .composer{
-    padding: 10px var(--ios-pad-x) 0;
+    padding: 6px var(--ios-pad-x) 0;
   }
   html.is-ios-app .composer-opts{
     flex-wrap: wrap;
     padding-left: var(--ios-pad-x);
     padding-right: var(--ios-pad-x);
   }
-  html.is-ios-app .composer-main{ min-height: 46px; }
+  html.is-ios-app .composer-main{ min-height: 44px; }
   html.is-ios-app .prio-btn,
   html.is-ios-app .add-btn,
   html.is-ios-app .range-btn{
@@ -476,13 +471,13 @@ body.settings-open .app{ pointer-events: none; }
   html.is-ios-app .row{
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
+    align-items: flex-start; /* 多行正文时勾选顶对齐 */
     column-gap: 6px;
-    row-gap: 6px;
+    row-gap: 4px;
     min-width: 0;
     max-width: 100%;
     box-sizing: border-box;
-    padding: 8px 6px;
+    padding: 10px 6px;
   }
 
   /* 视觉圆 ≈22px，热区 44×44 */
@@ -493,7 +488,7 @@ body.settings-open .app{ pointer-events: none; }
     min-width: 22px;
     min-height: 22px;
     flex: 0 0 22px;
-    margin: 11px; /* 四周扩到 44 布局占位 */
+    margin: 6px 11px 11px; /* 顶略收，与首行文字对齐 */
     box-sizing: border-box;
   }
   html.is-ios-app .check::before{
@@ -505,26 +500,41 @@ body.settings-open .app{ pointer-events: none; }
   html.is-ios-app .flag{
     flex: 0 0 auto;
     margin-left: 0;
+    margin-top: 0.45em; /* 与首行文字中线大致对齐 */
   }
 
-  html.is-ios-app .row-text,
-  html.is-ios-app .row-edit{
+  /*
+    待办正文：多行完整显示（原先 nowrap+ellipsis 截断看不见尾字）。
+    操作钮单独占第二行，正文可吃满整行宽度。
+  */
+  html.is-ios-app .row-text{
     flex: 1 1 0;
     min-width: 0;
     font-size: 15px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.4;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: unset;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    align-self: center;
   }
-  html.is-ios-app .row-edit{ font-size: 16px; }
+  html.is-ios-app .row-edit{
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: 16px;
+    line-height: 1.4;
+    white-space: normal;
+    word-break: break-word;
+  }
 
-  /* 操作区：取消 absolute，保留全部按钮（改/删/专注/上传/手柄） */
+  /* 操作区：整行右对齐，不与正文抢宽 */
   html.is-ios-app .row-tools{
     position: static;
     transform: none;
     top: auto;
     right: auto;
-    flex: 0 0 auto;
+    flex: 1 1 100%;
     order: 4;
     display: flex;
     flex-wrap: nowrap;
@@ -534,7 +544,8 @@ body.settings-open .app{ pointer-events: none; }
     opacity: 1 !important;
     pointer-events: auto !important;
     background: none;
-    padding-left: 0;
+    padding: 0 0 0 44px; /* 与勾选热区对齐 */
+    margin: -2px 0 0;
     max-width: 100%;
   }
   html.is-ios-app .tool{
@@ -559,7 +570,7 @@ body.settings-open .app{ pointer-events: none; }
     min-width: 0;
     max-width: 100%;
     padding-left: 44px; /* 对齐勾选热区右缘 */
-    overflow: hidden;
+    overflow: visible;
   }
   html.is-ios-app .row-meta:not(:has(> :not([hidden]))){
     display: none;
@@ -641,14 +652,10 @@ body.settings-open .app{ pointer-events: none; }
     height: min(32dvh, 92px);
     opacity: .16;
   }
-  html.is-ios-app .brand{
-    padding-top: calc(8px + var(--sat));
-  }
   html.is-ios-app .pomo{
-    padding-top: 6px;
-    padding-bottom: 6px;
+    padding-top: 4px;
+    padding-bottom: 4px;
   }
-  html.is-ios-app .side-foot{ display: none; }
   html.is-ios-app .tool{
     width: 40px;
     height: 40px;
@@ -672,4 +679,58 @@ body.settings-open .app{ pointer-events: none; }
 @media (prefers-reduced-motion: reduce){
   .settings-sheet{ animation: none; }
   .float-pet{ transition: none; }
+}
+
+/* ==========================================================================
+   软键盘：保证底部输入框始终可见
+   - --kb 由 mobile-ux 根据 Capacitor Keyboard / visualViewport 写入
+   - kb-open 时收起侧栏与底状态栏，把垂直空间留给主区 + 输入
+   ========================================================================== */
+html.is-ios-app{
+  --kb: 0px;
+}
+html.is-ios-app.kb-open .side{
+  display: none !important;
+}
+html.is-ios-app.kb-open .status{
+  display: none !important;
+}
+html.is-ios-app.kb-open .float-pet{
+  display: none !important;
+}
+/* 主区在键盘时吃满可用高度 */
+html.is-ios-app.kb-open .app{
+  grid-template-rows: minmax(0, 1fr) 0;
+  grid-template-areas: "main" "status";
+}
+html.is-ios-app.kb-open .main{
+  min-height: 0;
+}
+/* 新建待办 / 搜索：键盘弹起后仍贴在可视区中部以上 */
+html.is-ios-app.kb-open .composer{
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  background: var(--bg-pane, var(--lift-solid));
+  padding-bottom: 6px;
+  box-shadow: 0 8px 16px oklch(10% .02 280 / .12);
+}
+/*
+  Keyboard.resize=body 时视口已上缩，fixed bottom:0 会跟着抬。
+  这里只收紧 max-height / 可滚区域，避免 bottom+=kb 双重上移。
+*/
+html.is-ios-app .chat-composer{
+  padding-bottom: max(8px, var(--sab));
+}
+html.is-ios-app.kb-open .chat-drawer{
+  max-height: var(--vvh);
+}
+html.is-ios-app .settings-sheet{
+  max-height: min(88dvh, calc(var(--vvh) - 12px));
+}
+html.is-ios-app.kb-open .settings-sheet{
+  max-height: min(92dvh, calc(var(--vvh) - 4px));
+}
+html.is-ios-app .settings-body{
+  scroll-padding-bottom: 28px;
 }

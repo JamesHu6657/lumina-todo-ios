@@ -18,11 +18,37 @@
   document.documentElement.classList.add("is-ios-app");
   if (isTouch) document.documentElement.classList.add("is-touch");
 
-  /* ---- visual viewport / safe area ---- */
+  /* ---- visual viewport / safe area / keyboard ---- */
+  const root = document.documentElement;
+  let kbHeight = 0;
+  let kbFromPlugin = false;
+
   function setVVH() {
-    const h = window.visualViewport?.height || window.innerHeight;
-    document.documentElement.style.setProperty("--vvh", `${h}px`);
+    const vv = window.visualViewport;
+    const h = vv?.height || window.innerHeight;
+    root.style.setProperty("--vvh", `${h}px`);
+    // 无 Capacitor Keyboard 事件时，用 layout vs visual 差估键盘高度
+    if (!kbFromPlugin) {
+      const layoutH = window.innerHeight;
+      const estimate = Math.max(0, Math.round(layoutH - h - (vv?.offsetTop || 0)));
+      // 小于 80 多半是地址栏伸缩，不当作键盘
+      setKeyboardHeight(estimate >= 80 ? estimate : 0, false);
+    }
   }
+
+  function setKeyboardHeight(px, fromPlugin) {
+    const next = Math.max(0, Math.round(Number(px) || 0));
+    if (fromPlugin) kbFromPlugin = next > 0 ? true : kbFromPlugin;
+    if (!fromPlugin && kbFromPlugin && next === 0) {
+      // 插件已接管时忽略 viewport 抖动
+      return;
+    }
+    if (!fromPlugin && kbFromPlugin) return;
+    kbHeight = next;
+    root.style.setProperty("--kb", `${kbHeight}px`);
+    root.classList.toggle("kb-open", kbHeight > 0);
+  }
+
   setVVH();
   window.addEventListener("resize", setVVH);
   window.visualViewport?.addEventListener("resize", setVVH);
@@ -279,17 +305,46 @@
   /* ---- keyboard: keep focused fields above soft keyboard ---- */
   function focusScrollIntoView(el) {
     if (!el || el.disabled) return;
-    // 等键盘/visualViewport 稳定后再滚
     const run = () => {
       try {
+        // 先滚最近可滚动祖先，再滚自身
+        const scroller =
+          el.closest(".settings-body, .chat-log, .scroller, .chat-drawer") ||
+          el.closest(".main") ||
+          null;
+        if (scroller && typeof scroller.scrollTop === "number") {
+          const er = el.getBoundingClientRect();
+          const sr = scroller.getBoundingClientRect();
+          const vvH = window.visualViewport?.height || window.innerHeight;
+          const visibleBottom = Math.min(sr.bottom, vvH - 8);
+          if (er.bottom > visibleBottom - 12 || er.top < sr.top + 8) {
+            const delta = er.top - sr.top - Math.max(24, (visibleBottom - sr.top) * 0.28);
+            scroller.scrollTop += delta;
+          }
+        }
         el.scrollIntoView({ block: "center", behavior: "smooth" });
       } catch {
-        el.scrollIntoView(true);
+        try {
+          el.scrollIntoView(true);
+        } catch {
+          /* ignore */
+        }
       }
     };
-    setTimeout(run, 120);
-    setTimeout(run, 320);
+    setTimeout(run, 80);
+    setTimeout(run, 220);
+    setTimeout(run, 420);
   }
+
+  function isEditableTarget(t) {
+    if (!t || t.disabled) return false;
+    if (t.classList?.contains("row-edit")) return true;
+    if (t.classList?.contains("settings-input")) return true;
+    if (t.id === "todoInput" || t.id === "searchInput" || t.id === "chatInput") return true;
+    const tag = (t.tagName || "").toLowerCase();
+    return tag === "textarea" || (tag === "input" && !/^(button|checkbox|radio|file|submit|reset|range|color)$/i.test(t.type || ""));
+  }
+
   function chatKeyboard() {
     const input = document.getElementById("chatInput");
     if (!input || input._luminaFocusScroll) return;
@@ -304,26 +359,67 @@
     };
     bind(document.getElementById("todoInput"));
     bind(document.getElementById("searchInput"));
-    // 行内编辑框是模板克隆，用捕获一次绑定
+    // 行内编辑 / 设置输入 / 聊天：捕获一次
     if (!document._luminaRowEditFocus) {
       document._luminaRowEditFocus = true;
       document.addEventListener(
         "focusin",
         (e) => {
           const t = e.target;
-          if (t && t.classList && t.classList.contains("row-edit")) {
-            focusScrollIntoView(t);
-          }
+          if (isEditableTarget(t)) focusScrollIntoView(t);
+        },
+        true
+      );
+      document.addEventListener(
+        "focusout",
+        () => {
+          // 失焦后若无其它输入，延迟清 kb-open（给插件事件时间）
+          setTimeout(() => {
+            const a = document.activeElement;
+            if (!isEditableTarget(a) && !kbFromPlugin) {
+              setKeyboardHeight(0, false);
+            }
+          }, 180);
         },
         true
       );
     }
   }
 
+  async function bindCapacitorKeyboard() {
+    try {
+      const KB = window.Capacitor?.Plugins?.Keyboard;
+      if (!KB?.addListener) return;
+      await KB.addListener("keyboardWillShow", (info) => {
+        const h = info?.keyboardHeight ?? info?.height ?? 0;
+        setKeyboardHeight(h, true);
+        const a = document.activeElement;
+        if (isEditableTarget(a)) focusScrollIntoView(a);
+      });
+      await KB.addListener("keyboardDidShow", (info) => {
+        const h = info?.keyboardHeight ?? info?.height ?? 0;
+        setKeyboardHeight(h, true);
+        const a = document.activeElement;
+        if (isEditableTarget(a)) focusScrollIntoView(a);
+      });
+      await KB.addListener("keyboardWillHide", () => {
+        kbFromPlugin = false;
+        setKeyboardHeight(0, true);
+        kbFromPlugin = false;
+      });
+      await KB.addListener("keyboardDidHide", () => {
+        kbFromPlugin = false;
+        setKeyboardHeight(0, true);
+        kbFromPlugin = false;
+      });
+    } catch {
+      /* ignore — 回退 visualViewport 估算 */
+    }
+  }
+
   /* ---- list scroll dims floating pet so it never covers text ---- */
   function listScrollPetDim() {
     const scroller = document.getElementById("scroller");
-    const root = document.documentElement;
     if (!scroller || scroller._luminaPetDim) return;
     scroller._luminaPetDim = true;
     let timer = null;
@@ -406,6 +502,7 @@
     patchAppReorder();
     chatKeyboard();
     mainFieldKeyboard();
+    bindCapacitorKeyboard();
     listScrollPetDim();
     preventDblZoom();
     initCapacitor();
