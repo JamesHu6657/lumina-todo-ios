@@ -1,0 +1,32 @@
+{
+  "appId": "com.lumina.todo",
+  "appName": "Lumina Todo",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "capacitor"
+  },
+  "ios": {
+    "contentInset": "automatic",
+    "preferredContentMode": "mobile",
+    "backgroundColor": "#1a1630",
+    "scrollEnabled": true,
+    "allowsLinkPreview": false
+  },
+  "plugins": {
+    "Keyboard": {
+      "resize": "body",
+      "style": "DARK",
+      "resizeOnFullScreen": true
+    },
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon",
+      "iconColor": "#9b7bff"
+    },
+    "StatusBar": {
+      "style": "LIGHT",
+      "backgroundColor": "#1a1630"
+    }
+  }
+}

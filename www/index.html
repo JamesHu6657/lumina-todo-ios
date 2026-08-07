@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="kanna">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#1a1630">
+<!--
+  iOS CSP：
+  - AI / ClickUp 在 WebView 内直连（无 Electron 主进程代理）
+  - script-src 仅 'self'；主题首帧 theme-boot.js
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' https://opencode.ai https://api.clickup.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none';">
+<title>リスト · 我的小清单</title>
+<link rel="apple-touch-icon" href="./assets/icon.png">
+
+<!-- 首帧前定主题，避免闪白；同步同源脚本，不依赖 unsafe-inline -->
+<script src="./theme-boot.js"></script>
+<link rel="stylesheet" href="./styles.css">
+<link rel="stylesheet" href="./ios.css">
+</head>
+<body>
+
+<!-- ══════════════════ 图形符号库 ══════════════════ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="sym-petal" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 2.6c1.5 2 2.3 3.9 2.3 5.5 0 .9-.2 1.7-.7 2.4l6-1.3c.4 1.3-.2 2.6-1.7 3.9-1.2 1-2.8 1.8-4.6 2.2 1.4 1 2.4 2.1 2.9 3.2.6 1.4.4 2.6-.5 3.4-1-.5-2-1.6-2.8-3-.5-.9-.8-1.8-.9-2.7-.1.9-.4 1.8-.9 2.7-.8 1.4-1.8 2.5-2.8 3-.9-.8-1.1-2-.5-3.4.5-1.1 1.5-2.2 2.9-3.2-1.8-.4-3.4-1.2-4.6-2.2-1.5-1.3-2.1-2.6-1.7-3.9l6 1.3c-.5-.7-.7-1.5-.7-2.4 0-1.6.8-3.5 2.3-5.5Z"/>
+    </symbol>
+    <symbol id="sym-heart" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 20.4S3.6 15.2 3.6 9.6A4.6 4.6 0 0 1 12 7.1a4.6 4.6 0 0 1 8.4 2.5c0 5.6-8.4 10.8-8.4 10.8Z"/>
+    </symbol>
+    <symbol id="sym-star4" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 1.5c.9 5.5 4.1 8.7 9.6 9.6-5.5.9-8.7 4.1-9.6 9.6-.9-5.5-4.1-8.7-9.6-9.6C7.9 10.2 11.1 7 12 1.5Z"/>
+    </symbol>
+    <symbol id="sym-butterfly" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 6.8c1.3-2.6 3.8-4.6 6.2-4.6 2 0 3.3 1.4 3.3 3.5 0 3.2-3.1 6.4-7 7.4 2.7.3 4.4 1.6 4.4 3.3 0 1.9-1.6 3.3-3.7 3.3-1.4 0-2.6-.7-3.2-1.9-.6 1.2-1.8 1.9-3.2 1.9-2.1 0-3.7-1.4-3.7-3.3 0-1.7 1.7-3 4.4-3.3-3.9-1-7-4.2-7-7.4 0-2.1 1.3-3.5 3.3-3.5 2.4 0 4.9 2 6.2 4.6Z"/>
+      <path fill="currentColor" opacity=".55" d="M11.4 6.6h1.2v13h-1.2z"/>
+    </symbol>
+    <symbol id="sym-bean" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 2.4c5.3 0 9.6 4.3 9.6 9.6S17.3 21.6 12 21.6 2.4 17.3 2.4 12 6.7 2.4 12 2.4Zm0 2.2c-1.6 1.9-2.4 4.4-2.4 7.4s.8 5.5 2.4 7.4c1.6-1.9 2.4-4.4 2.4-7.4s-.8-5.5-2.4-7.4Z"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="app">
+
+  <!-- ═══════════════════════ 侧栏 ═══════════════════════ -->
+  <aside class="side">
+    <div class="brand">
+      <svg class="logo logo-sakura" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M15 15.5 5.5 9.5c-1.6-1-3.3.4-3 2.3l1.3 8c.3 1.9 2.3 2.7 3.7 1.5l7.5-6.4Z" fill="oklch(72% .155 6)"/>
+        <path d="M17 15.5l9.5-6c1.6-1 3.3.4 3 2.3l-1.3 8c-.3 1.9-2.3 2.7-3.7 1.5L17 15.5Z" fill="oklch(72% .155 6)"/>
+        <path d="M14 14.2h4c1.3 0 2.2 1 2.2 2.2v1.4c0 1.3-1 2.2-2.2 2.2h-4c-1.3 0-2.2-1-2.2-2.2v-1.4c0-1.2 1-2.2 2.2-2.2Z" fill="oklch(62% .17 8)"/>
+      </svg>
+      <svg class="logo logo-kanna" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M15.2 11.5C13.6 7.6 10.4 5 7.6 5 5.3 5 3.8 6.7 3.8 9.3c0 4.1 4.1 8.2 9.2 9.3-3.4.4-5.6 2-5.6 4.2 0 2.3 2 4.1 4.7 4.1 1.8 0 3.3-.9 4-2.3v-13Z" fill="oklch(74% .105 292)"/>
+        <path d="M16.8 11.5C18.4 7.6 21.6 5 24.4 5c2.3 0 3.8 1.7 3.8 4.3 0 4.1-4.1 8.2-9.2 9.3 3.4.4 5.6 2 5.6 4.2 0 2.3-2 4.1-4.7 4.1-1.8 0-3.3-.9-4-2.3v-13Z" fill="oklch(78% .095 250)"/>
+        <path d="M16 9.5v14" stroke="oklch(90% .04 285)" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <svg class="logo logo-cafe" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M6 12h17v9a7 7 0 0 1-7 7h-3a7 7 0 0 1-7-7v-9Z" fill="oklch(58% .115 52)"/>
+        <path d="M23 15h2.5a4 4 0 0 1 0 8H23" fill="none" stroke="oklch(58% .115 52)" stroke-width="2.4"/>
+        <path d="M11 8.5c0-2 2-2.5 2-4.5M16 8.5c0-2 2-2.5 2-4.5M21 8.5c0-2 2-2.5 2-4.5" stroke="oklch(70% .08 62)" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+      </svg>
+      <div class="brand-txt">
+        <p class="brand-name" id="brandName">星屑の栞</p>
+        <p class="brand-sub" id="brandDate">—</p>
+      </div>
+    </div>
+
+    <div class="side-scroll">
+      <nav class="side-group" data-group="smart" aria-label="视图">
+        <p class="group-label">视图</p>
+        <button class="nav-item" data-filter="all" aria-current="true">
+          <svg class="ico" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h11"/></svg>
+          <span class="label">全部</span><span class="n tnum" data-count="all"></span>
+        </button>
+        <button class="nav-item" data-filter="today">
+          <svg class="ico" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="16" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/></svg>
+          <span class="label">今天</span><span class="n tnum" data-count="today"></span>
+        </button>
+        <button class="nav-item" data-filter="overdue">
+          <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+          <span class="label">已逾期</span><span class="n tnum" data-count="overdue"></span>
+        </button>
+        <button class="nav-item" data-filter="active">
+          <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/></svg>
+          <span class="label">进行中</span><span class="n tnum" data-count="active"></span>
+        </button>
+        <button class="nav-item" data-filter="history">
+          <svg class="ico" viewBox="0 0 24 24"><path d="M3.6 10.5a8.6 8.6 0 1 1 .6 5"/><path d="M3.2 19.5v-4.4h4.4"/><path d="M12 7.6V12l3 1.8"/></svg>
+          <span class="label">历史记录</span><span class="n tnum" data-count="completed"></span>
+        </button>
+      </nav>
+
+      <nav class="side-group" data-group="cat" aria-label="分类">
+        <p class="group-label">分类</p>
+        <div id="catNav"></div>
+      </nav>
+    </div>
+
+    <!-- ── 番茄钟 ── -->
+    <section class="pomo" id="pomo" data-mode="focus" data-run="false" aria-label="番茄钟">
+      <div class="pomo-top">
+        <div class="pomo-ring">
+          <svg viewBox="0 0 52 52" aria-hidden="true">
+            <circle class="track" cx="26" cy="26" r="22.5"/>
+            <circle class="fill" id="pomoArc" cx="26" cy="26" r="22.5" stroke-dasharray="141.4" stroke-dashoffset="141.4"/>
+          </svg>
+          <span class="glyph" id="pomoGlyph">专注</span>
+        </div>
+        <div class="pomo-info">
+          <p class="pomo-time tnum" id="pomoTime">25:00</p>
+          <p class="pomo-sub" id="pomoSub">准备好了就开始</p>
+          <div class="pomo-dots" id="pomoDots" title="距离长休息还有几轮"></div>
+        </div>
+      </div>
+      <div class="pomo-ctrl">
+        <button class="pomo-btn primary" id="pomoMain" type="button">
+          <svg id="pomoMainIco" viewBox="0 0 24 24"><path d="M7 4.5 19 12 7 19.5Z" fill="currentColor" stroke="none"/></svg>
+          <span id="pomoMainTxt">开始专注</span>
+        </button>
+        <button class="pomo-btn icon" id="pomoSkip" type="button" title="跳到下一段" aria-label="跳到下一段">
+          <svg viewBox="0 0 24 24"><path d="M5 5.5 15 12 5 18.5Z" fill="currentColor" stroke="none"/><path d="M18.5 5v14"/></svg>
+        </button>
+        <button class="pomo-btn icon" id="pomoReset" type="button" title="重置这一段" aria-label="重置">
+          <svg viewBox="0 0 24 24"><path d="M3.8 10.4a8.5 8.5 0 1 1 .5 5"/><path d="M3.4 19v-4.2h4.2"/></svg>
+        </button>
+      </div>
+      <div class="pomo-foot">
+        <button class="pomo-preset" id="pomoPreset" type="button" title="切换时长">25 / 5</button>
+        <span id="pomoTally">今天 0 个</span>
+        <button class="pomo-bell" id="pomoBell" type="button" aria-pressed="false" title="到点提示音与通知" aria-label="提示音">
+          <svg viewBox="0 0 24 24"><path d="M18 8.5a6 6 0 0 0-12 0c0 6-2.5 7.5-2.5 7.5h17S18 14.5 18 8.5Z"/><path d="M13.7 19.5a2 2 0 0 1-3.4 0"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <!-- ── 角色搭档 ── -->
+    <div class="chara" id="chara" data-resting="false">
+      <div class="chara-stage">
+        <button class="chara-btn" id="charaBtn" type="button" aria-label="和搭档说说话">
+          <span class="chara-tilt" id="charaTilt">
+            <span class="chara-react" id="charaReact">
+              <span class="portrait" id="charaPortrait"><img id="charaImg" alt=""></span>
+            </span>
+          </span>
+          <span class="emote" id="charaEmote" aria-hidden="true"></span>
+        </button>
+        <div class="bubble" id="bubble">
+          <span class="bubble-name" id="bubbleName">明月栞那</span>
+          <span class="bubble-txt in" id="bubbleTxt">……</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="side-foot">
+      <button class="foot-btn" id="exportBtn">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7.5 10.5 12 15l4.5-4.5"/><path d="M12 15V3.5"/></svg>
+        <span class="txt">导出备份</span>
+      </button>
+      <button class="foot-btn" id="importBtn">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M16.5 8 12 3.5 7.5 8"/><path d="M12 3.5V15"/></svg>
+        <span class="txt">导入</span>
+      </button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden>
+      <button class="foot-btn danger" id="clearCompleted">
+        <svg viewBox="0 0 24 24"><path d="M3.5 6h17"/><path d="M8.5 6V4h7v2"/><path d="M18.5 6 17.6 20H6.4L5.5 6"/></svg>
+        <span class="txt">清除已完成</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════════ 主区 ═══════════════════════ -->
+  <main class="main">
+
+    <header class="toolbar">
+      <div class="tb-title">
+        <svg class="mark" aria-hidden="true"><use href="#sym-butterfly" id="titleMarkUse"/></svg>
+        <h1 id="viewTitle">全部</h1>
+        <span class="count tnum" id="viewCount"></span>
+      </div>
+      <div class="tb-pomo" id="tbPomo" hidden data-rest="false">
+        <span class="dot"></span>
+        <span class="lab" id="tbPomoLab">专注</span>
+        <span class="tnum" id="tbPomoTime">25:00</span>
+      </div>
+      <div class="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m19.5 19.5-3.2-3.2"/></svg>
+        <input type="search" id="searchInput" placeholder="搜索…" aria-label="搜索待办">
+        <span class="kbd" id="searchKbd">/</span>
+        <button class="search-clear" id="searchClear" type="button" hidden aria-label="清除搜索">
+          <svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <button class="tb-btn" id="undoBtn" title="撤销上一步">
+        <svg viewBox="0 0 24 24"><path d="M3.5 8h11a5.5 5.5 0 0 1 0 11H9"/><path d="M7 4 3.5 8 7 12"/></svg>
+        <span class="txt">撤销</span>
+      </button>
+      <button class="tb-btn icon-only" id="chatBtn" title="AI 对话 (A)" aria-label="打开 AI 对话" aria-pressed="false">
+        <svg viewBox="0 0 24 24"><path d="M5 6.5h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4.2L9.5 21v-3.5H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z"/><path d="M8.5 11h.01M12 11h.01M15.5 11h.01"/></svg>
+      </button>
+      <button class="tb-btn icon-only" id="themeBtn" title="切换主题 (T)" aria-label="切换主题" aria-haspopup="true">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 3.4v17.2"/><path d="M12 8.5a4 4 0 0 0 0 7"/></svg>
+      </button>
+    </header>
+
+    <div class="theme-pop" id="themePop" popover>
+      <p class="theme-pop-title">主题与搭档</p>
+      <div id="themeList" role="radiogroup" aria-label="主题"></div>
+    </div>
+
+    <div class="notice" id="notice" hidden data-tone="note">
+      <svg class="notice-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.6h.01"/></svg>
+      <div><strong id="noticeTitle"></strong><p id="noticeBody"></p></div>
+      <button class="notice-x" id="noticeClose" type="button" aria-label="关闭提示">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="composer-box">
+        <div class="composer-main">
+          <svg class="composer-icon" aria-hidden="true"><use href="#sym-butterfly" id="composerMarkUse"/></svg>
+          <input id="todoInput" type="text" maxlength="500" placeholder="今晚，想留下点什么呢……？" aria-label="新建待办">
+          <span class="composer-hint"><span class="kbd">N</span></span>
+        </div>
+        <div class="composer-more">
+          <div>
+            <div class="composer-opts">
+              <div class="seg" role="group" aria-label="优先级">
+                <button type="button" class="prio-btn" data-priority="low" aria-pressed="true">随意</button>
+                <button type="button" class="prio-btn" data-priority="medium" aria-pressed="false">在意</button>
+                <button type="button" class="prio-btn" data-priority="high" aria-pressed="false">要紧</button>
+              </div>
+              <label class="chip">
+                <svg viewBox="0 0 24 24"><path d="M3.5 7.5h17"/><path d="M6.5 7.5v-3h11v3"/><path d="M4.5 7.5v12h15v-12"/></svg>
+                <select id="category" aria-label="分类"></select>
+              </label>
+              <div class="chip date-chip" id="dueDateWrap">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="16" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/></svg>
+                <span class="date-field">
+                  <input
+                    type="text"
+                    id="dueDate"
+                    class="date-text"
+                    maxlength="12"
+                    placeholder="年/月/日"
+                    autocomplete="off"
+                    spellcheck="false"
+                    inputmode="numeric"
+                    aria-label="截止日期，可输入或点日历选择"
+                  >
+                  <button
+                    type="button"
+                    class="date-cal-btn"
+                    id="dueDateCalBtn"
+                    title="打开日历"
+                    aria-label="打开日历选择日期"
+                    aria-haspopup="dialog"
+                    aria-expanded="false"
+                    aria-controls="dueDatePop"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="16" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/><path d="M8 14h.01M12 14h.01M16 14h.01M8 17h.01M12 17h.01"/></svg>
+                  </button>
+                </span>
+              </div>
+              <button class="add-btn" type="submit" id="addBtn" disabled>添加</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </form>
+
+    <div class="history-bar" id="historyBar" hidden>
+      <span class="hb-label">
+        <svg viewBox="0 0 24 24"><path d="M3.6 10.5a8.6 8.6 0 1 1 .6 5"/><path d="M3.2 19.5v-4.4h4.4"/><path d="M12 7.6V12l3 1.8"/></svg>
+        回顾范围
+      </span>
+      <div class="range" role="group" aria-label="时间范围">
+        <button type="button" class="range-btn" data-range="7" aria-pressed="false">近 7 天</button>
+        <button type="button" class="range-btn" data-range="30" aria-pressed="true">近 30 天</button>
+        <button type="button" class="range-btn" data-range="0" aria-pressed="false">全部</button>
+      </div>
+      <span class="hb-stat" id="historyStat"></span>
+    </div>
+
+    <div class="scroller" id="scroller">
+      <ol class="list" id="todoList" aria-label="待办列表"></ol>
+      <div class="empty" id="emptyState" hidden>
+        <svg class="empty-mark" id="emptyMark" viewBox="0 0 24 24" aria-hidden="true"></svg>
+        <p class="empty-title" id="emptyTitle"></p>
+        <p class="empty-body" id="emptyBody"></p>
+        <p class="empty-line" id="emptyLine"></p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ═══════════════════════ 状态栏 ═══════════════════════ -->
+  <footer class="status">
+    <span class="status-seg" id="statusCounts">—</span>
+    <span class="status-sep"></span>
+    <span class="status-seg">
+      <span class="mini-track"><span class="mini-fill" id="miniFill"></span></span>
+      <span class="tnum" id="statusPct">0%</span>
+    </span>
+    <span class="status-sep"></span>
+    <span class="status-seg" id="sortNote">拖动手柄可排序</span>
+    <div class="status-right">
+      <span class="saved-flash" id="savedFlash">已保存</span>
+      <button class="store-chip" id="storeChip" type="button" data-state="ok">
+        <span class="store-dot"></span><span id="storeLabel">本地存储</span>
+      </button>
+    </div>
+  </footer>
+</div>
+
+<div class="sparkles" id="sparkles" aria-hidden="true"></div>
+
+
+<!-- ═══════════════════════ AI 对话 ═══════════════════════ -->
+<aside class="chat-drawer" id="chatDrawer" hidden aria-label="AI 对话">
+  <header class="chat-head">
+    <div class="chat-head-txt">
+      <p class="chat-title">AI 搭档</p>
+      <p class="chat-sub" id="chatModelLabel">DeepSeek V4 Flash · OpenCode Go</p>
+    </div>
+    <div class="chat-head-actions">
+      <button type="button" class="chat-ico" id="chatClear" title="清空对话" aria-label="清空对话">
+        <svg viewBox="0 0 24 24"><path d="M3.5 6h17"/><path d="M8.5 6V4h7v2"/><path d="M18.5 6 17.6 20H6.4L5.5 6"/></svg>
+      </button>
+      <button type="button" class="chat-ico" id="chatClose" title="关闭 (Esc)" aria-label="关闭对话">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+  </header>
+  <div class="chat-status-row">
+    <div class="chat-status" id="chatStatus" data-state="unknown">检测 API…</div>
+    <button type="button" class="chat-recheck" id="chatRecheck" hidden title="重新检测 API Key">重新检测</button>
+  </div>
+  <div class="chat-msgs" id="chatMsgs" role="log" aria-live="polite"></div>
+  <div class="chat-suggest" id="chatSuggest">
+    <button type="button" data-prompt="帮我梳理一下今天还没做完的要紧事项，按优先级给个执行顺序。">梳理今日</button>
+    <button type="button" data-prompt="根据我的清单，给一个 25 分钟番茄钟内最值得做的一件事。">选一件做</button>
+    <button type="button" data-prompt="用轻松一点的语气鼓励我开工，顺便提醒我别跳过休息。">鼓励一下</button>
+  </div>
+  <form class="chat-composer" id="chatForm" autocomplete="off">
+    <textarea id="chatInput" rows="2" maxlength="4000" placeholder="跟 AI 说点什么… 可问待办、番茄钟、怎么安排今天"></textarea>
+    <div class="chat-composer-bar">
+      <label class="chat-ctx" title="开启：下轮请求附带清单摘要（回答更贴你的待办）。关闭：更省流量；改待办时 AI 仍可按需用工具读取。">
+        <input type="checkbox" id="chatWithTodos">
+        <span>自动附带清单摘要</span>
+      </label>
+      <button type="button" class="chat-stop" id="chatStop" hidden>停止</button>
+      <button type="submit" class="chat-send" id="chatSend" disabled>发送</button>
+    </div>
+  </form>
+</aside>
+<div class="chat-backdrop" id="chatBackdrop" hidden></div>
+
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <span id="toastMsg"></span>
+  <button class="toast-action" id="toastAction" hidden></button>
+</div>
+
+<template id="rowTpl">
+  <li class="row" tabindex="-1">
+    <button class="check" type="button" aria-label="切换完成状态">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.4 8.3 6.4 11.3 12.6 4.8"/></svg>
+    </button>
+    <svg class="flag" aria-hidden="true"></svg>
+    <span class="row-text"></span>
+    <input class="row-edit" type="text" maxlength="500" hidden aria-label="编辑待办文字">
+    <span class="row-meta">
+      <span class="meta-pomo" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8.2"/><path d="M12 9v4l2.6 1.6"/><path d="M9.5 3.2h5"/></svg>
+        <span class="meta-pomo-n"></span>
+      </span>
+      <span class="meta-cat"></span>
+      <span class="meta-due" hidden></span>
+      <button class="meta-cu-push" type="button" data-act="clickup-meta" hidden title="传到 ClickUp My Work（无截止日期时日程默认今天）" aria-label="传到 ClickUp My Work">↑CU</button>
+      <span class="meta-cu" hidden title="已传到 ClickUp · 点击可打开">CU</span>
+      <span class="meta-done" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.6V12l3 1.8"/></svg>
+        <span class="meta-done-txt"></span>
+      </span>
+    </span>
+    <span class="row-tools">
+      <button class="tool" type="button" data-act="focus" aria-label="对这件事开始专注">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8.2"/><path d="M12 9v4l2.6 1.6"/><path d="M9.5 3.2h5"/></svg>
+      </button>
+      <button class="tool" type="button" data-act="clickup" aria-label="传到 ClickUp My Work" title="传到 ClickUp My Work">
+        <svg viewBox="0 0 24 24"><path d="M12 16V5"/><path d="M7.5 9.5 12 5l4.5 4.5"/><path d="M5 19h14"/></svg>
+      </button>
+      <button class="tool grip" type="button" tabindex="-1" aria-label="拖动排序">
+        <svg viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.3" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="tool" type="button" data-act="edit" aria-label="编辑">
+        <svg viewBox="0 0 24 24"><path d="M12.5 20H21"/><path d="M16.7 3.8a2 2 0 0 1 2.8 2.8L7.8 18.4 4 19.5l1.1-3.8Z"/></svg>
+      </button>
+      <button class="tool" type="button" data-act="delete" aria-label="删除">
+        <svg viewBox="0 0 24 24"><path d="M3.5 6h17"/><path d="M8.5 6V4h7v2"/><path d="M18.5 6 17.6 20H6.4L5.5 6"/><path d="M10 10v6M14 10v6"/></svg>
+      </button>
+    </span>
+  </li>
+</template>
+
+<!-- 截止日期日历（fixed，避免被 composer overflow 裁切） -->
+<div class="date-pop" id="dueDatePop" hidden role="dialog" aria-label="选择截止日期">
+  <div class="date-pop-ribbon" aria-hidden="true"></div>
+  <div class="date-pop-inner">
+    <div class="date-pop-head">
+      <div class="date-pop-title" id="dueDateTitle">2026年8月</div>
+      <div class="date-pop-navs">
+        <button type="button" class="date-pop-nav" id="dueDatePrev" aria-label="上个月" title="上个月">↑</button>
+        <button type="button" class="date-pop-nav" id="dueDateNext" aria-label="下个月" title="下个月">↓</button>
+      </div>
+    </div>
+    <div class="date-pop-week" aria-hidden="true">
+      <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+    </div>
+    <div class="date-pop-grid" id="dueDateGrid" role="grid" aria-labelledby="dueDateTitle"></div>
+    <div class="date-pop-foot">
+      <button type="button" class="date-pop-action is-muted" id="dueDateClear">清除</button>
+      <button type="button" class="date-pop-action" id="dueDateToday">今天</button>
+    </div>
+  </div>
+</div>
+
+<script src="./agent-tools.js"></script>
+<script src="./agent-loop.js"></script>
+<script src="./chat-messages.js"></script>
+<!-- iOS：ClickUp + AI 桥（对齐桌面 preload/main）须在 app/chat 之前 -->
+<script src="./js/secure-store.js"></script>
+<!-- 本机个人配置：由 npm run import-config 从桌面 api.txt / clickup.txt / Electron 状态生成 -->
+<script src="./js/mobile-clickup.js"></script>
+<script src="./js/mobile-bridge.js"></script>
+<script src="./js/mobile-notify.js"></script>
+<script src="./app.js"></script>
+<script src="./chat.js"></script>
+<script src="./js/mobile-settings.js"></script>
+<script src="./js/mobile-ux.js"></script>
+</body>
+</html>

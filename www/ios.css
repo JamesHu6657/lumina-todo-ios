@@ -1,0 +1,243 @@
+/* ============================================================================
+   Lumina Todo · iOS 专用样式
+   - 安全区 / 动态视口
+   - 触控热区
+   - 浮动桌宠
+   - 设置面板
+   ========================================================================== */
+
+:root{
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  --vvh: 100dvh;
+}
+
+html.is-ios-app,
+html.is-ios-app body{
+  height: var(--vvh);
+  max-height: var(--vvh);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+  touch-action: manipulation;
+}
+
+html.is-ios-app .app{
+  height: 100%;
+  max-height: 100%;
+  padding-top: var(--sat);
+  padding-left: var(--sal);
+  padding-right: var(--sar);
+  padding-bottom: var(--sab);
+  box-sizing: border-box;
+}
+
+/* 触控：行内工具默认可见一点，避免必须 hover */
+html.is-touch .row .row-tools{
+  opacity: 1;
+}
+html.is-touch .tool,
+html.is-touch .tb-btn,
+html.is-touch .pomo-btn,
+html.is-touch .nav-item,
+html.is-touch .check{
+  min-height: 36px;
+  min-width: 36px;
+}
+html.is-touch .tool.grip{
+  min-width: 40px;
+  touch-action: pan-y;
+}
+html.is-touch .row.is-dragging .tool.grip{
+  touch-action: none;
+}
+html.is-touch .row.dragging{
+  opacity: .92;
+  box-shadow: var(--shadow-m);
+  z-index: 5;
+  transform: scale(1.01);
+}
+
+/* 手机上侧栏角色仍被 styles 隐藏时，用浮动桌宠补回 */
+.float-pet{
+  display: none;
+  position: fixed;
+  right: max(10px, var(--sar));
+  bottom: calc(52px + var(--sab));
+  width: 88px;
+  height: 110px;
+  border: none;
+  padding: 0;
+  background: transparent;
+  z-index: 40;
+  -webkit-user-select: none;
+  user-select: none;
+}
+@media (max-width: 900px){
+  html.is-ios-app .float-pet{ display: block; }
+  /* 侧栏角色占位仍隐藏，省空间；桌宠走 float */
+  html.is-ios-app .chara{ display: none !important; }
+}
+@media (min-width: 901px){
+  html.is-ios-app .float-pet{ display: none !important; }
+}
+.float-pet-art{
+  width: 100%;
+  height: 100%;
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: bottom center;
+  filter: drop-shadow(0 8px 16px var(--char-glow, rgba(0 0 0 / .25)));
+  transition: transform 220ms var(--e-out);
+}
+.float-pet:active .float-pet-art{
+  transform: scale(0.96) rotate(-2deg);
+}
+.float-pet-bubble{
+  position: absolute;
+  right: 78px;
+  bottom: 70px;
+  max-width: 140px;
+  padding: 7px 10px;
+  border-radius: 12px 12px 4px 12px;
+  background: var(--lift-solid, #fff);
+  color: var(--ink);
+  border: 1.5px solid var(--line);
+  box-shadow: var(--shadow-m);
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-align: left;
+  pointer-events: none;
+  white-space: pre-wrap;
+}
+
+/* 聊天抽屉：安全区 + 键盘 */
+html.is-ios-app .chat-drawer{
+  padding-top: var(--sat);
+  padding-bottom: var(--sab);
+  max-height: var(--vvh);
+}
+html.is-ios-app .chat-composer{
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+html.is-ios-app .chat-input,
+html.is-ios-app #chatInput{
+  font-size: 16px; /* 防止 iOS 聚焦自动放大 */
+}
+
+/* Toast 抬离 Home 指示条 */
+html.is-ios-app .toast{
+  bottom: calc(48px + var(--sab));
+}
+
+/* 状态栏 */
+html.is-ios-app .status{
+  padding-bottom: max(4px, calc(var(--sab) * 0.35));
+}
+
+/* 设置面板 */
+.settings-backdrop{
+  position: fixed; inset: 0;
+  background: oklch(10% .02 280 / .45);
+  z-index: 80;
+  backdrop-filter: blur(4px);
+}
+.settings-sheet{
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  max-height: min(88dvh, 640px);
+  background: var(--bg-pane, var(--lift-solid));
+  color: var(--ink);
+  border-radius: 18px 18px 0 0;
+  border: 1.5px solid var(--line);
+  box-shadow: var(--shadow-l);
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: var(--sab);
+  animation: settings-up 280ms var(--e-out);
+}
+@keyframes settings-up{
+  from{ transform: translateY(12%); opacity: .6; }
+  to{ transform: none; opacity: 1; }
+}
+.settings-head{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.settings-title{
+  margin: 0; font-size: 16px; font-weight: 700;
+}
+.settings-close{
+  width: 36px; height: 36px; border-radius: 99px;
+  border: 1.5px solid var(--line);
+  background: var(--lift-strong);
+  color: var(--ink-2);
+  font-size: 14px;
+}
+.settings-body{
+  overflow: auto;
+  padding: 8px 16px 20px;
+  -webkit-overflow-scrolling: touch;
+}
+.settings-sec{ margin: 14px 0 18px; }
+.settings-sec h3{
+  margin: 0 0 6px; font-size: 13px; letter-spacing: .04em;
+  color: var(--ink-2); text-transform: none;
+}
+.settings-hint{
+  margin: 0 0 10px; font-size: 12px; line-height: 1.45; color: var(--ink-3);
+}
+.settings-hint code{
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.settings-label{
+  display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 5px;
+}
+.settings-input{
+  width: 100%; box-sizing: border-box;
+  height: 42px; padding: 0 12px;
+  border-radius: 11px;
+  border: 1.5px solid var(--line);
+  background: var(--sunk);
+  color: var(--ink);
+  font-size: 16px;
+}
+.settings-input:focus{
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.settings-mask{
+  margin: 6px 0 0; font-size: 11.5px; color: var(--ink-3); min-height: 1.2em;
+}
+.settings-row{
+  display: flex; gap: 8px; margin-top: 10px;
+}
+.settings-btn{
+  flex: 1; height: 40px; border-radius: 99px;
+  border: 1.5px solid var(--accent);
+  background: var(--accent); color: var(--accent-on);
+  font-size: 13px; font-weight: 600;
+}
+.settings-btn.ghost{
+  background: transparent; color: var(--ink-2); border-color: var(--line);
+}
+body.settings-open .app{ pointer-events: none; }
+
+/* 横屏窄高：仍显示 float pet 缩小版 */
+@media (max-height: 500px) and (max-width: 900px){
+  .float-pet{ width: 64px; height: 80px; bottom: calc(40px + var(--sab)); }
+  .float-pet-bubble{ display: none; }
+}
+
+/* 减少动效 */
+@media (prefers-reduced-motion: reduce){
+  .settings-sheet{ animation: none; }
+  .float-pet-art{ transition: none; }
+}

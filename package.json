@@ -1,0 +1,32 @@
+{
+  "name": "lumina-todo-ios",
+  "version": "1.0.0",
+  "description": "リスト · 我的小清单 — iOS 版（待办 + 番茄钟 + 角色搭档 + AI Agent + ClickUp）",
+  "author": "JamesHu6657",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "sync-web": "node scripts/sync-web.js",
+    "build:www": "node scripts/sync-web.js && node scripts/assert-web-safe.js",
+    "import-config": "node scripts/export-desktop-state.js",
+    "cap:sync": "node scripts/assert-web-safe.js && npx cap sync ios && node scripts/post-cap-sync.js && node scripts/assert-web-safe.js ios/App/App/public && node scripts/verify-ios-public.js",
+    "cap:open": "npx cap open ios",
+    "ios:prepare": "npm run build:www && npm run cap:sync",
+    "test": "npm run build:www && node scripts/run-bridge-tests.js && node scripts/assert-web-safe.js",
+    "test:ios": "npm run ios:prepare && node scripts/assert-web-safe.js && node scripts/assert-web-safe.js ios/App/App/public && node scripts/verify-ios-public.js",
+    "post-cap-sync": "node scripts/post-cap-sync.js",
+    "serve": "node scripts/assert-web-safe.js && npx --yes serve www --listen tcp://127.0.0.1:5173 --no-clipboard"
+  },
+  "dependencies": {
+    "@capacitor/app": "^7.0.1",
+    "@capacitor/core": "^7.2.0",
+    "@capacitor/haptics": "^7.0.1",
+    "@capacitor/keyboard": "^7.0.1",
+    "@capacitor/local-notifications": "^7.0.1",
+    "@capacitor/status-bar": "^7.0.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.2.0",
+    "@capacitor/ios": "^7.2.0"
+  }
+}

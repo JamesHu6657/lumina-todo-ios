@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+*.log
+
+# 本机个人密钥与导出状态（勿提交）
+www/js/personal-config.local.js
+www/data/personal-secrets.json
+www/data/desktop-state.json
+.lumina-local/
+_export_desktop_state.json
+
+# Xcode / CocoaPods
+ios/App/Pods/
+ios/App/build/
+ios/DerivedData/
+*.xcuserstate
+xcuserdata/
