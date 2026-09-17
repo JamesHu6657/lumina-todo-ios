@@ -374,11 +374,9 @@ let historyRange = 30;
 let editingId = null;
 let endEdit = null;            // 正在编辑时的收尾函数（render 草稿保活要用）
 let pendingExternal = null;    // 延迟的远端 STORAGE 快照（编辑中/写盘失败时攒着）
-let lastSeenSavedAt = 0;       // 最近一次看到的 STORAGE savedAt
 let lastAppliedList = [];      // 盘上内容的最后已知形态：脏窗口恢复合并的基线
 let dirtyBase = null;          // localDirty 窗口起点时的盘基线
 let localDirty = false;        // 有改动还没落盘：内存领先于盘
-let syncGen = 0;               // 外部内容流进内存的代际计数：undo 合并归因要用
 let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
 const remoteIds = new Set();   // 当前版本由远端写入（流入过内存）的条目 id——undo 归因要用
 let persistState = storageWritable ? "ok" : "unavailable";
@@ -1247,9 +1245,8 @@ function loadState(){
       const list = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.todos) ? parsed.todos : null;
       if (list){
         const r = sanitizeList(list); todos = r.todos; recovered = r.dropped;
-        /* 同步机制的三条基线：undo 三方合并、脏窗口恢复、结算标记采纳 */
+        /* 同步机制的两条基线：脏窗口恢复、结算标记采纳 */
         lastAppliedList = todos.map((t) => ({ ...t }));
-        if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
         if (!Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
       }
       else recovered = -1;
@@ -1288,7 +1285,6 @@ function persist(){
     setPersistState("ok");
     flashSaved();
     localDirty = false;
-    lastSeenSavedAt = savedAt;
     lastAppliedList = todos.map((t) => ({ ...t }));
     return true;
   } catch (err) {
@@ -1311,6 +1307,10 @@ function undo(){
   const snap = undoStack.pop();
   syncUndoBtn();
   if (!snap){ toast("没有可以撤销的操作了"); return; }
+  /* 与其它 mutator 一样先灌盘上最新内容：远端写可能还排在 storage 事件
+     队列里没投递，不先采纳的话 remoteIds 对它失明——三方合并会把远端
+     删的条目复活、把远端对本页新增条目的编辑当本地改动丢掉 */
+  syncTodosFromDisk();
   /* 不整体回滚：先读盘，盘上被别页动过就走三方合并——
      S=快照、M=内存、D=盘，逐条归因 */
   let diskList = null;
@@ -1335,13 +1335,17 @@ function undo(){
     const M = new Map(todos.map((t) => [t.id, t]));
     const diskIds = new Set(diskList.map((t) => t.id));
     const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-    const merged = [];
+    let merged = [];
     for (const d of diskList){
       const s = S.get(d.id), m = M.get(d.id);
       if (!s){
-        /* 盘有快照没有：远端加的才保留（登记过的、或根本没进过内存的）。
-           在内存里见过却没被标 → 是我们自己加的，撤销就该移除 */
-        if (!m || remoteIds.has(d.id)) merged.push(d);
+        /* 盘有快照没有：远端内容才保留——登记过的、根本没进过内存的、
+           或盘上版本与内存不同（远端编辑还卡在事件队列没流入，此时不查
+           会把对方的编辑连同条目一起删掉）。进内存的都顺手登记为远端；
+           在内存里见过且与盘一致却没被标 → 我们加的，撤销就该移除 */
+        if (!m || remoteIds.has(d.id) || !eq(d, m)){
+          remoteIds.add(d.id); merged.push(d);
+        }
         continue;
       }
       /* 三方共有：盘≠内存说明远端版较新（远端赢）；盘==内存且≠快照时，
@@ -1363,17 +1367,25 @@ function undo(){
       merged.splice(at, 0, s);
       mergedIds.add(s.id);
     }
+    /* 撤销纯排序：merged 按盘序输出会让「撤销调整顺序」变成无声空操作——
+       合并结果与快照同集合、同内容时，按快照顺序排回 */
+    const byId = new Map(merged.map((t) => [t.id, t]));
+    if (merged.length === snap.todos.length
+        && snap.todos.every((t) => { const g = byId.get(t.id); return g && eq(g, t); })){
+      merged = snap.todos.map((t) => byId.get(t.id));
+    }
     todos = merged.map(restore);
     /* 合并态下有 dirtyBase 时 pendingExternal 还要留给恢复合并用，不能清 */
     if (!dirtyBase) pendingExternal = null;
   } else {
     todos = snap.todos.map(restore);
   }
-  /* 绑定的待办：快照里记过且现在还在就还原；否则清掉悬挂的当前绑定 */
-  pomo.taskId = typeof snap.pomoTaskId === "string" && todos.some((t) => t.id === snap.pomoTaskId && !t.completed)
-    ? snap.pomoTaskId
-    : (pomo.taskId && todos.some((t) => t.id === pomo.taskId && !t.completed) ? pomo.taskId : null);
-  savePomo();
+  /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
+     否则当前绑定还有效就留着，再不行清掉防悬挂 */
+  const restorable = (id) => id && todos.some((t) => t.id === id && !t.completed);
+  const nextTaskId = restorable(snap.pomoTaskId) ? snap.pomoTaskId
+    : (restorable(pomo.taskId) ? pomo.taskId : null);
+  if (nextTaskId !== pomo.taskId){ pomo.taskId = nextTaskId; savePomo(); }
   persist(); render();
   play("r-nod");
   toast(`已撤销：${snap.label}`);
@@ -2190,14 +2202,14 @@ function toggleTodo(id, checkEl){
   }
 }
 
-function updateTodo(id, patch, opts = {}){
+function updateTodo(id, patch){
   syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return null;
   remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
   Object.assign(t, patch, { updatedAt: Date.now() });
   render();
-  if (opts.persist !== false) persist();
+  persist();
   return t;
 }
 
@@ -2265,12 +2277,13 @@ function reorder(fromId, toId, placeAfter){
   if (!sortingEnabled() || fromId === toId) return;
   syncTodosFromDisk();
   const from = todos.findIndex((t) => t.id === fromId);
-  if (from < 0) return;
+  const toRaw = todos.findIndex((t) => t.id === toId);
+  /* 目标已消失（拖放途中该行被删/被别页改掉）：整个拖拽作废，不留空撤销步 */
+  if (from < 0 || toRaw < 0) return;
   snapshot("调整顺序");
   const [item] = todos.splice(from, 1);
-  const to = todos.findIndex((t) => t.id === toId);
-  if (to < 0){ todos.splice(Math.min(from, todos.length), 0, item); }
-  else { todos.splice(placeAfter ? to + 1 : to, 0, item); }
+  const to = toRaw > from ? toRaw - 1 : toRaw;
+  todos.splice(placeAfter ? to + 1 : to, 0, item);
   render(); persist();
   play("r-nod");
 }
@@ -2389,14 +2402,13 @@ function syncTodosFromDisk(){
   if (!Array.isArray(list)) return false;
   lastDisk = parsed;             // 裸数组存档没有 savedAt/settledSegs 元数据，也无所谓
   const clean = sanitizeList(list).todos;
-  if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
   /* 结算标记随列表一起来：记账状态和列表同源。不采纳的话，一个滞后于
      「别页结算+persist」的本地写入会把盘上标记抹掉，给重复记账开窗。
      并集采纳：标记只增，旧写入无法让集合回退 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
   lastAppliedList = clean.map((t) => ({ ...t }));   // 盘上内容的最后已知形态：恢复/软合并的基线
   const same = JSON.stringify(clean) === JSON.stringify(todos);
-  if (!same){ markRemoteAdopted(todos, clean); todos = clean; syncGen++; }   // 外部内容流进内存：undo 归因要登记
+  if (!same){ markRemoteAdopted(todos, clean); todos = clean; }   // 外部内容流进内存：undo 归因要登记
   /* 盘上是我方写却攒着远端快照：那次远端写被我们的 persist 覆盖了，
      事件快照是唯一幸存副本——软合并把远端新增和较新编辑救回来。
      （盘上是远端写则快照只可能更旧或已并入，直接丢） */
@@ -2452,7 +2464,6 @@ function mergeRemoteWindow(parsed, base, followDeletes){
   }
   markRemoteAdopted(todos, merged);
   todos = merged;
-  syncGen++;               // 远端内容流进了内存：undo 三方合并的归因要算到它
   /* 远端快照的结算标记一并采纳：它和这份列表同源 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
 }
@@ -2480,7 +2491,6 @@ function mergeSoftRemote(parsed){
   }
   markRemoteAdopted(todos, merged);
   todos = merged;
-  syncGen++;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
 }
 
@@ -2494,7 +2504,6 @@ function applyExternal(parsed){
   if (JSON.stringify(clean) === JSON.stringify(todos)) return;   // 内容与内存一致：套了也白套
   markRemoteAdopted(todos, clean);
   todos = clean;
-  syncGen++;
   lastAppliedList = clean.map((t) => ({ ...t }));
   reconcilePomoTask();
   render();
@@ -2533,7 +2542,6 @@ window.addEventListener("storage", (e) => {
   if (!parsed || parsed.writer === TAB_ID) return;      // 自己写的不用回灌
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.todos) ? parsed.todos : null;
   if (!list) return;
-  if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
   /* 先攒快照再决定：编辑中/脏窗口里都不能立刻套用——若紧接着的 persist
      把这份远端写覆盖掉，快照就是它唯一的幸存副本 */
   pendingExternal = parsed;

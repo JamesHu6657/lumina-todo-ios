@@ -536,6 +536,42 @@ const kd = (w, el, init) => el.dispatchEvent(new w.KeyboardEvent("keydown", { bu
     f.remove();
   }
 
+  /* ── 终审：编辑中远端删除 → 撤销不得复活远端删的条目 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="b"] .check').click();   // 压快照 S0（含 a/b/c）
+    await sleep(60);
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);                                       // 编辑中：远端写入只进 pendingExternal
+    seedTodos(readTodos().filter(t => t.id !== "c"));      // 远端删 c
+    await sleep(80);
+    D.getElementById("undoBtn").click();                   // 按钮 mousedown 防移焦 → 编辑不关，undo 直跑
+    await sleep(100);
+    const list = readTodos();
+    assert("undo-no-resurrect-remote-del", !list.some(t => t.id === "c"),
+      "c 被远端删除，撤销不得复活: " + JSON.stringify(list.map(t=>t.id)));
+    assert("undo-still-reverts-b", list.find(t=>t.id==="b") && list.find(t=>t.id==="b").completed === false);
+    f.remove();
+  }
+
+  /* ── 终审：撤销纯排序不是空操作 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const row = D.querySelector('.row[data-id="a"]');
+    row.focus();
+    kd(W, row, { key:"ArrowDown", altKey:true });          // Alt+↓：a 下移 → [b,a,c]
+    await sleep(80);
+    assert("nudge-moved", readTodos().map(t=>t.id).join(",") === "b,a,c",
+      readTodos().map(t=>t.id).join(","));
+    D.getElementById("undoBtn").click();
+    await sleep(80);
+    assert("undo-reorder-restores", readTodos().map(t=>t.id).join(",") === "a,b,c",
+      readTodos().map(t=>t.id).join(","));
+    f.remove();
+  }
+
   const failed = results.filter(r => !r[1]);
   out.textContent += `\n${results.length - failed.length}/${results.length} passed`;
   document.title = failed.length ? "FAIL" : "ALL-PASS";
