@@ -180,18 +180,20 @@ const TAB_ID = (() => {
  *   blocked  站点存储权限被关
  * ==========================================================================*/
 function probeStorage(){
+  /* 先判沙盒：被嵌在跨源页里时连 window.localStorage 的取值本身都会抛，
+     走不到 setItem 探测，直接报「预览环境」比「权限被关」更能指路 */
+  const sandboxed = (() => {
+    try { return window.self !== window.top || location.protocol === "file:"; }
+    catch { return true; } // 读 window.top 抛错本身就说明被嵌在跨源页里
+  })();
   let ls;
-  try { ls = window.localStorage; } catch { return { writable:false, reason:"blocked" }; }
-  if (!ls) return { writable:false, reason:"blocked" };
+  try { ls = window.localStorage; } catch { return { writable:false, reason: sandboxed ? "sandbox" : "blocked" }; }
+  if (!ls) return { writable:false, reason: sandboxed ? "sandbox" : "blocked" };
   try {
     ls.setItem("__lumina_probe__","1");
     ls.removeItem("__lumina_probe__");
     return { writable:true, reason:null };
   } catch (err) {
-    const sandboxed = (() => {
-      try { return window.self !== window.top || location.protocol === "file:"; }
-      catch { return true; } // 读 window.top 抛错本身就说明被嵌在跨源页里
-    })();
     if (sandboxed) return { writable:false, reason:"sandbox" };
     const quota = err && (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED" || err.code === 22);
     return { writable:false, reason: quota ? "private" : "blocked" };
@@ -370,7 +372,14 @@ let searchQuery = "";
 let selectedPriority = "low";
 let historyRange = 30;
 let editingId = null;
-let pendingExternal = null;
+let endEdit = null;            // 正在编辑时的收尾函数（render 草稿保活要用）
+let pendingExternal = null;    // 延迟的远端 STORAGE 快照（编辑中/写盘失败时攒着）
+let lastSeenSavedAt = 0;       // 最近一次看到的 STORAGE savedAt
+let lastAppliedList = [];      // 盘上内容的最后已知形态：脏窗口恢复合并的基线
+let dirtyBase = null;          // localDirty 窗口起点时的盘基线
+let localDirty = false;        // 有改动还没落盘：内存领先于盘
+let syncGen = 0;               // 外部内容流进内存的代际计数：undo 合并归因要用
+let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
 let persistState = storageWritable ? "ok" : "unavailable";
 let noticeDismissed = false;
 let currentTheme = "kanna";
@@ -543,6 +552,8 @@ const pomo = {
   tally:0,             // 今天完成的专注段数
   halfSaid:false,
   nearSaid:false,
+  seg:null,            // 当前段的实例 id：跨标签页判重结算用
+  settledSegs:[],      // 已结算段 id 的只增集合（封顶 20，FIFO 淘汰）
 };
 let pomoTick = null;
 let nagTimer = null;
@@ -555,13 +566,33 @@ const durationOf = (mode) => (mode === "focus" ? preset().focus : mode === "shor
 const MODE_LABEL = { focus:"专注", short:"短憩", long:"长憩" };
 const isResting = () => pomo.mode !== "focus";
 
+/* 结算标记：只增集合（封顶 20 个，FIFO 淘汰）。做成集合而不是单值——
+   远端滞后写入只能并进来，永远不能把新标记顶掉，重复结算窗口被彻底关死 */
+function markSegSettled(seg){
+  if (!seg) return;
+  pomo.settledSegs = [seg, ...pomo.settledSegs.filter((s) => s !== seg)].slice(0, 20);
+}
+function adoptSettledSegs(raw){
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  const add = list.filter((s) => typeof s === "string" && !pomo.settledSegs.includes(s));
+  if (add.length) pomo.settledSegs = [...pomo.settledSegs, ...add].slice(-20);
+}
+/* 盘 payload 上「这段是否已被别页记账」：新形状 settledSegs[]，旧存档 settledSeg 字符串 */
+function segAlreadySettled(payload, seg){
+  if (!payload || !seg) return false;
+  if (Array.isArray(payload.settledSegs) && payload.settledSegs.includes(seg)) return true;
+  return payload.settledSeg === seg;
+}
+
 function savePomo(){
   try {
     store.set(POMO_KEY, JSON.stringify({
+      writer:TAB_ID,
       mode:pomo.mode, running:pomo.running, endsAt:pomo.endsAt, leftMs:pomo.leftMs,
       segmentMs:pomo.segmentMs,
       round:pomo.round, taskId:pomo.taskId, presetIdx:pomo.presetIdx,
       sound:pomo.sound, tallyDay:pomo.tallyDay, tally:pomo.tally,
+      seg:pomo.seg, settled:pomo.settledSegs,
     }));
   } catch { /* 存不下不影响计时 */ }
   syncNativePomoNotify();
@@ -569,13 +600,32 @@ function savePomo(){
 function loadPomo(){
   let raw;
   try { raw = JSON.parse(store.get(POMO_KEY) || "null"); } catch { raw = null; }
+  applyPomoState(raw);
+}
+
+/* 把一份 POMO 状态（本页加载或别页写入）落地为当前计时状态。
+   可重入：storage 事件和加载共用这一个入口 */
+function applyPomoState(raw){
   if (!raw || typeof raw !== "object") return;
-  if (["focus","short","long"].includes(raw.mode)) pomo.mode = raw.mode;
+  /* 只认合法 mode：POMO_KEY 被改成 "{}" 之类的垃圾时直接忽略，
+     别把本页正在跑的计时清零 */
+  if (!["focus","short","long"].includes(raw.mode)) return;
+  /* 采纳外部状态：本页挂起的自动转段作废（否则会拿过期段强行结算） */
+  cancelSegmentTransition();
+  pomo.mode = raw.mode;
   if (Number.isInteger(raw.presetIdx) && PRESETS[raw.presetIdx]) pomo.presetIdx = raw.presetIdx;
   pomo.sound = raw.sound === true;
   pomo.round = boundedInt(raw.round, 0, 999999, 0);
   pomo.taskId = typeof raw.taskId === "string" ? raw.taskId : null;
   if (Number.isFinite(raw.segmentMs) && raw.segmentMs > 0) pomo.segmentMs = raw.segmentMs;
+  /* 旧格式存档没有 seg：用 endsAt/leftMs 派生确定性段 id——
+     两个页面迁移同一份旧状态会算出同一个标记，判重才不会失散 */
+  pomo.seg = typeof raw.seg === "string" ? raw.seg
+    : Number.isFinite(raw.endsAt) ? "e" + raw.endsAt
+    : Number.isFinite(raw.leftMs) ? "l" + raw.leftMs
+    : null;
+  /* settled 新形状是数组、旧存档可能是字符串：一律并集采纳，标记集合只增不减 */
+  adoptSettledSegs(raw.settled);
   /* 跨天了就把今日计数清零 */
   if (raw.tallyDay === todayStr() && Number.isFinite(raw.tally)) { pomo.tallyDay = raw.tallyDay; pomo.tally = boundedInt(raw.tally, 0, 999999, 0); }
   else { pomo.tallyDay = todayStr(); pomo.tally = 0; }
@@ -588,19 +638,24 @@ function loadPomo(){
         pomo.segmentMs = durationOf(pomo.mode);
       }
       startTick();
+      if (isResting()) startNag(); else stopNag();
     } else {
-      /* 人不在的时候那一段已经跑完了 */
+      /* 人不在的时候那一段已经跑完了。保持「在跑」状态交给 finishSegment：
+         它的判重会先读盘——若这段已被别的页面结算过就直接采纳，不会重复记账 */
       const realEndedAt = raw.endsAt; // 先留住真实结束时刻，打卡用它而不是重启时刻
-      // 旧存档无 segmentMs 时与仍在跑的分支一致：回退当前预设，避免打卡时长 0
       if (!(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
         pomo.segmentMs = durationOf(pomo.mode);
       }
-      pomo.running = false; pomo.endsAt = null;
+      pomo.running = true; pomo.endsAt = raw.endsAt; pomo.leftMs = null;
+      stopNag();
       finishSegment(true, realEndedAt);
     }
-  } else if (Number.isFinite(raw.leftMs)){
-    pomo.leftMs = Math.max(0, raw.leftMs);
-    if (!(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
+  } else {
+    pomo.running = false; pomo.endsAt = null;
+    /* leftMs 封顶 3 小时：脏数据不该造出一段永远耗不完的计时 */
+    pomo.leftMs = Number.isFinite(raw.leftMs) ? Math.min(Math.max(0, raw.leftMs), 3 * 3600e3) : null;
+    stopTick(); stopNag();
+    if (pomo.leftMs != null && !(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
       pomo.segmentMs = durationOf(pomo.mode);
     }
   }
@@ -629,7 +684,7 @@ function chime(kind){
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     audioCtx = audioCtx || new AC();
-    if (audioCtx.state === "suspended") audioCtx.resume();
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(()=>{});
     const notes = kind === "rest" ? [784, 587, 494] : [523, 659, 784];
     notes.forEach((f, i) => {
       const o = audioCtx.createOscillator(), g = audioCtx.createGain();
@@ -719,6 +774,7 @@ function startSegment(mode, announce, opts = {}){
   pomo.leftMs = null;
   pomo.halfSaid = false;
   pomo.nearSaid = false;
+  pomo.seg = uid();          // 新的一段：结算判重标记跟着换
   startTick();
   if (isResting()) startNag(); else stopNag();
   savePomo(); renderPomo(); render();
@@ -762,6 +818,33 @@ function logPomoToClickUp(endedAt, segmentMs){
 
 function finishSegment(silentCatchUp, endedAtOverride){
   cancelSegmentTransition();
+  /* 判重链：不管是「运行中到点」还是「暂停在零点上按继续」，结算前
+     先读盘看 POMO 的真实状态——别页已结算/暂停/开新段就采纳，
+     否则两边的 pomodoros/tally/round 会各 +1 变成 +2 */
+  const aboutToSettle = pomo.running || (pomo.leftMs != null && pomo.leftMs <= 0);
+  if (aboutToSettle){
+    let disk;
+    try { disk = JSON.parse(store.get(POMO_KEY) || "null"); } catch { disk = null; }
+    const valid = disk && typeof disk === "object" && ["focus","short","long"].includes(disk.mode);
+    if (valid){
+      /* 盘上旧格式没有 seg：用 applyPomoState 同款规则派生一个再比——
+         不然派生的 "e"+endsAt 对 undefined 永远不等，会走「采纳」分支，
+         而采纳一个已到点的 running 态又会回到这里，无限递归 */
+      const diskSeg = typeof disk.seg === "string" ? disk.seg
+        : Number.isFinite(disk.endsAt) ? "e" + disk.endsAt
+        : Number.isFinite(disk.leftMs) ? "l" + disk.leftMs
+        : null;
+      const sameOngoing = pomo.running
+        ? (disk.running === true && diskSeg === (pomo.seg || null) && disk.endsAt === pomo.endsAt)
+        : (disk.running === false && diskSeg === (pomo.seg || null)
+            /* 脏数据 leftMs<0 会被钳成 0，严格相等对不上会卡死——
+               双方都 ≤0 视为同一段的零点 */
+            && (disk.leftMs === pomo.leftMs
+              || (Number.isFinite(disk.leftMs) && disk.leftMs <= 0 && pomo.leftMs <= 0)));
+      if (!sameOngoing){ applyPomoState(disk); renderPomo(); render(); return; }
+    }
+    /* 盘上读不出合法状态就照常结算：存储受限环境 disk 恒为 null 或自家写入 */
+  }
   const wasFocus = pomo.mode === "focus";
   /* 必须在清空 endsAt 之前取真实结束时刻：
    * - restorePomo 显式传入 raw.endsAt
@@ -783,18 +866,31 @@ function finishSegment(silentCatchUp, endedAtOverride){
     if (pomo.tallyDay !== today){ pomo.tallyDay = today; pomo.tally = 0; }
     // A segment recovered after midnight belongs to its actual completion day.
     if (finishedDay === today) pomo.tally++;
-    /* 给绑定的待办记一个番茄 */
-    if (pomo.taskId){
+    /* 先落 POMO（带上 settled 标记）再动列表：其他页面先看到「已结算」，
+       就不会在 STORAGE/POMO 两条事件的间隙里补结第二次 */
+    const nextMode = pomo.round % preset().per === 0 ? "long" : "short";
+    pomo.mode = nextMode;
+    pomo.segmentMs = null;
+    /* 本段可能已被结算过——远端标记经 STORAGE/POMO 采纳进集合后，
+       下方 lastDisk 若恰是我方写会查不到它。先记下再标：标过之后本地恒含本段 */
+    const wasSettled = !!(pomo.seg && pomo.settledSegs.includes(pomo.seg));
+    markSegSettled(pomo.seg);
+    savePomo();
+    /* 番茄入账必须写在最新列表上：本页挂起/忙碌期间，别页的写入可能还
+       排在 storage 事件队列里没投递，直接 persist 内存会把它们整个冲掉 */
+    syncTodosFromDisk();
+    /* 记账前看刚读到的 STORAGE payload：别页若已把这段的番茄记进盘，
+       它的 persist 会带上 settledSegs 含这段（writer 是对方）。这个标记随
+       「记账的那次写入」同生同落，比 POMO_KEY 的 settled 可靠——
+       后者的写顺序会被双方 savePomo 互相覆盖 */
+    const dup = wasSettled || !!(pomo.seg && lastDisk && lastDisk.writer && lastDisk.writer !== TAB_ID
+      && segAlreadySettled(lastDisk, pomo.seg));
+    if (!dup && pomo.taskId){
       const t = todos.find((x) => x.id === pomo.taskId);
       if (t){ t.pomodoros = (t.pomodoros || 0) + 1; t.updatedAt = Date.now(); persist(); }
     }
-    const nextMode = pomo.round % preset().per === 0 ? "long" : "short";
-    // 先落盘「已结算」，再异步打卡：崩溃后不可重复记番茄 / 重复打卡
-    pomo.mode = nextMode;
-    pomo.segmentMs = null;
-    savePomo();
-    /* 同步到 ClickUp：失败只写日志，绝不影响计时 */
-    logPomoToClickUp(realEndedAt, finishedSegmentMs);
+    /* 别页已结算的段不重复打卡（operationId 幂等兜底，但能省则省） */
+    if (!dup) logPomoToClickUp(realEndedAt, finishedSegmentMs);
     chime("rest");
     renderPomo(); render();
     if (silentCatchUp){
@@ -828,14 +924,19 @@ function toggleRun(){
     savePomo(); renderPomo(); render();
     say("pause");
   } else {
-    const left = pomo.leftMs != null && pomo.leftMs > 0 ? pomo.leftMs : durationOf(pomo.mode);
+    /* 暂停恰好发生在归零瞬间（两次 tick 之间）：这段其实已经到头，
+       按「继续」应该直接结算，而不是白送一整段新计时 */
+    if (pomo.leftMs != null && pomo.leftMs <= 0){ finishSegment(false); return; }
+    const fresh = pomo.leftMs == null;
+    const left = fresh ? durationOf(pomo.mode) : pomo.leftMs;
     if (!(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
       pomo.segmentMs = durationOf(pomo.mode);
     }
     pomo.running = true;
     pomo.endsAt = Date.now() + left;
     pomo.leftMs = null;
-    pomo.halfSaid = false; pomo.nearSaid = false;
+    /* 续跑不重置提醒标记，否则过半线会再说一遍；新的一段才重新武装 */
+    if (fresh){ pomo.halfSaid = false; pomo.nearSaid = false; pomo.seg = uid(); }
     startTick();
     if (isResting()) startNag();
     savePomo(); renderPomo(); render();
@@ -843,7 +944,7 @@ function toggleRun(){
     else say(pomo.mode === "long" ? "longRest" : "restStart");
     /* 音频上下文必须在用户手势里解锁 */
     if (pomo.sound){
-      try { const AC = window.AudioContext || window.webkitAudioContext; if (AC){ audioCtx = audioCtx || new AC(); audioCtx.resume(); } } catch {}
+      try { const AC = window.AudioContext || window.webkitAudioContext; if (AC){ audioCtx = audioCtx || new AC(); audioCtx.resume().catch(()=>{}); } } catch {}
     }
   }
 }
@@ -873,17 +974,34 @@ function resetSegment(){
 }
 
 function focusOnTask(id){
+  syncTodosFromDisk();   // 别绑到别页刚删掉的幽灵任务上
   const t = todos.find((x) => x.id === id);
+  /* 校验必须在清状态之前：对已完成/不存在的行按 f，
+     不能把专注结束后挂起的自动休息吞掉 */
   if (!t || t.completed) return;
+  cancelSegmentTransition();
+  const short = `${t.text.slice(0, 18)}${t.text.length > 18 ? "…" : ""}`;
+  /* 专注段进行中（跑着或暂停着）按 F：绝不允许重置计时——
+     同一任务就是重复按，不同任务是把这一段的记账对象换掉，endsAt 都保持不动 */
+  if (pomo.mode === "focus" && (pomo.running || pomo.leftMs != null)){
+    if (pomo.taskId === id){
+      if (!pomo.running && pomo.leftMs != null) toggleRun();   // 暂停着就顺手继续
+      else toast("这件事已经在专注中");
+      return;
+    }
+    pomo.taskId = id;
+    savePomo(); renderPomo(); render();
+    toast(`这次专注改记到「${short}」头上`);
+    return;
+  }
   pomo.taskId = id;
   if (isResting()){
     /* 休息还没结束就想干活？先说一句再放行 */
     say("skipRest");
     stopNag();
-    pomo.mode = "focus";
   }
   startSegment("focus", true);
-  toast(`开始专注：${t.text.slice(0, 18)}${t.text.length > 18 ? "…" : ""}`);
+  toast(`开始专注：${short}`);
 }
 function setPomoPreset(idx){
   if (!PRESETS[idx]) return null;
@@ -900,7 +1018,12 @@ function setPomoPreset(idx){
 }
 
 function renderPomo(){
-  const total = durationOf(pomo.mode);
+  /* 跨零点自愈：tally 还挂在前一天就清零，别让昨天的数字过夜 */
+  if (pomo.tallyDay !== todayStr()){ pomo.tallyDay = todayStr(); pomo.tally = 0; }
+  /* 运行中/暂停中的段用开段时锁定的 segmentMs：中途切预设只影响下一段，
+     不能让圆环比例跟着跳 */
+  const total = ((pomo.running || pomo.leftMs != null) && Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)
+    ? pomo.segmentMs : durationOf(pomo.mode);
   const left = remaining();
   const ratio = total > 0 ? 1 - left / total : 0;
 
@@ -913,9 +1036,10 @@ function renderPomo(){
   pomoGlyph.textContent = MODE_LABEL[pomo.mode];
   pomoTime.textContent = mmss(left);
 
-  /* 副标题：优先显示绑定的待办。用 textContent 塞进 <b>，不拼 HTML */
+  /* 副标题：优先显示绑定的待办。用 textContent 塞进 <b>，不拼 HTML。
+     暂停中的专注段也显示任务名，比干巴巴的「已暂停」更有用 */
   const task = pomo.taskId ? todos.find((t) => t.id === pomo.taskId) : null;
-  if (pomo.running && pomo.mode === "focus" && task){
+  if ((pomo.running || pomo.leftMs != null) && pomo.mode === "focus" && task){
     pomoSub.replaceChildren();
     const b = document.createElement("b");
     b.textContent = task.text;
@@ -1099,14 +1223,27 @@ function loadState(){
     try {
       const parsed = JSON.parse(rawV2);
       const list = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.todos) ? parsed.todos : null;
-      if (list){ const r = sanitizeList(list); todos = r.todos; recovered = r.dropped; }
+      if (list){
+        const r = sanitizeList(list); todos = r.todos; recovered = r.dropped;
+        /* 同步机制的三条基线：undo 三方合并、脏窗口恢复、结算标记采纳 */
+        lastAppliedList = todos.map((t) => ({ ...t }));
+        if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
+        if (!Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+      }
       else recovered = -1;
     } catch { recovered = -1; }
     return recovered;
   }
   const rawV1 = store.get(LEGACY_KEY);
   if (rawV1){
-    try { const r = sanitizeList(JSON.parse(rawV1)); todos = r.todos; recovered = r.dropped; persist(); }
+    try {
+      const p1 = JSON.parse(rawV1);
+      /* v1 也可能是 {todos:[…]} 包装格式，别假设裸数组 */
+      const r = sanitizeList(Array.isArray(p1) ? p1 : p1 && p1.todos);
+      todos = r.todos; recovered = r.dropped;
+      lastAppliedList = todos.map((t) => ({ ...t }));
+      persist();
+    }
     catch { recovered = -1; }
   }
   return recovered;
@@ -1114,23 +1251,40 @@ function loadState(){
 
 /* ---------------------------------------------------------------- 写入 */
 function persist(){
-  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt:Date.now(), todos });
-  if (!storageWritable){ setPersistState("unavailable"); return false; }
+  const savedAt = Date.now();
+  /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
+     比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
+  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, settledSegs:pomo.settledSegs, todos });
+  if (!storageWritable){
+    setPersistState("unavailable");
+    if (!localDirty) dirtyBase = lastAppliedList;
+    localDirty = true;
+    return false;
+  }
   try {
     store.set(STORAGE_KEY, payload);
     setPersistState("ok");
     flashSaved();
+    localDirty = false;
+    lastSeenSavedAt = savedAt;
+    lastAppliedList = todos.map((t) => ({ ...t }));
     return true;
   } catch (err) {
     const quota = err && (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED" || err.code === 22);
     setPersistState(quota ? "quota" : "error");
+    /* 内存领先于盘：记下窗口起点的盘基线，恢复时三方合并要用 */
+    if (!localDirty) dirtyBase = lastAppliedList;
+    localDirty = true;
     return false;   // 写失败绝不中断 UI，改动仍在内存里
   }
 }
 
 /* ---------------------------------------------------------------- 撤销 */
 function snapshot(label){
-  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId });
+  /* savedAt/syncGen 记基线：撤销时要判断盘上内容是否被别页动过、
+     以及远端内容是否已经流进过内存（决定「快照有而内存没有」的归因） */
+  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId,
+    savedAt:lastSeenSavedAt, gen:syncGen });
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
   syncUndoBtn();
 }
@@ -1138,10 +1292,64 @@ function undo(){
   const snap = undoStack.pop();
   syncUndoBtn();
   if (!snap){ toast("没有可以撤销的操作了"); return; }
-  todos = snap.todos;
+  /* 不整体回滚：先读盘，盘上被别页动过就走三方合并——
+     S=快照、M=内存、D=盘，逐条归因 */
+  let diskList = null;
+  if (!localDirty){
+    try {
+      const d = JSON.parse(store.get(STORAGE_KEY) || "null");
+      const l = d && (Array.isArray(d) ? d : d.todos);
+      if (Array.isArray(l)) diskList = sanitizeList(l).todos;
+      /* 盘上的结算标记一并采纳：undo 后的 persist 会把当前 settledSegs
+         写回去，不先并进来就可能把别页刚记的标记盖掉 */
+      if (d && !Array.isArray(d)) adoptSettledSegs(d.settledSegs || d.settledSeg);
+    } catch { /* 读不出就走纯快照恢复 */ }
+  }
+  const livePomos = new Map(todos.map((t) => [t.id, t.pomodoros]));
+  /* pomodoros 是系统记账不是用户编辑：恢复快照时绝不用旧值盖新值 */
+  const restore = (t) => livePomos.has(t.id)
+    ? { ...t, pomodoros: Math.max(livePomos.get(t.id) || 0, t.pomodoros || 0) } : t;
+  if (diskList){
+    /* 远端内容自快照后是否流进过内存：syncGen 没变说明内存里没见过远端版，
+       「快照有而内存没有」就是我们自己删的（该恢复），否则是远端删的（别复活）；
+       「盘有而快照没有」同理：远端已流入过才当远端新增保留 */
+    const remoteFlowed = syncGen !== snap.gen;
+    const S = new Map(snap.todos.map((t) => [t.id, t]));
+    const M = new Map(todos.map((t) => [t.id, t]));
+    const diskIds = new Set(diskList.map((t) => t.id));
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const merged = [];
+    for (const d of diskList){
+      const s = S.get(d.id), m = M.get(d.id);
+      if (!s){ if (!m || remoteFlowed) merged.push(d); continue; }   // 盘有快照没有：远端已流入才保留
+      /* 三方共有：盘≠内存说明远端改过了（远端赢）；
+         盘==内存且≠快照才是我们改的（回滚到快照） */
+      if (!m || !eq(d, m) || eq(m, s)) merged.push(d); else merged.push(s);
+    }
+    /* 快照有而盘没有：远端没流入过就是我们的删除（按原位插回），
+       流入过就是远端删的（不复活）。插位找「快照里的下一个幸存邻居」 */
+    const mergedIds = new Set(merged.map((t) => t.id));
+    for (let i = 0; i < snap.todos.length; i++){
+      const s = snap.todos[i];
+      if (mergedIds.has(s.id) || diskIds.has(s.id) || remoteFlowed) continue;
+      let at = merged.length;
+      for (let j = i + 1; j < snap.todos.length; j++){
+        const pos = merged.findIndex((t) => t.id === snap.todos[j].id);
+        if (pos >= 0){ at = pos; break; }
+      }
+      merged.splice(at, 0, s);
+      mergedIds.add(s.id);
+    }
+    todos = merged.map(restore);
+    /* 合并态下有 dirtyBase 时 pendingExternal 还要留给恢复合并用，不能清 */
+    if (!dirtyBase) pendingExternal = null;
+  } else {
+    todos = snap.todos.map(restore);
+  }
+  /* 绑定的待办：快照里记过且现在还在就还原；否则清掉悬挂的当前绑定 */
   pomo.taskId = typeof snap.pomoTaskId === "string" && todos.some((t) => t.id === snap.pomoTaskId && !t.completed)
     ? snap.pomoTaskId
-    : null;
+    : (pomo.taskId && todos.some((t) => t.id === pomo.taskId && !t.completed) ? pomo.taskId : null);
   savePomo();
   persist(); render();
   play("r-nod");
@@ -1277,6 +1485,20 @@ const isTouchUi =
 
 /* ---------------------------------------------------------------- 渲染 */
 function render(){
+  /* 草稿保活：render 会 replaceChildren 重建整个列表，直接把正在编辑的
+     输入框拆掉——打了一半的字连同焦点一起丢。先 park 收尾（只拆 DOM，
+     不 flush 不 sync 不提交），记下文稿/选区/焦点，重建后原样恢复 */
+  let draft = null;
+  if (endEdit && editingId){
+    const live = todoList.querySelector(`.row[data-id="${cssEscape(editingId)}"] .row-edit`);
+    if (live){
+      draft = { id: editingId, text: live.value,
+                sel: live.selectionStart, selEnd: live.selectionEnd,
+                focused: document.activeElement === live };
+    }
+    endEdit(false, false, true);
+  }
+
   const visible = getVisible();
   const sortable = sortingEnabled();
   const history = isHistory();
@@ -1309,6 +1531,23 @@ function render(){
 
   if (history) renderHistoryStat(visible);
   updateStats();
+
+  /* 草稿恢复：同一行重开编辑、还原打了一半的字和选区。
+     autofocus 跟着原焦点走——原来没聚焦就不能抢（抢了又丢会误提交） */
+  if (draft){
+    const node = todoList.querySelector(`.row[data-id="${cssEscape(draft.id)}"]`);
+    if (node){
+      startEdit(node, draft.id, draft.focused);
+      const inp = node.querySelector(".row-edit");
+      if (inp){
+        inp.value = draft.text;
+        if (draft.focused){
+          inp.focus();
+          try { inp.setSelectionRange(draft.sel, draft.selEnd); } catch {}
+        }
+      }
+    }
+  }
 }
 
 function groupLabel(key){
@@ -1511,14 +1750,27 @@ function buildRow(todo, index, sortable){
   node.addEventListener("click", (e) => { if (!e.target.closest("button,input")) node.focus(); });
 
   node.addEventListener("keydown", (e) => {
-    if (e.target !== node) return;
-    if (e.key === "Enter"){ e.preventDefault(); startEdit(node, todo.id); }
-    else if (e.key === " "){ e.preventDefault(); toggleTodo(todo.id, check); }
-    else if (e.key === "Backspace" || e.key === "Delete"){ e.preventDefault(); removeTodo(todo.id); }
-    else if (e.key.toLowerCase() === "f"){ e.preventDefault(); focusOnTask(todo.id); }
-    else if (e.key.toLowerCase() === "u"){ e.preventDefault(); pushTodoToClickUp(todo.id); }
-    else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")){ e.preventDefault(); nudge(todo.id, e.key === "ArrowUp" ? -1 : 1); }
-    else if (e.key === "ArrowUp" || e.key === "ArrowDown"){ e.preventDefault(); moveFocus(node, e.key === "ArrowUp" ? -1 : 1); }
+    /* 焦点在行内的编辑框/下拉里就不管（交给输入语义）；焦点在行本体或
+       行内按钮（Tab 进来的 .check/.tool）上时行快捷键照常生效——
+       否则按钮聚焦时 ↓ 会冒泡到 doc 级被拉回第一行、F/Alt+↑↓ 全死 */
+    if (e.target.closest("input,textarea,select")) return;
+    const arrow = e.key === "ArrowUp" || e.key === "ArrowDown";
+    /* 放行浏览器组合键：Ctrl+F 查找、Ctrl+Backspace、Alt+… 等不该触发行操作。
+       Alt 只保留 Alt+↑↓ 挪位置这一条 */
+    if (e.ctrlKey || e.metaKey || (e.altKey && !arrow)) return;
+    /* 长按只对方向键有意义（连续扫行/连续挪位）；F/空格/退格 按住不放
+       会变成操作风暴（反复起停计时、连删整列） */
+    if (e.repeat && !arrow) return;
+    const onBtn = e.target !== node && e.target.closest("button") != null;
+    /* 已处理的键必须 stopPropagation：document 级快捷键会把 ↓ 再处理一遍，
+       把刚移好的焦点拉回第一行（Alt+↓ 挪位置也一样被截胡） */
+    if (!onBtn && e.key === "Enter"){ e.preventDefault(); e.stopPropagation(); startEdit(node, todo.id); }
+    else if (!onBtn && e.key === " "){ e.preventDefault(); e.stopPropagation(); toggleTodo(todo.id, check); }
+    else if (e.key === "Backspace" || e.key === "Delete"){ e.preventDefault(); e.stopPropagation(); removeTodo(todo.id); }
+    else if (e.key.toLowerCase() === "f"){ e.preventDefault(); e.stopPropagation(); focusOnTask(todo.id); }
+    else if (e.key.toLowerCase() === "u"){ e.preventDefault(); e.stopPropagation(); pushTodoToClickUp(todo.id); }
+    else if (e.altKey && arrow){ e.preventDefault(); e.stopPropagation(); nudge(todo.id, e.key === "ArrowUp" ? -1 : 1); }
+    else if (arrow){ e.preventDefault(); e.stopPropagation(); moveFocus(node, e.key === "ArrowUp" ? -1 : 1); }
   });
 
   if (sortable) attachDrag(node, todo.id);
@@ -1582,9 +1834,26 @@ function syncUndoBtn(){
  * blur，blur 又调 finish(true)，结果「取消」变成「提交」。
  * 必须先摘监听、再改 DOM，且整个 finish 只允许跑一次。
  * ==========================================================================*/
-function startEdit(node, id){
+function startEdit(node, id, autofocus = true){
   const todo = todos.find((t) => t.id === id);
-  if (!todo || editingId) return;
+  if (!todo) return;
+  /* 事件闭包里捕获的可能是上一轮 render 摘掉的旧节点——在 detached 节点上
+     开编辑会得到幽灵输入框，下一次 render 的草稿恢复会把它变成空白编辑态 */
+  if (!node || !node.isConnected) node = todoList.querySelector(`.row[data-id="${cssEscape(id)}"]`);
+  if (!node) return;
+  /* 该行已在编辑但输入框没聚焦（草稿恢复时 draft.focused=false 的路径）：
+     Enter/双击应该把焦点送进已开的编辑框，而不是早退把用户挡在外面 */
+  if (editingId === id){
+    const open = node.querySelector(".row-edit");
+    if (open && !open.hidden) open.focus();
+    return;
+  }
+  /* 另一行正在编辑：先把它提交掉，commit 会触发 render()，node 已被重建 */
+  if (editingId){
+    if (endEdit) endEdit(true);
+    node = todoList.querySelector(`.row[data-id="${cssEscape(id)}"]`);
+    if (!node) return;
+  }
   editingId = id;
 
   const textEl = node.querySelector(".row-text");
@@ -1594,47 +1863,64 @@ function startEdit(node, id){
   textEl.hidden = true;
   input.hidden = false;
   input.value = original;
-  input.focus(); input.select();
+  /* 草稿保活恢复路径传 autofocus=false：原来的输入框根本没聚焦，
+     不能在这儿抢焦点——blur 监听已挂上，抢了又丢会误触发提交 */
+  if (autofocus){ input.focus(); input.select(); }
 
   let settled = false;
-  const finish = (commit) => {
+  const finish = (commit, refocus, park) => {
     if (settled) return;
     settled = true;
     input.removeEventListener("blur", onBlur);
     input.removeEventListener("keydown", onKey);
     editingId = null;
+    endEdit = null;
 
     const next = input.value.trim().slice(0, MAX_TEXT);
     input.hidden = true; textEl.hidden = false;
 
-    let committed = false;
-    if (commit && next && next !== original){
-      const rebased = rebasePendingEdit(id);
+    /* park 模式（render 的草稿保活收尾）只拆 DOM：绝不能跑 flush/sync——
+       此刻调用方可能刚改完内存还没 persist（mutate→render→persist 顺序），
+       读盘会读到变更前的旧版本，一「采纳」就把刚做的 mutation 冲掉 */
+    if (!park){
+      /* 先并入一切外部变更再落这次提交：flushExternal 处理已投递的快照，
+         syncTodosFromDisk 再无条件读盘——别页已写但事件还没投递到的窗口也覆盖。
+         反过来（先提交后灌）会用旧快照把刚 persist 的本地改动回滚 */
+      flushExternal();
+      syncTodosFromDisk();
+    }
+
+    /* 该行可能在编辑期间被删了（本地删或外部同步删掉）：
+       updateTodo 会空转，但空快照会留下一个「什么都没发生」的撤销步，
+       而且快照里带着已删行——以后 ⌘Z 会把它复活再广播给所有标签页 */
+    if (commit && next && next !== original && todos.some((t) => t.id === id)){
       snapshot("编辑待办");
-      // 若编辑期间收到了其他标签页的数据，先以那份最新数据为撤销基线，
-      // 再覆写本次只编辑的 text；否则一次 undo 会回滚对方的全部改动。
-      updateTodo(id, { text: next }, { persist:false });
-      persist();
-      if (rebased) toast("已同步其他标签页的改动，并保留当前编辑");
-      committed = true;
+      updateTodo(id, { text: next });
       play("r-nod");
     } else if (commit && !next){
       toast("内容是空的，没有改动");
     }
-    flushExternal(committed ? id : null);
+    /* 键盘收尾（Enter/Esc）把焦点还给这一行，键盘流不断档；
+       blur 和 render 触发的收尾不抢焦点——用户/应用本来就把焦点挪走了 */
+    if (refocus) refocusRow(id);
   };
-  const onBlur = () => finish(true);
+  const onBlur = () => finish(true, false);
   const onKey = (e) => {
     e.stopPropagation();
-    if (e.key === "Enter"){ e.preventDefault(); finish(true); }
-    else if (e.key === "Escape"){ e.preventDefault(); finish(false); }
+    /* Safari 在 IME 组合中派发真实 key（不像 Chrome 发 Process）：
+       组合中回车是选词、Esc 是取消候选，不能当成提交/取消编辑 */
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter"){ e.preventDefault(); finish(true, true); }
+    else if (e.key === "Escape"){ e.preventDefault(); finish(false, true); }
   };
   input.addEventListener("blur", onBlur);
   input.addEventListener("keydown", onKey);
+  endEdit = (commit, refocus, park) => finish(commit, refocus, park);
 }
 
 /* ---------------------------------------------------------------- 变更 */
 function addTodo(text, priority, category, dueDate){
+  syncTodosFromDisk();   // 先把别页的写入灌进来，别拿旧内存去覆盖
   if (todos.length >= MAX_ITEMS){ toast(`最多只能保存 ${MAX_ITEMS} 条`); return; }
   snapshot("添加待办");
   const now = Date.now();
@@ -1780,7 +2066,9 @@ async function pushTodoToClickUp(id, btnEl){
       ? { label: "打开", run: () => openSafeClickUp(safeUrl) }
       : undefined;
 
-    // await 后必须重新查找：可能已删除 / 另一路径已写入 taskId
+    // await 后必须重新查找+同步：可能已删除 / 另一页面已写入 taskId，
+    // 别拿挂起前的旧内存去 persist 冲掉别页的写入
+    syncTodosFromDisk();
     const live = todos.find((x) => x.id === id);
     if (!live){
       const msg = "已传到 ClickUp（本地条目已删除）· " + scheduleHint;
@@ -1851,14 +2139,13 @@ async function pushTodoToClickUp(id, btnEl){
 }
 
 function toggleTodo(id, checkEl){
+  /* 先取坐标：sync 可能触发 render()，之后这个节点就摘了，rect 变 0,0 */
+  const rect = checkEl ? checkEl.getBoundingClientRect() : null;
+  syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return;
   const willComplete = !t.completed;
-  /* 先取坐标：render() 之后这个节点就没了 */
-  if (willComplete && checkEl){
-    const r = checkEl.getBoundingClientRect();
-    burst(r.left + r.width / 2, r.top + r.height / 2);
-  }
+  if (willComplete && rect) burst(rect.left + rect.width / 2, rect.top + rect.height / 2);
   snapshot(willComplete ? "标记完成" : "取消完成");
   const now = Date.now();
   t.completed = willComplete;
@@ -1879,6 +2166,7 @@ function toggleTodo(id, checkEl){
 }
 
 function updateTodo(id, patch, opts = {}){
+  syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return null;
   Object.assign(t, patch, { updatedAt: Date.now() });
@@ -1889,6 +2177,7 @@ function updateTodo(id, patch, opts = {}){
 
 /* 数据先删，动画只是表演：重复点击、中途 render 都安全 */
 function removeTodo(id){
+  syncTodosFromDisk();
   const idx = todos.findIndex((t) => t.id === id);
   if (idx < 0) return; // 幂等，连点两次不会重复提示
   snapshot("删除待办");
@@ -1910,6 +2199,7 @@ function removeTodo(id){
 }
 
 function clearCompleted(){
+  syncTodosFromDisk();
   const n = todos.filter((t) => t.completed).length;
   if (n === 0){ toast("还没有已完成的待办"); return; }
   snapshot(`清除 ${n} 件已完成`);
@@ -1931,6 +2221,7 @@ function requestClearCompleted(){
 
 function nudge(id, delta){
   if (!sortingEnabled()){ toast("清除筛选和搜索后才能排序"); return; }
+  syncTodosFromDisk();
   const from = todos.findIndex((t) => t.id === id);
   const to = from + delta;
   if (from < 0 || to < 0 || to >= todos.length) return;
@@ -1944,6 +2235,7 @@ function nudge(id, delta){
 /* 先移除、再算目标索引，否则往下拖会因为索引偏移落到目标项前面一位 */
 function reorder(fromId, toId, placeAfter){
   if (!sortingEnabled() || fromId === toId) return;
+  syncTodosFromDisk();
   const from = todos.findIndex((t) => t.id === fromId);
   if (from < 0) return;
   snapshot("调整顺序");
@@ -1957,7 +2249,9 @@ function reorder(fromId, toId, placeAfter){
 
 function refocusRow(id){
   const node = todoList.querySelector(`.row[data-id="${cssEscape(id)}"]`);
+  /* 行被别页删掉/被筛选藏了就把焦点放回列表容器，别掉回 body 让键盘流断档 */
   if (node) node.focus({ preventScroll:true });
+  else todoList.focus({ preventScroll:true });
 }
 
 /* ---------------------------------------------------------------- 拖拽 */
@@ -2017,6 +2311,7 @@ function importJSON(file){
     if (!list){ toast("文件里找不到待办数据"); return; }
     const { todos: clean, dropped } = sanitizeList(list);
     if (clean.length === 0){ toast("没有可导入的有效条目"); return; }
+    syncTodosFromDisk();   // 导入覆盖整张表，更不能拿旧内存垫在底下
     snapshot("导入数据");
     todos = clean;
     reconcilePomoTask();
@@ -2028,62 +2323,165 @@ function importJSON(file){
 }
 
 /* -------------------------------------------------------- 跨标签页同步 */
-function applyExternal(list, opts = {}){
-  todos = sanitizeList(list).todos;
-  reconcilePomoTask();
-  if (opts.resetUndo !== false){
-    undoStack.length = 0;
-    syncUndoBtn();
+/* 读盘并把最新内容合进内存。返回值三态：
+   "applied" 内容有变化并已进内存；"same" 内容一致；false 读不出/不该采纳。
+   所有 mutator 在改内存前都要先调它——挂着旧内存直接 persist 会把别页
+   的写入整个冲掉（事件可能还排在队列里没投递） */
+function syncTodosFromDisk(){
+  lastDisk = null;
+  let mergedFromDirty = false;
+  let parsed = null;
+  try { parsed = JSON.parse(store.get(STORAGE_KEY) || "null"); } catch { return false; }
+  if (localDirty){
+    /* 内存领先于盘：绝不能采纳盘内容（会冲掉没存下的改动），但读还是要读——
+       finishSegment 的判重需要看到别页最新的 settledSegs 标记 */
+    lastDisk = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    return false;
   }
+  /* 刚从脏窗口爬出来且攒着远端快照：先把它按窗口前基线并进内存——
+     恢复写已把远端改动从盘上盖掉，这份快照是它们唯一的幸存副本。
+     合并输入取 pendingExternal 与刚读到的 parsed 中较新的那份远端写：
+     事件入队后远端可能又写了一版，用旧的合并会让新版在盘上被覆盖。
+     合并后重读盘：开头的 parsed 是合并前的旧版，直接用会把合并结果再冲掉。
+     persist 再失败就直接退：merged 留在内存，且 persist 会把 dirtyBase
+     改记为恢复写（=当前盘内容）——下一个脏窗口的基线本就该是它 */
+  if (dirtyBase && pendingExternal){
+    let remoteSrc = pendingExternal;
+    if (parsed && !Array.isArray(parsed) && parsed.writer && parsed.writer !== TAB_ID
+        && Array.isArray(parsed.todos)) remoteSrc = parsed;   // 盘上这份是远端写的，必然 ≥ 排队快照
+    mergeRemoteWindow(remoteSrc, dirtyBase, true);
+    pendingExternal = null;
+    if (!persist()) return false;
+    try { parsed = JSON.parse(store.get(STORAGE_KEY) || "null"); } catch { parsed = null; }
+    mergedFromDirty = true;
+  }
+  dirtyBase = null;
+  const list = parsed && (Array.isArray(parsed) ? parsed : parsed.todos);
+  if (!Array.isArray(list)) return false;
+  lastDisk = parsed;             // 裸数组存档没有 savedAt/settledSegs 元数据，也无所谓
+  const clean = sanitizeList(list).todos;
+  if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
+  /* 结算标记随列表一起来：记账状态和列表同源。不采纳的话，一个滞后于
+     「别页结算+persist」的本地写入会把盘上标记抹掉，给重复记账开窗。
+     并集采纳：标记只增，旧写入无法让集合回退 */
+  if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  lastAppliedList = clean.map((t) => ({ ...t }));   // 盘上内容的最后已知形态：恢复/软合并的基线
+  const same = JSON.stringify(clean) === JSON.stringify(todos);
+  if (!same){ todos = clean; syncGen++; }   // 外部内容流进内存：undo 合并归因要用
+  /* 盘上是我方写却攒着远端快照：那次远端写被我们的 persist 覆盖了，
+     事件快照是唯一幸存副本——软合并把远端新增和较新编辑救回来。
+     （盘上是远端写则快照只可能更旧或已并入，直接丢） */
+  if (pendingExternal){
+    if (parsed && !Array.isArray(parsed) && parsed.writer === TAB_ID){
+      const before = JSON.stringify(todos);
+      mergeSoftRemote(pendingExternal);
+      if (JSON.stringify(todos) !== before){
+        if (!persist()){ pendingExternal = null; return false; }   // merged 在内存，内容没丢
+        mergedFromDirty = true;
+      }
+    }
+    pendingExternal = null;
+  }
+  reconcilePomoTask();
+  /* 外部变更立刻上屏：mutator 入口的早退路径（目标已被别页删了）也必须
+     让界面跟上；脏窗口/软合并改了内存但内容碰巧等于盘时同理 */
+  if (!same || mergedFromDirty) render();
+  return same ? "same" : "applied";
+}
+
+/* 三方合并远端内容进内存：base=参照基线（脏窗口前的盘 或 刚采纳的盘）、
+   ours=内存、theirs=远端快照。逐条判定——
+   · 我们没碰过的基线条目（ours==base）→ 取远端版（远端编辑/番茄入账要活下来）
+   · 远端没碰过的（theirs==base）→ 留本页版
+   · 双方都改过的 → 本页为准，但 pomodoros 单调计数取大（远端记的番茄不能丢）
+   · 双方各自新增的 → 都保留
+   followDeletes=true（脏窗口恢复，远端写在窗口内、见过基线）才跟进
+   「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释 */
+function mergeRemoteWindow(parsed, base, followDeletes){
+  const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
+  const baseMap = new Map(base.map((t) => [t.id, t]));
+  const ourIds = new Set(todos.map((t) => t.id));
+  const remoteMap = new Map(remote.map((t) => [t.id, t]));
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const merged = todos
+    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id))
+    .map((t) => {
+      const b = baseMap.get(t.id), r = remoteMap.get(t.id);
+      if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
+      if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版
+      if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
+      return { ...t, pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0) };
+    });
+  for (const t of remote){
+    if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
+  }
+  todos = merged;
+  syncGen++;               // 远端内容流进了内存：undo 三方合并的归因要算到它
+  /* 远端快照的结算标记一并采纳：它和这份列表同源 */
+  if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+}
+
+/* 软合并：把被覆盖的远端快照并进内存，但绝不删条目、不盖本页更新——
+   快照早于盘上写时，远端缺的条目分不清「没见到」还是「删了」，
+   宁可多留（add-wins）也不能误删 */
+function mergeSoftRemote(parsed){
+  const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
+  const ourIds = new Set(todos.map((t) => t.id));
+  const remoteMap = new Map(remote.map((t) => [t.id, t]));
+  const merged = todos.map((t) => {
+    const r = remoteMap.get(t.id);
+    if (!r) return t;
+    const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
+    return { ...w, pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0) };
+  });
+  for (const t of remote){
+    if (!ourIds.has(t.id)) merged.push(t);
+  }
+  todos = merged;
+  syncGen++;
+  if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+}
+
+function applyExternal(parsed){
+  /* 内存领先于盘时绝不许远端快照覆盖（会丢掉没存下的改动）——
+     攒回 pendingExternal，等恢复窗口合并 */
+  if (localDirty){ pendingExternal = parsed; return; }
+  const list = Array.isArray(parsed) ? parsed : parsed && parsed.todos;
+  const clean = sanitizeList(Array.isArray(list) ? list : []).todos;
+  if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  if (JSON.stringify(clean) === JSON.stringify(todos)) return;   // 内容与内存一致：套了也白套
+  todos = clean;
+  syncGen++;
+  lastAppliedList = clean.map((t) => ({ ...t }));
+  reconcilePomoTask();
   render();
   play("r-peek");
-  toast(opts.message || "已同步其他标签页的改动");
+  toast("已同步其他标签页的改动");
 }
-/**
- * 编辑中收到外部更新时，先把本地状态换成外部最新版本，再由调用方创建撤销
- * 快照并写入本次字段改动。这样 undo 只撤当前编辑，不会倒退别的标签页修改。
- */
-function rebasePendingEdit(id){
-  if (!pendingExternal) return false;
-  const list = pendingExternal;
-  pendingExternal = null;
-  const local = todos.find((t) => t.id === id);
-  if (!local) return false;
-
-  const merged = sanitizeList(list).todos;
-  const index = merged.findIndex((t) => t.id === id);
-  if (index < 0) merged.unshift({ ...local });
-  todos = merged;
-  reconcilePomoTask();
-  return true;
-}
-function flushExternal(preserveEditedId = null){
-  if (!pendingExternal) return;
-  const list = pendingExternal; pendingExternal = null;
-  if (!preserveEditedId){
-    applyExternal(list);
-    return;
-  }
-
-  const local = todos.find((t) => t.id === preserveEditedId);
-  if (!local){
-    applyExternal(list);
-    return;
-  }
-  const merged = sanitizeList(list).todos;
-  const index = merged.findIndex((t) => t.id === preserveEditedId);
-  if (index >= 0) merged[index] = { ...local };
-  else merged.unshift({ ...local });
-  applyExternal(merged, {
-    resetUndo:false,
-    message:index >= 0 ? "已同步其他标签页的改动，并保留当前编辑" : "其他标签已删除该待办，已保留当前编辑",
-  });
-  persist();
+function flushExternal(){
+  if (!pendingExternal || localDirty) return;   // 有未落盘改动时不许外部状态覆盖内存
+  const snap = pendingExternal;
+  /* 不预清 pendingExternal：sync 要自己消费它——脏窗口合并
+     （dirtyBase && pendingExternal）或「我方写覆盖远端」时的软合并；
+     提前清掉会让合并条件短路，快照内容永久丢失。
+     也绝不直接套快照：事件按序排队，快照之后盘上可能已有更新版 */
+  const r = syncTodosFromDisk();
+  if (r === "applied"){ play("r-peek"); toast("已同步其他标签页的改动"); }
+  else if (r === false) applyExternal(snap);   // 真读不出盘才整套退回；localDirty 守卫会攒回
 }
 window.addEventListener("storage", (e) => {
   /* 主题跨标签同步，但不弹提示 */
   if (e.key === THEME_KEY && e.newValue && THEMES[e.newValue] && e.newValue !== currentTheme){
     applyTheme(e.newValue, false);
+    return;
+  }
+  /* 番茄钟也跨页面同步（storage 事件不在写入方触发，收到的必是外部写入） */
+  if (e.key === POMO_KEY){
+    if (e.newValue == null) return;
+    let praw;
+    try { praw = JSON.parse(e.newValue); } catch { return; }
+    applyPomoState(praw);
+    renderPomo(); render();   // .focusing 高亮跟 taskId 走，光刷番茄钟不够
     return;
   }
   if (e.key !== STORAGE_KEY || e.newValue == null) return;
@@ -2092,8 +2490,13 @@ window.addEventListener("storage", (e) => {
   if (!parsed || parsed.writer === TAB_ID) return;      // 自己写的不用回灌
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.todos) ? parsed.todos : null;
   if (!list) return;
-  if (editingId){ pendingExternal = list; return; }     // 别把用户正在敲的字冲掉
-  applyExternal(list);
+  if (Number.isFinite(parsed.savedAt)) lastSeenSavedAt = parsed.savedAt;
+  /* 先攒快照再决定：编辑中/脏窗口里都不能立刻套用——若紧接着的 persist
+     把这份远端写覆盖掉，快照就是它唯一的幸存副本 */
+  pendingExternal = parsed;
+  if (editingId || localDirty) return;
+  const r = syncTodosFromDisk();
+  if (r === false) applyExternal(parsed);
 });
 
 /* ------------------------------------------------------------ 侧栏分类 */
@@ -2331,6 +2734,7 @@ function bindEvents(){
     play("r-peek");
   });
   todoInput.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return;   // IME 组合中 Esc 只该取消候选
     if (e.key === "Escape"){
       if (isDueCalOpen()){ closeDueCal(); return; }
       if (todoInput.value){ todoInput.value = ""; syncAdd(); }
@@ -2478,30 +2882,77 @@ function bindEvents(){
   window.addEventListener("pointerleave", resetTilt);
   window.addEventListener("blur", resetTilt);
 
-  /* 切回标签页或 iOS 回前台立刻对表。 */
+  /* 切回标签页或 iOS 回前台立刻对表：补读盘（挂起期间可能错过 storage
+     事件/跨过零点）、补结算、补刷新 */
   const reconcileForeground = () => {
+    syncTodosFromDisk();
     if (pomo.running && remaining() <= 0) finishSegment(true);
     else renderPomo();
+    render();
   };
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) reconcileForeground();
   });
   window.addEventListener("lumina:foreground", reconcileForeground);
 
-  /* 主题面板：优先用原生 popover，不支持就退化成点击循环 */
+  /* 主题面板：优先用原生 popover，不支持就退化成点击循环。
+     不支持时 [popover] 只是普通属性，面板会常驻页面——必须手动藏掉。
+     开关走 popovertarget invoker（见 index.html）：手写 togglePopover 会被
+     light-dismiss 抢先——pointerdown 时面板已关，click 又把它开回来，按钮永远关不上 */
   const hasPopover = typeof themePop.showPopover === "function";
-  themeBtn.addEventListener("click", () => {
-    if (!hasPopover){ cycleTheme(); return; }
-    placePopover();
-    themePop.togglePopover();
+  if (!hasPopover){
+    themePop.hidden = true;
+    /* 退化成点击循环后这个按钮不再弹出任何面板，haspopup 得说实话 */
+    themeBtn.setAttribute("aria-haspopup", "false");
+    themeBtn.removeAttribute("aria-expanded");
+  }
+  themeBtn.addEventListener("click", () => { if (!hasPopover) cycleTheme(); });
+  themePop.addEventListener("toggle", (e) => {
+    if (e.newState === "open") placePopover();
+    themeBtn.setAttribute("aria-expanded", String(e.newState === "open"));
   });
-  window.addEventListener("resize", () => { if (themePop.matches?.(":popover-open")) placePopover(); });
+  /* radiogroup 的方向键导航（APG）：上下/左右移动即选中预览，不自动关面板 */
+  themePop.addEventListener("keydown", (e) => {
+    if (!["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) return;
+    const opts = [...themeList.querySelectorAll(".theme-opt")];
+    const i = opts.indexOf(document.activeElement && document.activeElement.closest
+      ? document.activeElement.closest(".theme-opt") : null);
+    if (i < 0) return;
+    e.preventDefault();
+    const next = opts[(i + (e.key === "ArrowUp" || e.key === "ArrowLeft" ? -1 : 1) + opts.length) % opts.length];
+    next.focus();
+    applyTheme(next.dataset.theme, false);
+  });
+  window.addEventListener("resize", () => { if (hasPopover && themePop.matches(":popover-open")) placePopover(); });
+
+  /* 所有按钮（除拖拽手柄）的 mousedown 一律 preventDefault：
+     编辑中点任何按钮，默认动作会先移焦 → blur → 提交编辑 → render() 重建，
+     随后的 click 落在已摘除的旧节点上被吞掉（按钮像坏了一样）；
+     工具栏撤销按钮尤其如此——blur 提交压栈后 click 立刻把它弹掉，
+     用户的编辑被「提交-撤销」连环吞掉。手柄排除：它的默认动作就是发起拖拽 */
+  document.addEventListener("mousedown", (e) => {
+    const b = e.target instanceof Element && e.target.closest("button");
+    if (!b) return;
+    /* 手柄的默认动作是拖拽手势的起点，平时不能拦；
+       但编辑中按下它会先移焦 → blur 提交 → render 重建 →
+       拖拽中的节点被摘除、拖拽流产。编辑中就拦下：编辑由草稿机制保活，
+       这次拖拽不发起（用户松开后再拖即可） */
+    if (b.classList.contains("grip") && !editingId) return;
+    e.preventDefault();
+  });
 
   document.addEventListener("keydown", (e) => {
     const el = document.activeElement;
     const typing = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
+    /* 主题面板开着时别抢它的按键（↓ 不该跳去列表、⌘Z 不该触发全局撤销、
+       Esc 交给 popover 自己）——必须在 ⌘Z 之前判断 */
+    if (el && el.closest && el.closest("#themePop")) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.shiftKey && !typing){ e.preventDefault(); undo(); return; }
     if (typing) return;
+    /* 不劫持浏览器组合键：Ctrl+P 打印、Ctrl+H 历史、Alt+… 菜单都必须放行 */
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    /* 长按一键连发：按住 P 会把计时器反复起停，按住 T 主题狂闪 */
+    if (e.repeat) return;
     if (e.key === "/"){ e.preventDefault(); searchInput.focus(); }
     else if (e.key.toLowerCase() === "n"){ e.preventDefault(); if (composer.hidden) document.querySelector('[data-filter="all"]').click(); todoInput.focus(); }
     else if (e.key.toLowerCase() === "h"){ e.preventDefault(); document.querySelector('[data-filter="history"]').click(); }
@@ -2704,6 +3155,7 @@ function agentInvoke(name, rawArgs){
           else return { ok:false, error:`日期无效：${due}` };
         }
         if (!Object.keys(patch).length) return { ok:false, error:"没有可更新的字段" };
+        syncTodosFromDisk();   // 快照必须拍在最新底版上，别页已写未投递的改动不能被撤销吃掉
         snapshot("AI 修改待办");
         updateTodo(t.id, patch);
         const next = todos.find((x) => x.id === t.id);
@@ -2900,6 +3352,7 @@ function installChatBridge(){
       try { toast("清除筛选和搜索后才能排序"); } catch { /* ignore */ }
       return false;
     }
+    syncTodosFromDisk();   // 按盘序重排，别把别页的新增从排序结果里漏掉
     const map = new Map(todos.map((t) => [t.id, t]));
     const next = [];
     for (const id of ids) {

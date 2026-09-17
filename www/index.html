@@ -208,7 +208,7 @@
       <button class="tb-btn icon-only" id="chatBtn" title="AI 对话 (A)" aria-label="打开 AI 对话" aria-pressed="false">
         <svg viewBox="0 0 24 24"><path d="M5 6.5h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4.2L9.5 21v-3.5H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z"/><path d="M8.5 11h.01M12 11h.01M15.5 11h.01"/></svg>
       </button>
-      <button class="tb-btn icon-only" id="themeBtn" title="切换主题 (T)" aria-label="切换主题" aria-haspopup="true">
+      <button class="tb-btn icon-only" id="themeBtn" title="切换主题 (T)" aria-label="切换主题" aria-haspopup="menu" aria-expanded="false" popovertarget="themePop">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 3.4v17.2"/><path d="M12 8.5a4 4 0 0 0 0 7"/></svg>
       </button>
     </header>
@@ -294,7 +294,7 @@
     </div>
 
     <div class="scroller" id="scroller">
-      <ol class="list" id="todoList" aria-label="待办列表"></ol>
+      <ol class="list" id="todoList" aria-label="待办列表" tabindex="-1"></ol>
       <div class="empty" id="emptyState" hidden>
         <svg class="empty-mark" id="emptyMark" viewBox="0 0 24 24" aria-hidden="true"></svg>
         <p class="empty-title" id="emptyTitle"></p>

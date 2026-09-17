@@ -1,0 +1,504 @@
+<!doctype html><meta charset="utf-8"><title>smoke</title><pre id="out"></pre>
+<script>
+window.onerror = (m, s, l) => { document.getElementById("out").textContent += `\nPAGE-ERROR ${m} @${l}`; };
+const out = document.getElementById("out");
+const results = [];
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function assert(name, cond, extra){
+  results.push([name, !!cond, extra]);
+  out.textContent += `${cond ? "PASS" : "FAIL"} ${name}${cond ? "" : "  <- " + (extra || "")}\n`;
+}
+const KEY = "lumina-todo-v2", POMO = "lumina-pomo", SEED = "lumina-todo-seeded";
+const today = new Date();
+const dayKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
+const y = new Date(Date.now() - 86400e3);
+const yKey = `${y.getFullYear()}-${String(y.getMonth()+1).padStart(2,"0")}-${String(y.getDate()).padStart(2,"0")}`;
+
+function seedTodos(list){ localStorage.setItem(KEY, JSON.stringify({ v:4, writer:"t", savedAt:Date.now(), todos:list })); }
+function seedPomo(o){ localStorage.setItem(POMO, JSON.stringify(o)); }
+function readTodos(){ return JSON.parse(localStorage.getItem(KEY) || "null")?.todos || []; }
+function readPomo(){ return JSON.parse(localStorage.getItem(POMO) || "null"); }
+function mkTodo(id, text, extra){ return { id, text, completed:false, priority:"low", category:"inbox", dueDate:null, createdAt:1, updatedAt:1, completedAt:null, pomodoros:0, clickupTaskId:null, clickupUrl:null, ...(extra||{}) }; }
+
+async function freshFrame(pomoSeed, todos){
+  localStorage.clear();
+  seedTodos(todos || [ mkTodo("a","任务甲"), mkTodo("b","任务乙"), mkTodo("c","任务丙") ]);
+  localStorage.setItem(SEED, "1");
+  if (pomoSeed) seedPomo(pomoSeed);
+  const f = document.createElement("iframe");
+  f.src = "index.html";
+  document.body.appendChild(f);
+  await new Promise(r => f.onload = r);
+  await sleep(150);
+  return f;
+}
+const kd = (w, el, init) => el.dispatchEvent(new w.KeyboardEvent("keydown", { bubbles:true, cancelable:true, ...init }));
+
+(async () => {
+  /* ── 追结算只记一次 + 结算标记 ── */
+  {
+    const f = await freshFrame({
+      writer:"other", mode:"focus", running:true, endsAt:Date.now()-2000, leftMs:null,
+      round:0, taskId:"a", presetIdx:0, sound:false, tallyDay:dayKey, tally:0, seg:"segA",
+    });
+    await sleep(100);
+    const t = readTodos().find(x => x.id === "a");
+    const p = readPomo();
+    assert("catchup-credits-once", t && t.pomodoros === 1, JSON.stringify(t));
+    assert("catchup-settles", p && p.running === false && p.mode === "short", JSON.stringify(p));
+    assert("catchup-marks-settled", p && Array.isArray(p.settled) && p.settled.includes("segA"), JSON.stringify(p));
+    f.remove();
+  }
+
+  /* ── 已结算态不重结 ── */
+  {
+    const f = await freshFrame(
+      { writer:"other", mode:"short", running:false, endsAt:null, leftMs:null,
+        round:1, taskId:"a", presetIdx:0, sound:false, tallyDay:dayKey, tally:1, seg:"segA", settled:"segA" },
+      [ mkTodo("a","任务甲",{pomodoros:1}) ]
+    );
+    await sleep(100);
+    assert("no-double-settle", readTodos().find(x => x.id === "a").pomodoros === 1);
+    f.remove();
+  }
+
+  /* ── 旧格式（无 seg）迁移追结算也带确定性标记 ── */
+  {
+    const endsAt = Date.now() - 3000;
+    const f = await freshFrame(
+      { mode:"focus", running:true, endsAt, leftMs:null, round:0, taskId:"a", presetIdx:0, sound:false, tallyDay:dayKey, tally:0 },
+    );
+    await sleep(100);
+    const p = readPomo();
+    const t = readTodos().find(x => x.id === "a");
+    assert("legacy-settles-once", t.pomodoros === 1);
+    assert("legacy-derives-seg", Array.isArray(p.settled) && p.settled.includes("e" + endsAt), JSON.stringify(p));
+    f.remove();
+  }
+
+  /* ── F 进行中不重置 / 换任务改绑 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const rows = D.querySelectorAll(".row");
+    rows[0].focus(); kd(W, rows[0], { key:"f" });
+    await sleep(60);
+    const p1 = readPomo();
+    assert("f-starts-focus", p1.running === true && p1.taskId === "a");
+    kd(W, D.querySelector('.row[data-id="a"]'), { key:"f" });
+    await sleep(60);
+    assert("f-same-keeps-endsAt", readPomo().endsAt === p1.endsAt);
+    kd(W, D.querySelector('.row[data-id="b"]'), { key:"f" });
+    await sleep(60);
+    const p3 = readPomo();
+    assert("f-other-rebinds", p3.taskId === "b" && p3.endsAt === p1.endsAt && p3.running === true);
+    f.remove();
+  }
+
+  /* ── 行内按钮上的按键 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const btn = D.querySelector('.row[data-id="a"] [data-act="delete"]');
+    btn.focus();
+    kd(W, btn, { key:"ArrowDown" });
+    await sleep(40);
+    assert("btn-arrow-moves-next", D.activeElement.dataset && D.activeElement.dataset.id === "b");
+    const btn2 = D.querySelector('.row[data-id="b"] [data-act="edit"]');
+    btn2.focus();
+    kd(W, btn2, { key:"f" });
+    await sleep(60);
+    assert("btn-f-focuses", readPomo().taskId === "b" && readPomo().running === true);
+    const btn3 = D.querySelector('.row[data-id="c"] [data-act="edit"]');
+    btn3.focus();
+    kd(W, btn3, { key:"Enter" });
+    await sleep(60);
+    assert("btn-enter-not-stolen", !D.querySelector('.row[data-id="c"] input:not([hidden])'));
+    f.remove();
+  }
+
+  /* ── IME 组合中回车不提交 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);
+    const input = D.querySelector(".row[data-id='a'] input");
+    input.value = "改名甲";
+    kd(W, input, { key:"Enter", isComposing:true });
+    await sleep(40);
+    assert("ime-enter-ignored", input.hidden === false);
+    kd(W, input, { key:"Enter" });
+    await sleep(60);
+    assert("enter-commits", input.hidden === true && readTodos().find(t=>t.id==="a").text === "改名甲");
+    f.remove();
+  }
+
+  /* ── 编辑中外部写入 + 本地勾选都保留 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);
+    seedTodos(readTodos().concat([ mkTodo("ext","外部新增") ]));
+    await sleep(80);
+    D.querySelector('.row[data-id="b"] .check').click();
+    await sleep(120);
+    const list = readTodos();
+    assert("ext-item-survives", list.some(t => t.id === "ext"));
+    assert("local-toggle-survives", list.find(t => t.id === "b").completed === true);
+    f.remove();
+  }
+
+  /* ── 跨标签删除绑定任务 → 解绑 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const row = D.querySelector('.row[data-id="a"]');
+    row.focus(); kd(W, row, { key:"f" });
+    await sleep(60);
+    seedTodos(readTodos().filter(t => t.id !== "a"));
+    await sleep(80);
+    assert("dangling-cleared", readPomo().taskId === null, JSON.stringify(readPomo()));
+    f.remove();
+  }
+
+  /* ── 撤销三方合并：别页新增的条目不被撤销吞掉 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    /* 本地勾掉 a（快照里 a 未完成、无 ext） */
+    D.querySelector('.row[data-id="a"] .check').click();
+    await sleep(60);
+    /* 别页新增 ext（直接应用，没人在编辑） */
+    seedTodos(readTodos().concat([ mkTodo("ext","外部新增") ]));
+    await sleep(80);
+    /* 本地撤销勾选：应回到 a 未完成 + ext 仍在 */
+    kd(W, D.body, { key:"z", ctrlKey:true });
+    await sleep(100);
+    const list = readTodos();
+    assert("undo-keeps-ext", list.some(t => t.id === "ext"), JSON.stringify(list.map(t=>t.id)));
+    assert("undo-reverts-toggle", list.find(t => t.id === "a").completed === false);
+    f.remove();
+  }
+
+  /* ── 撤销自己的新增：合并逻辑不得把它误判成远端条目而保留 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const inp = D.getElementById("todoInput");
+    inp.value = "临时项"; inp.dispatchEvent(new W.Event("input", {bubbles:true}));
+    D.getElementById("addBtn").click();
+    await sleep(80);
+    assert("add-worked", readTodos().some(t => t.text === "临时项"));
+    inp.blur();   // 焦点在输入框时 ⌘Z 是浏览器文本撤销，应用层不该抢
+    kd(W, D.body, { key:"z", ctrlKey:true });
+    await sleep(80);
+    assert("undo-removes-own-add", !readTodos().some(t => t.text === "临时项"), JSON.stringify(readTodos().map(t=>t.text)));
+    f.remove();
+  }
+
+  /* ── 远端删除已同步进内存后，撤销不得复活它 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    /* 本地勾 a（压快照） */
+    D.querySelector('.row[data-id="a"] .check').click();
+    await sleep(60);
+    /* 远端删掉 c 并直接应用进内存 */
+    seedTodos(readTodos().filter(t => t.id !== "c"));
+    await sleep(80);
+    /* 撤销勾选：c 不应复活 */
+    kd(W, D.body, { key:"z", ctrlKey:true });
+    await sleep(100);
+    const list = readTodos();
+    assert("undo-no-resurrect", !list.some(t => t.id === "c"), JSON.stringify(list.map(t=>t.id)));
+    assert("undo-still-reverts", list.find(t => t.id === "a").completed === false);
+    f.remove();
+  }
+
+  /* ── M1: 编辑中攒下的远端快照，不得把随后的撤销反转掉 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="b"] .check').click();   // 本地勾 b（压快照 S0）
+    await sleep(60);
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);                                       // 进入编辑：远端写入将被 defer
+    /* 远端勾掉 c（写进 pendingExternal，不进内存） */
+    const remote = readTodos().map(t => t.id === "c" ? { ...t, completed:true } : t);
+    seedTodos(remote);
+    await sleep(80);
+    /* 先改好内容再点撤销：草稿保活机制会让编辑在 render 后原样恢复 */
+    const input = D.querySelector(".row[data-id='a'] input");
+    input.value = "改名甲";
+    /* 编辑中点撤销：合并远端盘内容，撤掉 b 的勾选，保留远端对 c 的勾选；
+       收尾时 flushExternal 不得把旧快照套回来反转这一切 */
+    D.getElementById("undoBtn").click();
+    await sleep(120);
+    /* 编辑应仍处于打开态且草稿不丢——回车提交 */
+    const input2 = D.querySelector(".row[data-id='a'] input");
+    kd(W, input2, { key:"Enter" });
+    await sleep(100);
+    const list = readTodos();
+    assert("undo-merge-keeps-remote", list.find(t=>t.id==="c").completed === true, "远端勾选应保留");
+    assert("undo-merge-reverts-b", list.find(t=>t.id==="b").completed === false, "本地勾选应被撤销");
+    assert("undo-merge-edit-lands", list.find(t=>t.id==="a").text === "改名甲");
+    f.remove();
+  }
+
+  /* ── M2: 远端已落盘的 pomodoros 不得被撤销回滚 ── */
+  {
+    const f = await freshFrame([ mkTodo("a","任务甲",{pomodoros:1}), mkTodo("b","任务乙"), mkTodo("c","任务丙") ]);
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="b"] .check').click();   // 压一个可撤操作
+    await sleep(60);
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);                                       // 编辑中：远端写入进 pendingExternal
+    /* 远端结算了一个番茄：a.pomodoros 1→2 落盘，事件被编辑 defer */
+    const remote = readTodos().map(t => t.id === "a" ? { ...t, pomodoros:2 } : t);
+    seedTodos(remote);
+    await sleep(80);
+    D.getElementById("undoBtn").click();                   // 撤销走的是读盘合并
+    await sleep(80);
+    kd(W, D.querySelector(".row[data-id='a'] input"), { key:"Escape" });  // 收尾触发 flush
+    await sleep(80);
+    const a = readTodos().find(t => t.id === "a");
+    assert("undo-keeps-remote-pomo", a.pomodoros === 2, `pomodoros=${a && a.pomodoros}`);
+    f.remove();
+  }
+
+  /* ── S3: 脏窗口里的远端改动，恢复后按基线合并回来 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const ls = W.localStorage;
+    const proto = Object.getPrototypeOf(ls);
+    ls.setItem = () => { throw Object.assign(new Error("q"), { name:"QuotaExceededError" }); };
+    /* 脏窗口内：本地新增 ours（写盘失败，只在内存） */
+    const inp = D.getElementById("todoInput");
+    inp.value = "ours"; inp.dispatchEvent(new W.Event("input", {bubbles:true}));
+    D.getElementById("addBtn").click();
+    await sleep(60);
+    /* 远端新增 remote——必须用 parent 自己的 localStorage 对象写：
+       storage 事件按「发起方 Storage 对象」豁免，用 iframe 的对象写的话
+       iframe 反而收不到事件（事件会派给 parent） */
+    const remote = readTodos().concat([ mkTodo("remote","远端项") ]);
+    localStorage.setItem(KEY, JSON.stringify({ v:4, writer:"remote", savedAt:Date.now(), todos:remote }));
+    await sleep(80);
+    /* 恢复可写 */
+    delete ls.setItem;
+    D.querySelector('.row[data-id="a"] .check').click();   // 这次 persist 成功，清除 localDirty
+    await sleep(60);
+    D.querySelector('.row[data-id="b"] .check').click();   // 下一次 sync 触发脏窗口合并
+    await sleep(80);
+    const list = readTodos();
+    assert("dirty-merge-keeps-ours", list.some(t => t.text === "ours"), JSON.stringify(list.map(t=>t.text)));
+    assert("dirty-merge-keeps-remote", list.some(t => t.id === "remote"), "远端项应被合并回来");
+    f.remove();
+  }
+
+  /* ── 脏窗口合并：本页没碰过的基线条目，远端编辑应胜出（不能一律本页赢） ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const ls = W.localStorage;
+    ls.setItem = () => { throw Object.assign(new Error("q"), { name:"QuotaExceededError" }); };
+    /* 脏窗口内本地只动 b（勾选），a 完全不碰 */
+    D.querySelector('.row[data-id="b"] .check').click();
+    await sleep(60);
+    /* 远端编辑 a 的文本 + 给 a 记了一个番茄 */
+    const remote = readTodos().map(t => t.id === "a"
+      ? { ...t, text:"远端改的", pomodoros:(t.pomodoros||0)+1 } : t);
+    localStorage.setItem(KEY, JSON.stringify({ v:4, writer:"remote", savedAt:Date.now(), todos:remote }));
+    await sleep(80);
+    delete ls.setItem;
+    /* b 的第二次点击：persist 成功清掉 localDirty（这次 sync 还在脏窗口里，不会合并） */
+    D.querySelector('.row[data-id="b"] .check').click();
+    await sleep(60);
+    /* 下一次 sync 才触发合并：此刻 a 我们从头没碰 → 远端版胜出；
+       然后才执行 a 的勾选（toggle 不动 text/pomodoros，断言不受影响） */
+    D.querySelector('.row[data-id="a"] .check').click();
+    await sleep(80);
+    const list = readTodos();
+    const a = list.find(t => t.id === "a"), b = list.find(t => t.id === "b");
+    assert("dirty-remote-edit-wins", a && a.text === "远端改的",
+      a && `a.text=${a.text}`);
+    assert("dirty-remote-pomo-kept", a && a.pomodoros >= 1,
+      a && `a.pomodoros=${a.pomodoros}`);
+    assert("dirty-ours-kept", b && b.completed === false,
+      b && `b.completed=${b.completed}`);   // 脏窗口勾过又勾回：b 的最终态是本页说了算
+    f.remove();
+  }
+
+  /* ── 撤销删除：条目回到原来的位置，不是甩到末尾 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const before = readTodos().map(t => t.id);
+    const idx = before.indexOf("b");
+    D.querySelector('.row[data-id="b"] [data-act="delete"]').click();
+    await sleep(350);                              // 离场动画播完才真正删
+    D.activeElement && D.activeElement.blur && D.activeElement.blur();
+    D.body.dispatchEvent(new W.KeyboardEvent("keydown",
+      { key:"z", ctrlKey:true, bubbles:true }));
+    await sleep(80);
+    const after = readTodos().map(t => t.id);
+    assert("undo-restores-position", after.indexOf("b") === idx,
+      `before=${before} after=${after}`);
+    f.remove();
+  }
+
+  /* ── 编辑期间攒下的远端快照：收尾时经 sync 消费，不丢 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    /* 打开 a 的就地编辑（dblclick），编辑不提交 */
+    D.querySelector('.row[data-id="a"] .row-text')
+      .dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(50);
+    const inp = D.querySelector('.row[data-id="a"] .row-edit');
+    inp.value = "改名a"; inp.dispatchEvent(new W.Event("input", { bubbles:true }));
+    /* 远端在编辑期间写入 */
+    const remote = readTodos().concat([ mkTodo("ext2","远端新增") ]);
+    localStorage.setItem(KEY, JSON.stringify({ v:4, writer:"remote", savedAt:Date.now(), todos:remote }));
+    await sleep(80);
+    /* blur 提交：finish → flushExternal → sync 必须消费攒着的快照。
+       合成 click 不移焦、iframe 里 focus() 也未必生效——直接派 blur 事件 */
+    inp.dispatchEvent(new W.FocusEvent("blur"));
+    await sleep(100);
+    const list = readTodos();
+    assert("stash-consumed-after-edit",
+      list.some(t => t.id === "ext2") && list.some(t => t.text === "改名a"),
+      JSON.stringify(list.map(t => t.text)));
+    f.remove();
+  }
+
+  /* ── localDirty：写盘失败后同步不得回滚内存 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    /* 让 iframe 里的 localStorage.setItem 抛配额错 */
+    const ls = W.localStorage;
+    const orig = ls.setItem.bind(ls);
+    ls.setItem = () => { throw Object.assign(new Error("q"), { name:"QuotaExceededError" }); };
+    /* 勾 a —— 写盘失败，改动只在内存 */
+    D.querySelector('.row[data-id="a"] .check').click();
+    await sleep(60);
+    /* 别页写入（此时 iframe 是 dirty 的） */
+    seedTodos(readTodos().concat([ mkTodo("ext","外部新增") ]));
+    await sleep(80);
+    /* 再勾 b —— 若 sync 回滚了内存，a 的勾选会丢 */
+    D.querySelector('.row[data-id="b"] .check').click();
+    await sleep(60);
+    const aDone = D.querySelector('.row[data-id="a"]').classList.contains("done");
+    const bDone = D.querySelector('.row[data-id="b"]').classList.contains("done");
+    assert("dirty-keeps-local", aDone && bDone, `a.done=${aDone} b.done=${bDone}`);
+    ls.setItem = orig;
+    f.remove();
+  }
+
+  /* ── 删除离场动画真的在播（不再是死代码） ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="a"] [data-act="delete"]').click();
+    await sleep(50);
+    const row = D.querySelector('.row[data-id="a"]');
+    const cs = row && W.getComputedStyle(row);
+    assert("leaving-anim-plays", row && cs.animationName === "none" && row.classList.contains("is-leaving"),
+      cs && `anim=${cs.animationName}`);
+    await sleep(300);
+    assert("leaving-then-gone", !D.querySelector('.row[data-id="a"]'));
+    f.remove();
+  }
+
+  /* ── 编辑中点撤销：编辑照常提交、撤的是上一步 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="b"] .check').click();   // 压一个「标记完成」
+    await sleep(60);
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);
+    const input = D.querySelector(".row[data-id='a'] input");
+    input.value = "改名甲";
+    D.getElementById("undoBtn").click();
+    await sleep(120);
+    /* 草稿保活：编辑仍开着，回车把草稿提交 */
+    const input2 = D.querySelector(".row[data-id='a'] input");
+    kd(W, input2, { key:"Enter" });
+    await sleep(100);
+    const list = readTodos();
+    assert("undo-during-edit", list.find(t=>t.id==="b").completed === false, "应撤掉标记完成");
+    assert("edit-survives-undo", list.find(t=>t.id==="a").text === "改名甲", "编辑文字应保留");
+    f.remove();
+  }
+
+  /* ── M3: 异步 render（别页番茄事件）不得打断进行中的编辑 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="a"] .row-text').dispatchEvent(new W.MouseEvent("dblclick", { bubbles:true }));
+    await sleep(40);
+    const input = D.querySelector(".row[data-id='a'] input");
+    input.value = "半截草稿";
+    /* 别页按下番茄键：POMO 事件 → applyPomoState → render() */
+    seedPomo({ writer:"other", mode:"focus", running:true, endsAt:Date.now()+1500000, leftMs:null,
+      round:1, taskId:"b", presetIdx:0, sound:false, tallyDay:dayKey, tally:1, seg:"segX", settled:[] });
+    await sleep(100);
+    const input2 = D.querySelector(".row[data-id='a'] input");
+    assert("edit-survives-render", input2 && input2.hidden === false && input2.value === "半截草稿",
+      input2 ? `hidden=${input2.hidden} value=${input2.value}` : "input gone");
+    assert("edit-keeps-focus", D.activeElement === input2, "焦点应回到新输入框");
+    kd(W, input2, { key:"Enter" });
+    await sleep(80);
+    assert("draft-commits", readTodos().find(t=>t.id==="a").text === "半截草稿");
+    f.remove();
+  }
+
+  /* ── 长按重复键不触发 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.body.focus();
+    kd(W, D.body, { key:"p", repeat:true });
+    await sleep(50);
+    assert("repeat-p-ignored", (readPomo() || {}).running !== true);
+    const row = D.querySelector('.row[data-id="a"]');
+    row.focus();
+    kd(W, row, { key:"Backspace", repeat:true });
+    await sleep(60);
+    assert("repeat-del-ignored", !!D.querySelector('.row[data-id="a"]'));
+    f.remove();
+  }
+
+  /* ── 昨日 tally 显示归零 / 垃圾 POMO / 日期框回车 ── */
+  {
+    const f = await freshFrame({
+      writer:"other", mode:"focus", running:false, endsAt:null, leftMs:null,
+      round:3, taskId:null, presetIdx:0, sound:false, tallyDay:yKey, tally:7,
+    });
+    const W = f.contentWindow, D = f.contentDocument;
+    assert("stale-tally-zeroed", D.getElementById("pomoTally").textContent.includes("今天 0"));
+    const row = D.querySelector('.row[data-id="a"]');
+    row.focus(); kd(W, row, { key:"f" });
+    await sleep(60);
+    localStorage.setItem(POMO, "{}");
+    await sleep(80);
+    assert("garbage-pomo-ignored", D.getElementById("pomo").dataset.run === "true");
+    const before = readTodos().length;
+    const inp = D.getElementById("todoInput");
+    inp.value = "别提交我"; inp.dispatchEvent(new W.Event("input", {bubbles:true}));
+    D.getElementById("dueDate").focus();
+    kd(W, D.getElementById("dueDate"), { key:"Enter" });
+    await sleep(60);
+    assert("date-enter-no-submit", readTodos().length === before);
+    f.remove();
+  }
+
+  const failed = results.filter(r => !r[1]);
+  out.textContent += `\n${results.length - failed.length}/${results.length} passed`;
+  document.title = failed.length ? "FAIL" : "ALL-PASS";
+})().catch(e => { out.textContent += `\nRUNNER-ERROR ${e && e.stack || e}`; });
+</script>
