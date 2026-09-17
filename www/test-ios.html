@@ -497,6 +497,45 @@ const kd = (w, el, init) => el.dispatchEvent(new w.KeyboardEvent("keydown", { bu
     f.remove();
   }
 
+  /* ── 归因：远端编辑流入后，撤销本页操作不得回滚它 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="a"] .check').click();    // A 勾 a（压快照 S0）
+    await sleep(80);
+    /* B 把 b 改名落盘 → storage 事件流进 A */
+    seedTodos(readTodos().map(t => t.id === "b" ? { ...t, text:"远端改名", updatedAt:999 } : t));
+    await sleep(80);
+    D.getElementById("undoBtn").click();                   // A 撤销「标记完成」
+    await sleep(80);
+    const b = readTodos().find(t => t.id === "b");
+    const a = readTodos().find(t => t.id === "a");
+    assert("undo-keeps-remote-edit", b.text === "远端改名", `b=${b && b.text}`);
+    assert("undo-reverted-a", a.completed === false, `a.completed=${a && a.completed}`);
+    f.remove();
+  }
+
+  /* ── 归因：远端无关写入流入后，撤销本页新增/删除仍生效 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const inp = D.getElementById("todoInput");
+    inp.value = "本地新增"; inp.dispatchEvent(new W.Event("input", {bubbles:true}));
+    D.getElementById("addBtn").click();                    // A 加 X
+    await sleep(80);
+    /* B 无关写入：只改 b 的文本 */
+    seedTodos(readTodos().map(t => t.id === "b" ? { ...t, text:"远端改动", updatedAt:999 } : t));
+    await sleep(80);
+    inp.blur();
+    D.getElementById("undoBtn").click();                   // 撤销「添加待办」
+    await sleep(80);
+    const list = readTodos();
+    assert("undo-removes-own-add-2", !list.some(t => t.text === "本地新增"),
+      JSON.stringify(list.map(t => t.text)));
+    assert("remote-edit-still-there", list.some(t => t.text === "远端改动"));
+    f.remove();
+  }
+
   const failed = results.filter(r => !r[1]);
   out.textContent += `\n${results.length - failed.length}/${results.length} passed`;
   document.title = failed.length ? "FAIL" : "ALL-PASS";

@@ -380,6 +380,7 @@ let dirtyBase = null;          // localDirty 窗口起点时的盘基线
 let localDirty = false;        // 有改动还没落盘：内存领先于盘
 let syncGen = 0;               // 外部内容流进内存的代际计数：undo 合并归因要用
 let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
+const remoteIds = new Set();   // 当前版本由远端写入（流入过内存）的条目 id——undo 归因要用
 let persistState = storageWritable ? "ok" : "unavailable";
 let noticeDismissed = false;
 let currentTheme = "kanna";
@@ -575,7 +576,21 @@ function markSegSettled(seg){
 function adoptSettledSegs(raw){
   const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
   const add = list.filter((s) => typeof s === "string" && !pomo.settledSegs.includes(s));
-  if (add.length) pomo.settledSegs = [...pomo.settledSegs, ...add].slice(-20);
+  /* 与 markSegSettled 同向：新的在头、留前 20。反过来的话远端一次带来
+     多个标记会先把本页最新结算顶出窗，给该段重复记账重新开门 */
+  if (add.length) pomo.settledSegs = [...add, ...pomo.settledSegs].slice(0, 20);
+}
+/* 远端内容流入内存时逐条登记归因：内容有变的、被远端删掉的都记。
+   undo 的三方合并靠它区分「我们改的」和「远端改了流进来的」——
+   两者盘==内存且≠快照，全局标志分不清 */
+function markRemoteAdopted(prev, next){
+  const prevMap = new Map(prev.map((t) => [t.id, t]));
+  const nextIds = new Set(next.map((t) => t.id));
+  for (const t of next){
+    const o = prevMap.get(t.id);
+    if (!o || JSON.stringify(o) !== JSON.stringify(t)) remoteIds.add(t.id);
+  }
+  for (const t of prev){ if (!nextIds.has(t.id)) remoteIds.add(t.id); }
 }
 /* 盘 payload 上「这段是否已被别页记账」：新形状 settledSegs[]，旧存档 settledSeg 字符串 */
 function segAlreadySettled(payload, seg){
@@ -620,15 +635,19 @@ function applyPomoState(raw){
   if (Number.isFinite(raw.segmentMs) && raw.segmentMs > 0) pomo.segmentMs = raw.segmentMs;
   /* 旧格式存档没有 seg：用 endsAt/leftMs 派生确定性段 id——
      两个页面迁移同一份旧状态会算出同一个标记，判重才不会失散 */
-  pomo.seg = typeof raw.seg === "string" ? raw.seg
+  const nextSeg = typeof raw.seg === "string" ? raw.seg
     : Number.isFinite(raw.endsAt) ? "e" + raw.endsAt
     : Number.isFinite(raw.leftMs) ? "l" + raw.leftMs
     : null;
+  /* 采纳的是另一段：上一段的过半/临点提醒标记要重新武装 */
+  if (nextSeg !== pomo.seg){ pomo.halfSaid = false; pomo.nearSaid = false; }
+  pomo.seg = nextSeg;
   /* settled 新形状是数组、旧存档可能是字符串：一律并集采纳，标记集合只增不减 */
   adoptSettledSegs(raw.settled);
-  /* 跨天了就把今日计数清零 */
+  /* 跨天了就把今日计数清零。远端若还带着昨天的 tallyDay（写方跨午夜后
+     第一次 savePomo 先于自愈），绝不能采纳来清掉本页的今日计数 */
   if (raw.tallyDay === todayStr() && Number.isFinite(raw.tally)) { pomo.tallyDay = raw.tallyDay; pomo.tally = boundedInt(raw.tally, 0, 999999, 0); }
-  else { pomo.tallyDay = todayStr(); pomo.tally = 0; }
+  else if (pomo.tallyDay !== todayStr()){ pomo.tallyDay = todayStr(); pomo.tally = 0; }
 
   if (raw.running && Number.isFinite(raw.endsAt)){
     if (raw.endsAt > Date.now()){
@@ -887,7 +906,10 @@ function finishSegment(silentCatchUp, endedAtOverride){
       && segAlreadySettled(lastDisk, pomo.seg));
     if (!dup && pomo.taskId){
       const t = todos.find((x) => x.id === pomo.taskId);
-      if (t){ t.pomodoros = (t.pomodoros || 0) + 1; t.updatedAt = Date.now(); persist(); }
+      if (t){
+        remoteIds.delete(t.id);    // 本页记账改写，当前版本不再是远端写的
+        t.pomodoros = (t.pomodoros || 0) + 1; t.updatedAt = Date.now(); persist();
+      }
     }
     /* 别页已结算的段不重复打卡（operationId 幂等兜底，但能省则省） */
     if (!dup) logPomoToClickUp(realEndedAt, finishedSegmentMs);
@@ -1281,10 +1303,7 @@ function persist(){
 
 /* ---------------------------------------------------------------- 撤销 */
 function snapshot(label){
-  /* savedAt/syncGen 记基线：撤销时要判断盘上内容是否被别页动过、
-     以及远端内容是否已经流进过内存（决定「快照有而内存没有」的归因） */
-  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId,
-    savedAt:lastSeenSavedAt, gen:syncGen });
+  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId });
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
   syncUndoBtn();
 }
@@ -1310,10 +1329,8 @@ function undo(){
   const restore = (t) => livePomos.has(t.id)
     ? { ...t, pomodoros: Math.max(livePomos.get(t.id) || 0, t.pomodoros || 0) } : t;
   if (diskList){
-    /* 远端内容自快照后是否流进过内存：syncGen 没变说明内存里没见过远端版，
-       「快照有而内存没有」就是我们自己删的（该恢复），否则是远端删的（别复活）；
-       「盘有而快照没有」同理：远端已流入过才当远端新增保留 */
-    const remoteFlowed = syncGen !== snap.gen;
+    /* 归因靠 remoteIds（条目级）：远端版本流入内存时登记，本页改写时销记——
+       「盘==内存且≠快照」可能是我方编辑也可能是远端编辑流入，全局标志分不清 */
     const S = new Map(snap.todos.map((t) => [t.id, t]));
     const M = new Map(todos.map((t) => [t.id, t]));
     const diskIds = new Set(diskList.map((t) => t.id));
@@ -1321,17 +1338,23 @@ function undo(){
     const merged = [];
     for (const d of diskList){
       const s = S.get(d.id), m = M.get(d.id);
-      if (!s){ if (!m || remoteFlowed) merged.push(d); continue; }   // 盘有快照没有：远端已流入才保留
-      /* 三方共有：盘≠内存说明远端改过了（远端赢）；
-         盘==内存且≠快照才是我们改的（回滚到快照） */
-      if (!m || !eq(d, m) || eq(m, s)) merged.push(d); else merged.push(s);
+      if (!s){
+        /* 盘有快照没有：远端加的才保留（登记过的、或根本没进过内存的）。
+           在内存里见过却没被标 → 是我们自己加的，撤销就该移除 */
+        if (!m || remoteIds.has(d.id)) merged.push(d);
+        continue;
+      }
+      /* 三方共有：盘≠内存说明远端版较新（远端赢）；盘==内存且≠快照时，
+         登记过的是远端流入（远端赢），没登记的是我方改动（回滚到快照） */
+      if (!m || !eq(d, m) || eq(m, s) || remoteIds.has(d.id)) merged.push(d);
+      else merged.push(s);
     }
-    /* 快照有而盘没有：远端没流入过就是我们的删除（按原位插回），
-       流入过就是远端删的（不复活）。插位找「快照里的下一个幸存邻居」 */
+    /* 快照有而盘没有：登记过的是远端删的（不复活），没登记的是我们删的
+       （按原位插回——找「快照里的下一个幸存邻居」） */
     const mergedIds = new Set(merged.map((t) => t.id));
     for (let i = 0; i < snap.todos.length; i++){
       const s = snap.todos[i];
-      if (mergedIds.has(s.id) || diskIds.has(s.id) || remoteFlowed) continue;
+      if (mergedIds.has(s.id) || diskIds.has(s.id) || remoteIds.has(s.id)) continue;
       let at = merged.length;
       for (let j = i + 1; j < snap.todos.length; j++){
         const pos = merged.findIndex((t) => t.id === snap.todos[j].id);
@@ -2105,6 +2128,7 @@ async function pushTodoToClickUp(id, btnEl){
       console.warn("[clickup] pushTodo 回包 id 非法：", r);
       return { ok:false, code:"BAD_RESPONSE", error: msg, message: msg };
     }
+    remoteIds.delete(id);        // 本页回写 taskId，当前版本不再是远端写的
     live.clickupTaskId = taskId;
     live.clickupUrl = safeUrl || ("https://app.clickup.com/t/" + taskId);
     live.updatedAt = Date.now();
@@ -2147,6 +2171,7 @@ function toggleTodo(id, checkEl){
   const willComplete = !t.completed;
   if (willComplete && rect) burst(rect.left + rect.width / 2, rect.top + rect.height / 2);
   snapshot(willComplete ? "标记完成" : "取消完成");
+  remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
   const now = Date.now();
   t.completed = willComplete;
   t.completedAt = willComplete ? now : null;
@@ -2169,6 +2194,7 @@ function updateTodo(id, patch, opts = {}){
   syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return null;
+  remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
   Object.assign(t, patch, { updatedAt: Date.now() });
   render();
   if (opts.persist !== false) persist();
@@ -2181,6 +2207,7 @@ function removeTodo(id){
   const idx = todos.findIndex((t) => t.id === id);
   if (idx < 0) return; // 幂等，连点两次不会重复提示
   snapshot("删除待办");
+  remoteIds.delete(id);          // 我们的删除：undo 恢复时别误判成远端删的
   todos.splice(idx, 1);
   if (pomo.taskId === id){ pomo.taskId = null; savePomo(); }
   persist(); updateStats();
@@ -2203,6 +2230,7 @@ function clearCompleted(){
   const n = todos.filter((t) => t.completed).length;
   if (n === 0){ toast("还没有已完成的待办"); return; }
   snapshot(`清除 ${n} 件已完成`);
+  for (const t of todos) if (t.completed) remoteIds.delete(t.id);   // 我们的清除
   todos = todos.filter((t) => !t.completed);
   render(); persist();
   play("r-shake");
@@ -2313,6 +2341,7 @@ function importJSON(file){
     if (clean.length === 0){ toast("没有可导入的有效条目"); return; }
     syncTodosFromDisk();   // 导入覆盖整张表，更不能拿旧内存垫在底下
     snapshot("导入数据");
+    remoteIds.clear();           // 整张表都是本页写的，远端归因全部作废
     todos = clean;
     reconcilePomoTask();
     render(); persist();
@@ -2367,7 +2396,7 @@ function syncTodosFromDisk(){
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
   lastAppliedList = clean.map((t) => ({ ...t }));   // 盘上内容的最后已知形态：恢复/软合并的基线
   const same = JSON.stringify(clean) === JSON.stringify(todos);
-  if (!same){ todos = clean; syncGen++; }   // 外部内容流进内存：undo 合并归因要用
+  if (!same){ markRemoteAdopted(todos, clean); todos = clean; syncGen++; }   // 外部内容流进内存：undo 归因要登记
   /* 盘上是我方写却攒着远端快照：那次远端写被我们的 persist 覆盖了，
      事件快照是唯一幸存副本——软合并把远端新增和较新编辑救回来。
      （盘上是远端写则快照只可能更旧或已并入，直接丢） */
@@ -2386,7 +2415,8 @@ function syncTodosFromDisk(){
   /* 外部变更立刻上屏：mutator 入口的早退路径（目标已被别页删了）也必须
      让界面跟上；脏窗口/软合并改了内存但内容碰巧等于盘时同理 */
   if (!same || mergedFromDirty) render();
-  return same ? "same" : "applied";
+  /* 脏窗口/软合并即便内容与盘相同也改过了内存——对调用方算 applied */
+  return (same && !mergedFromDirty) ? "same" : "applied";
 }
 
 /* 三方合并远端内容进内存：base=参照基线（脏窗口前的盘 或 刚采纳的盘）、
@@ -2410,11 +2440,17 @@ function mergeRemoteWindow(parsed, base, followDeletes){
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
       if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
-      return { ...t, pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0) };
+      /* 双方都改：本页普通字段为准，但 pomodoros 取大、ClickUp 关联字段
+         哪边有哪边留——taskId/url 是外部系统回写，合并丢掉会断链 */
+      return { ...t,
+        pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
+        clickupTaskId: t.clickupTaskId || r.clickupTaskId,
+        clickupUrl: t.clickupUrl || r.clickupUrl };
     });
   for (const t of remote){
     if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
   }
+  markRemoteAdopted(todos, merged);
   todos = merged;
   syncGen++;               // 远端内容流进了内存：undo 三方合并的归因要算到它
   /* 远端快照的结算标记一并采纳：它和这份列表同源 */
@@ -2432,11 +2468,17 @@ function mergeSoftRemote(parsed){
     const r = remoteMap.get(t.id);
     if (!r) return t;
     const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
-    return { ...w, pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0) };
+    const l = w === r ? t : r;
+    /* 赢方普通字段为准，但 pomodoros 取大、ClickUp 关联字段哪边有哪边留 */
+    return { ...w,
+      pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
+      clickupTaskId: w.clickupTaskId || l.clickupTaskId,
+      clickupUrl: w.clickupUrl || l.clickupUrl };
   });
   for (const t of remote){
     if (!ourIds.has(t.id)) merged.push(t);
   }
+  markRemoteAdopted(todos, merged);
   todos = merged;
   syncGen++;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
@@ -2450,6 +2492,7 @@ function applyExternal(parsed){
   const clean = sanitizeList(Array.isArray(list) ? list : []).todos;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
   if (JSON.stringify(clean) === JSON.stringify(todos)) return;   // 内容与内存一致：套了也白套
+  markRemoteAdopted(todos, clean);
   todos = clean;
   syncGen++;
   lastAppliedList = clean.map((t) => ({ ...t }));
