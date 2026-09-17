@@ -592,6 +592,30 @@ const kd = (w, el, init) => el.dispatchEvent(new w.KeyboardEvent("keydown", { bu
     f.remove();
   }
 
+  /* ── 终审3：脏窗口快照兜底不得复活远端删的条目 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    const ls = W.localStorage;
+    D.querySelector('.row[data-id="a"] .check').click();   // S1=[a,b,c]
+    await sleep(60);
+    seedTodos(readTodos().filter(t => t.id !== "b"));      // 远端删 b → 采纳登记 remoteIds
+    await sleep(80);
+    ls.setItem = () => { throw Object.assign(new Error("q"), { name:"QuotaExceededError" }); };
+    D.querySelector('.row[data-id="c"] .check').click();   // S2=[a,c]（b 已删），persist 失败 → localDirty
+    await sleep(60);
+    D.getElementById("undoBtn").click();                   // undo#1 → S2 兜底（无 b）
+    await sleep(60);
+    D.getElementById("undoBtn").click();                   // undo#2 → S1 兜底（b 是远端删的，不得复活）
+    await sleep(60);
+    delete ls.setItem;
+    D.querySelector('.row[data-id="a"] .check').click();   // persist 成功把内存落盘
+    await sleep(80);
+    assert("undo-no-resurrect-fallback", !readTodos().some(t => t.id === "b"),
+      "远端删的 b 经快照兜底复活: " + JSON.stringify(readTodos().map(t=>t.id)));
+    f.remove();
+  }
+
   const failed = results.filter(r => !r[1]);
   out.textContent += `\n${results.length - failed.length}/${results.length} passed`;
   document.title = failed.length ? "FAIL" : "ALL-PASS";

@@ -1400,7 +1400,14 @@ function undo(){
     const snapIds = new Set(snap.todos.map((t) => t.id));
     const remoteOnly = todos.filter((t) =>
       !snapIds.has(t.id) && (remoteIds.has(t.id) || remoteOriginIds.has(t.id)));
-    todos = snap.todos.map(restore).concat(remoteOnly);
+    /* 对称的一侧也不能漏：快照里有、内存里没有、还带着远端标记的——
+       那是远端删的（标记来源只剩 markRemoteAdopted 的删除登记），
+       无脑恢复等于复活并广播僵尸。注意不能只看标记：远端改过的条目
+       也在 remoteIds 里但仍在内存，得用 liveIds 区分 */
+    const liveIds = new Set(todos.map((t) => t.id));
+    todos = snap.todos
+      .filter((s) => !remoteIds.has(s.id) || liveIds.has(s.id))
+      .map(restore).concat(remoteOnly);
   }
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
