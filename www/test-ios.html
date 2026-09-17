@@ -572,6 +572,26 @@ const kd = (w, el, init) => el.dispatchEvent(new w.KeyboardEvent("keydown", { bu
     f.remove();
   }
 
+  /* ── 终审2：远端新增+本页碰过的条目，撤销更早快照不得删除它 ── */
+  {
+    const f = await freshFrame();
+    const W = f.contentWindow, D = f.contentDocument;
+    D.querySelector('.row[data-id="b"] .check').click();   // S1=[a,b,c]（无 x）
+    await sleep(60);
+    seedTodos([...readTodos(), mkTodo("x","远端新增")]);   // 远端加 x → 登记版本+出身
+    await sleep(80);
+    D.querySelector('.row[data-id="x"] .check').click();   // 本页勾 x（销版本标记，出身仍在）
+    await sleep(60);
+    D.getElementById("undoBtn").click();                   // 撤「标记完成(x)」
+    await sleep(80);
+    D.getElementById("undoBtn").click();                   // 撤「标记完成(b)」→ S1 里没有 x
+    await sleep(80);
+    const list = readTodos();
+    assert("undo-keeps-remote-origin", list.some(t => t.id === "x"),
+      "远端新增的 x 被误删: " + JSON.stringify(list.map(t=>t.id)));
+    f.remove();
+  }
+
   const failed = results.filter(r => !r[1]);
   out.textContent += `\n${results.length - failed.length}/${results.length} passed`;
   document.title = failed.length ? "FAIL" : "ALL-PASS";

@@ -379,6 +379,10 @@ let dirtyBase = null;          // localDirty 窗口起点时的盘基线
 let localDirty = false;        // 有改动还没落盘：内存领先于盘
 let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
 const remoteIds = new Set();   // 当前版本由远端写入（流入过内存）的条目 id——undo 归因要用
+/* 「出身」归因：远端新增的条目。本页改写只销版本标记（remoteIds.delete），
+   不动出身——否则撤销更早的快照时，「远端加的、后来被本页碰过的条目」
+   会被误判成本页新增，直接被撤掉并广播删除 */
+const remoteOriginIds = new Set();
 let persistState = storageWritable ? "ok" : "unavailable";
 let noticeDismissed = false;
 let currentTheme = "kanna";
@@ -586,7 +590,9 @@ function markRemoteAdopted(prev, next){
   const nextIds = new Set(next.map((t) => t.id));
   for (const t of next){
     const o = prevMap.get(t.id);
-    if (!o || JSON.stringify(o) !== JSON.stringify(t)) remoteIds.add(t.id);
+    /* 远端新增首次进内存：版本+出身一起记；远端编辑只记版本 */
+    if (!o){ remoteIds.add(t.id); remoteOriginIds.add(t.id); }
+    else if (JSON.stringify(o) !== JSON.stringify(t)) remoteIds.add(t.id);
   }
   for (const t of prev){ if (!nextIds.has(t.id)) remoteIds.add(t.id); }
 }
@@ -906,7 +912,7 @@ function finishSegment(silentCatchUp, endedAtOverride){
       const t = todos.find((x) => x.id === pomo.taskId);
       if (t){
         remoteIds.delete(t.id);    // 本页记账改写，当前版本不再是远端写的
-        t.pomodoros = (t.pomodoros || 0) + 1; t.updatedAt = Date.now(); persist();
+        t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); t.updatedAt = Date.now(); persist();
       }
     }
     /* 别页已结算的段不重复打卡（operationId 幂等兜底，但能省则省） */
@@ -1324,10 +1330,17 @@ function undo(){
       if (d && !Array.isArray(d)) adoptSettledSegs(d.settledSegs || d.settledSeg);
     } catch { /* 读不出就走纯快照恢复 */ }
   }
-  const livePomos = new Map(todos.map((t) => [t.id, t.pomodoros]));
-  /* pomodoros 是系统记账不是用户编辑：恢复快照时绝不用旧值盖新值 */
-  const restore = (t) => livePomos.has(t.id)
-    ? { ...t, pomodoros: Math.max(livePomos.get(t.id) || 0, t.pomodoros || 0) } : t;
+  const liveMap = new Map(todos.map((t) => [t.id, t]));
+  /* pomodoros/ClickUp 关联都是系统侧写入不是用户编辑（pushTodoToClickUp
+     回写不压快照）：恢复快照时绝不用旧值盖新值，哪边有留哪边 */
+  const restore = (t) => {
+    const l = liveMap.get(t.id);
+    if (!l) return t;
+    return { ...t,
+      pomodoros: Math.max(l.pomodoros || 0, t.pomodoros || 0),
+      clickupTaskId: l.clickupTaskId || t.clickupTaskId,
+      clickupUrl: l.clickupUrl || t.clickupUrl };
+  };
   if (diskList){
     /* 归因靠 remoteIds（条目级）：远端版本流入内存时登记，本页改写时销记——
        「盘==内存且≠快照」可能是我方编辑也可能是远端编辑流入，全局标志分不清 */
@@ -1339,12 +1352,14 @@ function undo(){
     for (const d of diskList){
       const s = S.get(d.id), m = M.get(d.id);
       if (!s){
-        /* 盘有快照没有：远端内容才保留——登记过的、根本没进过内存的、
-           或盘上版本与内存不同（远端编辑还卡在事件队列没流入，此时不查
-           会把对方的编辑连同条目一起删掉）。进内存的都顺手登记为远端；
-           在内存里见过且与盘一致却没被标 → 我们加的，撤销就该移除 */
-        if (!m || remoteIds.has(d.id) || !eq(d, m)){
-          remoteIds.add(d.id); merged.push(d);
+        /* 盘有快照没有：远端内容才保留——版本登记过的、出身是远端的、
+           根本没进过内存的、或盘上版本与内存不同（远端编辑还卡在事件
+           队列没流入）。进内存的都顺手登记为远端；
+           在内存里见过、与盘一致、又没被标 → 我们加的，撤销就该移除 */
+        if (!m || remoteIds.has(d.id) || remoteOriginIds.has(d.id) || !eq(d, m)){
+          remoteIds.add(d.id);
+          if (!m) remoteOriginIds.add(d.id);   // 没进过内存的盘条目：远端新增
+          merged.push(d);
         }
         continue;
       }
@@ -1378,7 +1393,14 @@ function undo(){
     /* 合并态下有 dirtyBase 时 pendingExternal 还要留给恢复合并用，不能清 */
     if (!dirtyBase) pendingExternal = null;
   } else {
-    todos = snap.todos.map(restore);
+    /* 快照恢复兜底（读不出盘/脏窗口）：remoteIds/remoteOriginIds 标记的
+       内存条目是远端内容——可能刚从 pendingExternal 合进来而快照里没有，
+       无脑恢复快照会把它们从内存抹掉（pendingExternal 已被消费时就是
+       永久丢失）。合不进去的就别丢：追加到末尾 */
+    const snapIds = new Set(snap.todos.map((t) => t.id));
+    const remoteOnly = todos.filter((t) =>
+      !snapIds.has(t.id) && (remoteIds.has(t.id) || remoteOriginIds.has(t.id)));
+    todos = snap.todos.map(restore).concat(remoteOnly);
   }
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
@@ -2354,7 +2376,7 @@ function importJSON(file){
     if (clean.length === 0){ toast("没有可导入的有效条目"); return; }
     syncTodosFromDisk();   // 导入覆盖整张表，更不能拿旧内存垫在底下
     snapshot("导入数据");
-    remoteIds.clear();           // 整张表都是本页写的，远端归因全部作废
+    remoteIds.clear(); remoteOriginIds.clear();   // 整张表都是本页写的，远端归因全部作废
     todos = clean;
     reconcilePomoTask();
     render(); persist();
