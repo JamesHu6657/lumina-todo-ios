@@ -5,7 +5,6 @@
  * - 浮动桌宠（手机横条布局时恢复角色）
  * - 键盘弹起时聊天输入可见
  * - 长按行工具
- * - 排序提示文案
  * - 轻触觉（若 Capacitor Haptics 可用）
  */
 (() => {
@@ -67,12 +66,6 @@
     } catch {
       /* ignore */
     }
-  }
-
-  /* ---- status sort hint ---- */
-  function fixSortHint() {
-    const note = document.getElementById("sortNote");
-    if (note && isTouch) note.textContent = "长按手柄可排序";
   }
 
   /* ---- undo title ---- */
@@ -184,6 +177,42 @@
       pending = null;
     };
 
+    const rowIds = () =>
+      [...list.querySelectorAll(".row")]
+        .map((r) => r.dataset.id || r.getAttribute("data-id"))
+        .filter(Boolean);
+
+    const placeAt = (x, y) => {
+      const el = document.elementFromPoint(x, y);
+      const over = el && el.closest ? el.closest(".row") : null;
+      if (!over || over === drag.row || !list.contains(over)) return;
+      const rect = over.getBoundingClientRect();
+      if (y < rect.top + rect.height / 2) list.insertBefore(drag.row, over);
+      else list.insertBefore(drag.row, over.nextSibling);
+    };
+
+    /* 拖到滚动区上下边缘时自动滚动，长列表也能一次拖到位 */
+    const EDGE_PX = 56;
+    const autoScroll = () => {
+      if (!drag) return;
+      drag.raf = 0;
+      const scroller = document.getElementById("scroller") || list.closest(".scroller");
+      if (!scroller) return;
+      const r = scroller.getBoundingClientRect();
+      const vvH = window.visualViewport?.height || window.innerHeight;
+      const top = r.top;
+      const bottom = Math.min(r.bottom, vvH);
+      let dy = 0;
+      if (drag.lastY < top + EDGE_PX) dy = -Math.ceil((top + EDGE_PX - drag.lastY) / 4);
+      else if (drag.lastY > bottom - EDGE_PX) dy = Math.ceil((drag.lastY - (bottom - EDGE_PX)) / 4);
+      if (!dy) return;
+      const before = scroller.scrollTop;
+      scroller.scrollTop += dy;
+      if (scroller.scrollTop === before) return;
+      placeAt(drag.lastX, drag.lastY);
+      drag.raf = requestAnimationFrame(autoScroll);
+    };
+
     list.addEventListener(
       "touchstart",
       (e) => {
@@ -204,7 +233,11 @@
             drag = {
               row,
               startY: pending.y,
+              lastX: pending.x,
+              lastY: pending.y,
               id: row.dataset.id || row.getAttribute("data-id"),
+              origin: rowIds(),
+              raf: 0,
             };
             pending = null;
             row.classList.add("dragging", "is-dragging");
@@ -226,42 +259,50 @@
         }
         if (!drag) return;
         e.preventDefault();
-        const y = t.clientY;
-        const el = document.elementFromPoint(t.clientX, y);
-        const over = el && el.closest ? el.closest(".row") : null;
-        if (!over || over === drag.row || !list.contains(over)) return;
-
-        const rect = over.getBoundingClientRect();
-        const before = y < rect.top + rect.height / 2;
-        if (before) list.insertBefore(drag.row, over);
-        else list.insertBefore(drag.row, over.nextSibling);
+        drag.lastX = t.clientX;
+        drag.lastY = t.clientY;
+        placeAt(t.clientX, t.clientY);
+        if (!drag.raf) drag.raf = requestAnimationFrame(autoScroll);
       },
       { passive: false }
     );
 
-    const end = () => {
+    /* DOM 已被拖动改过序：数据没跟着改时要按数据重绘，否则界面和存储顺序不一致 */
+    const restoreDom = () => {
+      const api = window.__luminaTouchReorderApi;
+      if (api && typeof api.render === "function") api.render();
+    };
+
+    const end = (cancelled) => {
       if (pending) {
         clearPending();
         return;
       }
       if (!drag) return;
-      const row = drag.row;
+      const { row, origin, raf } = drag;
+      if (raf) cancelAnimationFrame(raf);
+      drag = null;
       row.classList.remove("dragging", "is-dragging");
+      const ids = rowIds();
+      const changed = ids.join("\n") !== origin.join("\n");
+      if (!changed) return;
+      if (cancelled) {
+        restoreDom();
+        return;
+      }
+      let ok = false;
       try {
-        const ids = [...list.querySelectorAll(".row")]
-          .map((r) => r.dataset.id || r.getAttribute("data-id"))
-          .filter(Boolean);
         if (typeof window.__luminaReorder === "function") {
-          window.__luminaReorder(ids);
+          ok = window.__luminaReorder(ids) !== false;
         }
       } catch (err) {
         console.warn("[touch-sort]", err);
       }
-      drag = null;
-      haptic("medium");
+      if (ok) haptic("medium");
+      else restoreDom();
     };
-    list.addEventListener("touchend", end);
-    list.addEventListener("touchcancel", end);
+    list.addEventListener("touchend", () => end(false));
+    list.addEventListener("touchcancel", () => end(true));
   }
 
   /**
@@ -495,7 +536,6 @@
   }
 
   function boot() {
-    fixSortHint();
     fixUndoTitle();
     mountFloatingPet();
     enableTouchSort();

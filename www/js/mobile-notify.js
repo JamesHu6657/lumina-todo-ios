@@ -17,6 +17,8 @@
   let ready = false;
   let perm = "prompt"; // prompt | granted | denied
   let lastScheduleKey = "";
+  // 已交给系统、到点会由 iOS 自己弹出的那条通知的时间点
+  let armedEndsAt = 0;
   let lastSnapshot = null;
   // App 的开始/暂停/重置可连续触发；串行化原生调用以免旧 schedule 覆盖新 cancel。
   let pomoChanges = Promise.resolve();
@@ -77,6 +79,8 @@
       /* ignore */
     }
     lastScheduleKey = "";
+    // 取消的是还没到点的那条才算撤销；已到点的系统已经弹过了
+    if (armedEndsAt > Date.now() + 1500) armedEndsAt = 0;
   }
 
   function modeLabel(mode) {
@@ -128,14 +132,25 @@
         ],
       });
       lastScheduleKey = key;
+      armedEndsAt = snap.endsAt;
     } catch (err) {
       console.warn("[mobile-notify] schedule failed", err);
     }
   }
 
+  function alreadyDeliveredBySystem() {
+    if (!armedEndsAt) return false;
+    const now = Date.now();
+    return now >= armedEndsAt - 1500 && now - armedEndsAt < 10 * 60 * 1000;
+  }
+
   async function notifyNow(title, body) {
+    // 人在 App 里：提示音 + 角色台词已足够，不再叠一条系统横幅
+    if (!document.hidden) return;
     const LN = plugin();
     if (LN?.schedule && perm === "granted") {
+      // 预约的到点通知已由系统送达，别再补一条重复的
+      if (alreadyDeliveredBySystem()) return;
       try {
         // 立即通知：用近未来 1s，避免部分系统忽略 past dates
         const at = new Date(Date.now() + 1000);

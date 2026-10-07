@@ -1106,7 +1106,7 @@ async function main() {
   /* ---- app.js 触控排序文案与 O(n) 历史分组 ---- */
   {
     const appSrc = fs.readFileSync(path.join(WWW, "app.js"), "utf8");
-    assert.match(appSrc, /长按左侧手柄可排序/);
+    assert.match(appSrc, /长按(左侧)?手柄可排序/);
     assert.match(appSrc, /dayCounts/);
     assert.doesNotMatch(
       appSrc,
