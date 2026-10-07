@@ -151,12 +151,14 @@
       const maskEl = document.getElementById("setApiMask");
       const cuMask = document.getElementById("setCuMask");
       const keyLabel = document.getElementById("setApiKeyLabel");
+      const keyInput = document.getElementById("setApiKey");
       const hintEl = document.getElementById("setProviderHint");
       try {
         const pv = await window.luminaAI?.providers?.();
         const cur = pv?.list?.find((x) => x.id === pv.current);
         if (cur) {
           if (keyLabel) keyLabel.textContent = `API Key（${cur.keyHint}）`;
+          if (keyInput) keyInput.placeholder = cur.keyHint;
           if (hintEl) hintEl.textContent = `${cur.label} · ${cur.model}`;
         }
       } catch {
@@ -190,6 +192,7 @@
 
     // 服务商下拉：填充并记住当前项
     const providerSel = document.getElementById("setProvider");
+    let previousProvider = providerSel?.value || "";
     (async () => {
       try {
         const pv = await window.luminaAI?.providers?.();
@@ -202,6 +205,7 @@
           providerSel.appendChild(opt);
         }
         providerSel.value = pv.current;
+        previousProvider = pv.current;
       } catch {
         /* ignore */
       }
@@ -211,14 +215,17 @@
       try {
         const r = await window.luminaAI?.setProvider?.(id);
         if (r?.ok) {
+          previousProvider = id;
           document.getElementById("setApiKey").value = "";
           toast(`已切换为 ${providerSel.options[providerSel.selectedIndex]?.textContent || id}`);
           refreshMasks();
           document.getElementById("chatRecheck")?.click();
         } else {
+          providerSel.value = previousProvider;
           toast(r?.error || "切换失败");
         }
       } catch (err) {
+        providerSel.value = previousProvider;
         toast(err?.message || "切换失败");
       }
     });

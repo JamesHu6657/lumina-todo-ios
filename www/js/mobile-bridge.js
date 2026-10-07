@@ -202,8 +202,8 @@
 
   /* ----------------------------- key store（Keychain / localStorage） ----------------------------- */
   let keyCache = { provider: null, value: null, at: 0 };
-  function cacheFor() {
-    return keyCache.provider === currentProvider().id ? keyCache : null;
+  function cacheFor(provider = currentProvider()) {
+    return keyCache.provider === provider.id ? keyCache : null;
   }
   /** providerId 显式传入：异步读 key 期间用户可能已切换服务商，别把旧家的 key 记到新家名下 */
   function storeCache(key, providerId = currentProvider().id) {
@@ -240,8 +240,7 @@
     }
   }
 
-  async function warmApiKey() {
-    const provider = currentProvider();
+  async function warmApiKey(provider = currentProvider()) {
     // 按服务商预热：切换后要给新服务商的 key 做一次 Keychain 迁移
     if (keyWarm && keyWarmProvider === provider.id) return keyWarm;
     const p = (async () => {
@@ -269,15 +268,14 @@
   // 启动预热
   warmApiKey().catch(() => {});
 
-  async function resolveApiKey({ refresh = false } = {}) {
-    const provider = currentProvider();
+  async function resolveApiKey({ refresh = false, provider = currentProvider() } = {}) {
     const now = Date.now();
-    let c = cacheFor();
+    let c = cacheFor(provider);
     if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
       return c.value;
     }
-    await warmApiKey();
-    c = cacheFor();
+    await warmApiKey(provider);
+    c = cacheFor(provider);
     if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
       return c.value;
     }
@@ -592,10 +590,12 @@
   }
 
   async function callChatApi({ messages, tools, tool_choice, stream, temperature, max_tokens, signal, timeoutMs }) {
-    const key = await resolveApiKey();
+    const provider = currentProvider();
+    const endpoint = provider.base + "/chat/completions";
+    const key = await resolveApiKey({ provider });
     if (!key) {
       const err = new Error(
-        `未找到 API Key。请在设置中为 ${currentProvider().label} 粘贴 ${currentProvider().keyHint} 密钥。`
+        `未找到 API Key。请在设置中为 ${provider.label} 粘贴 ${provider.keyHint} 密钥。`
       );
       err.code = "NO_KEY";
       throw err;
@@ -607,7 +607,7 @@
       throw err;
     }
     const body = {
-      model: aiModel(),
+      model: provider.model,
       messages: clipped,
       stream: Boolean(stream),
       temperature: clampNumber(temperature, 0, 2, 0.4),
@@ -652,7 +652,7 @@
 
     let res;
     try {
-      res = await fetch(aiEndpoint(), {
+      res = await fetch(endpoint, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -661,8 +661,8 @@
     } catch (err) {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
-      const classified = classifyRequestError(err, { url: aiEndpoint() });
-      logRequestFailure("fetch failed", err, { url: aiEndpoint() });
+      const classified = classifyRequestError(err, { url: endpoint });
+      logRequestFailure("fetch failed", err, { url: endpoint });
       const e = new Error(classified.message);
       e.code = classified.code;
       e.cause = err;
@@ -683,15 +683,15 @@
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
       if (res.status === 401 || res.status === 403) {
-        storeCache(null);
+        storeCache(null, provider.id);
       }
       const classified = classifyRequestError(null, {
-        url: aiEndpoint(),
+        url: endpoint,
         status: res.status,
         bodySnippet: redactSecrets(detail),
       });
       logRequestFailure("HTTP error", { name: "HttpError", message: classified.message, status: res.status }, {
-        url: aiEndpoint(),
+        url: endpoint,
         status: res.status,
       });
       const err = new Error(classified.message);
@@ -1085,8 +1085,11 @@
       } catch {
         /* ignore */
       }
+      if (currentProvider().id !== id) {
+        return { ok: false, error: "无法保存服务商选择（存储不可用）" };
+      }
       const p = currentProvider();
-      warmApiKey().catch(() => {});
+      warmApiKey(p).catch(() => {});
       return { ok: true, provider: p.id, model: p.model };
     },
 

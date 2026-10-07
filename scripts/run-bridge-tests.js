@@ -1139,6 +1139,87 @@ async function main() {
     ok("AI 服务商可切换 Command Code（独立 key 存储）");
   }
 
+  /* ---- Command Code complete 请求使用对应服务商配置 ---- */
+  {
+    const key = "cmd-" + "c".repeat(24);
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-provider", "commandcode");
+    store.setItem("lumina-api-key-commandcode", key);
+    let request;
+    const { ai } = loadBridge(store, async (url, options) => {
+      request = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+          });
+        },
+      };
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const result = await ai.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(request.url, "https://api.commandcode.ai/provider/v1/chat/completions");
+    assert.equal(request.headers.Authorization, `Bearer ${key}`);
+    assert.equal(request.body.model, "deepseek/deepseek-v4.1-flash");
+    ok("complete 使用 Command Code URL、key 与模型");
+  }
+
+  /* ---- 请求期间切换服务商不会混用 endpoint / key / model ---- */
+  {
+    const key = "cmd-" + "d".repeat(24);
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-provider", "commandcode");
+    store.setItem("lumina-api-key-commandcode", key);
+    let request;
+    const { ai } = loadBridge(store, async (url, options) => {
+      request = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+          });
+        },
+      };
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const pending = ai.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: false,
+    });
+    await Promise.resolve();
+    const switched = ai.setProvider("opencode");
+    assert.equal(switched.ok, true);
+    const result = await pending;
+    assert.equal(result.ok, true);
+    assert.equal(request.url, "https://api.commandcode.ai/provider/v1/chat/completions");
+    assert.equal(request.headers.Authorization, `Bearer ${key}`);
+    assert.equal(request.body.model, "deepseek/deepseek-v4.1-flash");
+    ok("请求期间切换服务商仍使用 Command Code 配置");
+  }
+
+  /* ---- 服务商选择无法持久化时返回失败且不切换 ---- */
+  {
+    const store = makeLocalStorage();
+    const setItem = store.setItem;
+    store.setItem = (key, value) => {
+      if (key === "lumina-api-provider") throw new Error("storage unavailable");
+      setItem(key, value);
+    };
+    const { ai } = loadBridge(store);
+    const result = ai.setProvider("commandcode");
+    assert.equal(result.ok, false);
+    assert.equal((await ai.providers()).current, "opencode");
+    ok("服务商存储失败时返回错误并保留当前选择");
+  }
+
   /* ---- app.js 触控排序文案与 O(n) 历史分组 ---- */
   {
     const appSrc = fs.readFileSync(path.join(WWW, "app.js"), "utf8");
