@@ -44,7 +44,6 @@
   }
   const aiEndpoint = () => currentProvider().base + "/chat/completions";
   const aiModel = () => currentProvider().model;
-  const aiBase = () => currentProvider().base;
 
   const LIMITS = {
     maxActiveRequests: 8,
@@ -1007,10 +1006,11 @@
   }
 
   async function aiStatus(opts) {
+    const provider = currentProvider();
     let key;
     let storageError = null;
     try {
-      key = await resolveApiKey({ refresh: Boolean(opts && opts.refresh) });
+      key = await resolveApiKey({ refresh: Boolean(opts && opts.refresh), provider });
     } catch (err) {
       storageError = err;
     }
@@ -1018,9 +1018,9 @@
     if (!key) {
       return {
         ok: false,
-        provider: currentProvider().id,
-        model: aiModel(),
-        base: aiBase(),
+        provider: provider.id,
+        model: provider.model,
+        base: provider.base,
         agent: true,
         tools,
         source: null,
@@ -1033,9 +1033,9 @@
     }
     return {
       ok: true,
-      provider: currentProvider().id,
-      model: aiModel(),
-      base: aiBase(),
+      provider: provider.id,
+      model: provider.model,
+      base: provider.base,
       agent: true,
       tools,
       source: "settings",
