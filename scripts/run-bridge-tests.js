@@ -1130,6 +1130,12 @@ async function main() {
     // 非法 id 报错，当前服务商不变
     const bad = await sandbox.luminaAI.setProvider("nope");
     assert.equal(bad.ok, false);
+    // ClickUp token 不能当 AI key；OpenCode 仍要求 sk-
+    const pkRes = await sandbox.luminaAI.setApiKey("pk_" + "z".repeat(30));
+    assert.equal(pkRes.ok, false, "pk_ token 应被拒绝");
+    await sandbox.luminaAI.setProvider("opencode");
+    const noSk = await sandbox.luminaAI.setApiKey("x".repeat(30));
+    assert.equal(noSk.ok, false, "OpenCode 仍要求 sk- 前缀");
     ok("AI 服务商可切换 Command Code（独立 key 存储）");
   }
 

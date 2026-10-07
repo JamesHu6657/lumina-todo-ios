@@ -17,6 +17,7 @@
       model: "deepseek-v4-flash",
       keyStore: "lumina-api-key",
       keyHint: "sk-…",
+      keyPattern: /^sk-/,
     },
     commandcode: {
       id: "commandcode",
@@ -24,7 +25,8 @@
       base: "https://api.commandcode.ai/provider/v1",
       model: "deepseek/deepseek-v4.1-flash",
       keyStore: "lumina-api-key-commandcode",
-      keyHint: "cmd-… / Bearer Token",
+      keyHint: "Studio 生成的 API Key",
+      keyPattern: null,
     },
   };
   const DEFAULT_PROVIDER = "opencode";
@@ -43,7 +45,6 @@
   const aiEndpoint = () => currentProvider().base + "/chat/completions";
   const aiModel = () => currentProvider().model;
   const aiBase = () => currentProvider().base;
-  const apiKeyStore = () => currentProvider().keyStore;
 
   const LIMITS = {
     maxActiveRequests: 8,
@@ -80,7 +81,11 @@
 
   function redactSecrets(text) {
     if (typeof text !== "string" || !text) return text;
-    return text.replace(/sk-[A-Za-z0-9_-]{8,}/g, (m) => m.slice(0, 6) + "***");
+    let out = text.replace(/sk-[A-Za-z0-9_-]{8,}/g, (m) => m.slice(0, 6) + "***");
+    // 无固定前缀的 key（如 Command Code）：按已知 key 原文脱敏
+    const known = keyCache && keyCache.value;
+    if (known && known.length >= 8) out = out.split(known).join(known.slice(0, 4) + "***");
+    return out.replace(/(Bearer\s+)[^\s"']{8,}/gi, "$1***");
   }
 
   function normalizeRequestId(value) {
@@ -197,15 +202,16 @@
 
   /* ----------------------------- key store（Keychain / localStorage） ----------------------------- */
   let keyCache = { provider: null, value: null, at: 0 };
-  function cacheFor(key) {
-    const p = currentProvider().id;
-    if (keyCache.provider !== p) return null;
-    return keyCache;
+  function cacheFor() {
+    return keyCache.provider === currentProvider().id ? keyCache : null;
   }
-  function storeCache(key) {
-    keyCache = { provider: currentProvider().id, value: key, at: Date.now() };
+  /** providerId 显式传入：异步读 key 期间用户可能已切换服务商，别把旧家的 key 记到新家名下 */
+  function storeCache(key, providerId = currentProvider().id) {
+    if (providerId !== currentProvider().id) return;
+    keyCache = { provider: providerId, value: key, at: Date.now() };
   }
   let keyWarm = null;
+  let keyWarmProvider = null;
 
   function secure() {
     return globalThis.LUMINA_SECURE_STORE || null;
@@ -214,38 +220,43 @@
     return secure()?.backend?.() === "keychain";
   }
 
-  function parseApiKey(raw) {
+  function parseApiKey(raw, provider = currentProvider()) {
     const line = String(raw || "").trim();
     if (!line) return null;
-    const m = line.match(/(?:api[_-]?key\s*[=:]\s*)?((?:sk|cmd|cc|pk|api)[-_][A-Za-z0-9_-]+)/i);
-    const key = m ? m[1] : line;
-    // 各家 key 前缀不一（sk-、cmd- 等），统一要求非空白且够长
-    if (key.length >= MIN_KEY && !/\s/.test(key)) return key;
-    return null;
+    const m = line.match(/^(?:api[_-]?key\s*[=:]\s*)?(\S+)$/i);
+    const key = m ? m[1] : null;
+    if (!key || key.length < MIN_KEY) return null;
+    // ClickUp 个人 token 误贴到 AI 栏
+    if (/^pk_/.test(key)) return null;
+    if (provider.keyPattern && !provider.keyPattern.test(key)) return null;
+    return key;
   }
 
-  function loadKeyFromLocalStorage() {
+  function loadKeyFromLocalStorage(provider = currentProvider()) {
     try {
-      return parseApiKey(localStorage.getItem(apiKeyStore()) || "");
+      return parseApiKey(localStorage.getItem(provider.keyStore) || "", provider);
     } catch {
       return null;
     }
   }
 
   async function warmApiKey() {
-    if (keyWarm) return keyWarm;
+    const provider = currentProvider();
+    // 按服务商预热：切换后要给新服务商的 key 做一次 Keychain 迁移
+    if (keyWarm && keyWarmProvider === provider.id) return keyWarm;
     const p = (async () => {
       const s = secure();
       if (s?.migrateKey) {
-        const v = parseApiKey(await s.migrateKey(apiKeyStore()));
-        storeCache(v);
+        const v = parseApiKey(await s.migrateKey(provider.keyStore), provider);
+        storeCache(v, provider.id);
         return v;
       }
-      const v = loadKeyFromLocalStorage();
-      storeCache(v);
+      const v = loadKeyFromLocalStorage(provider);
+      storeCache(v, provider.id);
       return v;
     })();
     keyWarm = p;
+    keyWarmProvider = provider.id;
     try {
       return await p;
     } catch (err) {
@@ -259,6 +270,7 @@
   warmApiKey().catch(() => {});
 
   async function resolveApiKey({ refresh = false } = {}) {
+    const provider = currentProvider();
     const now = Date.now();
     let c = cacheFor();
     if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
@@ -272,55 +284,56 @@
     const s = secure();
     if (s?.get) {
       try {
-        const v = parseApiKey(await s.get(apiKeyStore()));
-        storeCache(v);
+        const v = parseApiKey(await s.get(provider.keyStore), provider);
+        storeCache(v, provider.id);
         return v;
       } catch (err) {
         if (usesKeychain()) throw err;
       }
     }
     if (usesKeychain()) return null;
-    const v = loadKeyFromLocalStorage();
-    storeCache(v);
+    const v = loadKeyFromLocalStorage(provider);
+    storeCache(v, provider.id);
     return v;
   }
 
   async function setApiKey(raw) {
+    const provider = currentProvider();
     const line = String(raw || "").trim();
     if (!line) {
       const s = secure();
       if (s?.remove) {
         try {
-          const removed = await s.remove(apiKeyStore());
+          const removed = await s.remove(provider.keyStore);
           if (!removed && usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         } catch {
           if (usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         }
       }
       if (usesKeychain()) {
-        storeCache(null);
+        storeCache(null, provider.id);
         return { ok: true, backend: "keychain" };
       }
       try {
-        localStorage.removeItem(apiKeyStore());
+        localStorage.removeItem(provider.keyStore);
       } catch {
         /* ignore */
       }
-      storeCache(null);
+      storeCache(null, provider.id);
       return { ok: true };
     }
-    const key = parseApiKey(line);
+    const key = parseApiKey(line, provider);
     if (!key) {
       return {
         ok: false,
-        error: `API Key 格式无效：需要 ${currentProvider().keyHint} 且至少 ${MIN_KEY} 字符`,
+        error: `API Key 格式无效：需要 ${provider.keyHint} 且至少 ${MIN_KEY} 字符`,
       };
     }
     const s = secure();
     let ok = false;
     if (s?.set) {
       try {
-        ok = await s.set(apiKeyStore(), key);
+        ok = await s.set(provider.keyStore, key);
       } catch {
         ok = false;
       }
@@ -330,14 +343,14 @@
     }
     if (!ok) {
       try {
-        localStorage.setItem(apiKeyStore(), key);
+        localStorage.setItem(provider.keyStore, key);
         ok = true;
       } catch {
         ok = false;
       }
     }
     if (!ok) return { ok: false, error: "无法保存 Key（存储不可用）" };
-    storeCache(key);
+    storeCache(key, provider.id);
     return { ok: true, backend: s?.backend?.() || "localStorage" };
   }
 
@@ -1073,6 +1086,7 @@
         /* ignore */
       }
       const p = currentProvider();
+      warmApiKey().catch(() => {});
       return { ok: true, provider: p.id, model: p.model };
     },
 
