@@ -5,11 +5,45 @@
 (function () {
   "use strict";
 
-  const AI_BASE = "https://opencode.ai/zen/go/v1";
-  const AI_MODEL = "deepseek-v4-flash";
-  const AI_ENDPOINT = AI_BASE + "/chat/completions";
-  const API_KEY_STORE = "lumina-api-key";
+  /**
+   * 支持的 AI 服务商（都是 OpenAI Chat Completions 兼容端点）。
+   * 每个服务商有自己的模型、key 存储位与提示文案；切换不会清掉别家的 key。
+   */
+  const AI_PROVIDERS = {
+    opencode: {
+      id: "opencode",
+      label: "OpenCode Zen",
+      base: "https://opencode.ai/zen/go/v1",
+      model: "deepseek-v4-flash",
+      keyStore: "lumina-api-key",
+      keyHint: "sk-…",
+    },
+    commandcode: {
+      id: "commandcode",
+      label: "Command Code",
+      base: "https://api.commandcode.ai/provider/v1",
+      model: "deepseek/deepseek-v4.1-flash",
+      keyStore: "lumina-api-key-commandcode",
+      keyHint: "cmd-… / Bearer Token",
+    },
+  };
+  const DEFAULT_PROVIDER = "opencode";
+  const PROVIDER_STORE = "lumina-api-provider";
   const MIN_KEY = 20;
+
+  function currentProvider() {
+    let id = null;
+    try {
+      id = localStorage.getItem(PROVIDER_STORE);
+    } catch {
+      /* ignore */
+    }
+    return AI_PROVIDERS[id] || AI_PROVIDERS[DEFAULT_PROVIDER];
+  }
+  const aiEndpoint = () => currentProvider().base + "/chat/completions";
+  const aiModel = () => currentProvider().model;
+  const aiBase = () => currentProvider().base;
+  const apiKeyStore = () => currentProvider().keyStore;
 
   const LIMITS = {
     maxActiveRequests: 8,
@@ -147,7 +181,7 @@
         message: err?.message,
         code: err?.code,
         status: err?.status ?? meta.status,
-        url: meta.url || AI_ENDPOINT,
+        url: meta.url || aiEndpoint(),
         stack: err?.stack,
         raw: err,
       });
@@ -162,7 +196,15 @@
   }
 
   /* ----------------------------- key store（Keychain / localStorage） ----------------------------- */
-  let keyCache = { value: null, at: 0 };
+  let keyCache = { provider: null, value: null, at: 0 };
+  function cacheFor(key) {
+    const p = currentProvider().id;
+    if (keyCache.provider !== p) return null;
+    return keyCache;
+  }
+  function storeCache(key) {
+    keyCache = { provider: currentProvider().id, value: key, at: Date.now() };
+  }
   let keyWarm = null;
 
   function secure() {
@@ -175,15 +217,16 @@
   function parseApiKey(raw) {
     const line = String(raw || "").trim();
     if (!line) return null;
-    const m = line.match(/(?:api[_-]?key\s*[=:]\s*)?(sk-[A-Za-z0-9_-]+)/i);
+    const m = line.match(/(?:api[_-]?key\s*[=:]\s*)?((?:sk|cmd|cc|pk|api)[-_][A-Za-z0-9_-]+)/i);
     const key = m ? m[1] : line;
-    if (key.startsWith("sk-") && key.length >= MIN_KEY) return key;
+    // 各家 key 前缀不一（sk-、cmd- 等），统一要求非空白且够长
+    if (key.length >= MIN_KEY && !/\s/.test(key)) return key;
     return null;
   }
 
   function loadKeyFromLocalStorage() {
     try {
-      return parseApiKey(localStorage.getItem(API_KEY_STORE) || "");
+      return parseApiKey(localStorage.getItem(apiKeyStore()) || "");
     } catch {
       return null;
     }
@@ -194,12 +237,12 @@
     const p = (async () => {
       const s = secure();
       if (s?.migrateKey) {
-        const v = parseApiKey(await s.migrateKey(API_KEY_STORE));
-        keyCache = { value: v, at: Date.now() };
+        const v = parseApiKey(await s.migrateKey(apiKeyStore()));
+        storeCache(v);
         return v;
       }
       const v = loadKeyFromLocalStorage();
-      keyCache = { value: v, at: Date.now() };
+      storeCache(v);
       return v;
     })();
     keyWarm = p;
@@ -217,18 +260,20 @@
 
   async function resolveApiKey({ refresh = false } = {}) {
     const now = Date.now();
-    if (!refresh && keyCache.at && now - keyCache.at < LIMITS.apiKeyCacheMs) {
-      return keyCache.value;
+    let c = cacheFor();
+    if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
+      return c.value;
     }
     await warmApiKey();
-    if (!refresh && keyCache.at && now - keyCache.at < LIMITS.apiKeyCacheMs) {
-      return keyCache.value;
+    c = cacheFor();
+    if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
+      return c.value;
     }
     const s = secure();
     if (s?.get) {
       try {
-        const v = parseApiKey(await s.get(API_KEY_STORE));
-        keyCache = { value: v, at: Date.now() };
+        const v = parseApiKey(await s.get(apiKeyStore()));
+        storeCache(v);
         return v;
       } catch (err) {
         if (usesKeychain()) throw err;
@@ -236,7 +281,7 @@
     }
     if (usesKeychain()) return null;
     const v = loadKeyFromLocalStorage();
-    keyCache = { value: v, at: Date.now() };
+    storeCache(v);
     return v;
   }
 
@@ -246,36 +291,36 @@
       const s = secure();
       if (s?.remove) {
         try {
-          const removed = await s.remove(API_KEY_STORE);
+          const removed = await s.remove(apiKeyStore());
           if (!removed && usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         } catch {
           if (usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         }
       }
       if (usesKeychain()) {
-        keyCache = { value: null, at: 0 };
+        storeCache(null);
         return { ok: true, backend: "keychain" };
       }
       try {
-        localStorage.removeItem(API_KEY_STORE);
+        localStorage.removeItem(apiKeyStore());
       } catch {
         /* ignore */
       }
-      keyCache = { value: null, at: 0 };
+      storeCache(null);
       return { ok: true };
     }
     const key = parseApiKey(line);
     if (!key) {
       return {
         ok: false,
-        error: `API Key 格式无效：需要 sk-… 且至少 ${MIN_KEY} 字符`,
+        error: `API Key 格式无效：需要 ${currentProvider().keyHint} 且至少 ${MIN_KEY} 字符`,
       };
     }
     const s = secure();
     let ok = false;
     if (s?.set) {
       try {
-        ok = await s.set(API_KEY_STORE, key);
+        ok = await s.set(apiKeyStore(), key);
       } catch {
         ok = false;
       }
@@ -285,14 +330,14 @@
     }
     if (!ok) {
       try {
-        localStorage.setItem(API_KEY_STORE, key);
+        localStorage.setItem(apiKeyStore(), key);
         ok = true;
       } catch {
         ok = false;
       }
     }
     if (!ok) return { ok: false, error: "无法保存 Key（存储不可用）" };
-    keyCache = { value: key, at: Date.now() };
+    storeCache(key);
     return { ok: true, backend: s?.backend?.() || "localStorage" };
   }
 
@@ -537,7 +582,7 @@
     const key = await resolveApiKey();
     if (!key) {
       const err = new Error(
-        "未找到 API Key。请在设置中粘贴 sk-… 密钥（OpenCode / DeepSeek）。"
+        `未找到 API Key。请在设置中为 ${currentProvider().label} 粘贴 ${currentProvider().keyHint} 密钥。`
       );
       err.code = "NO_KEY";
       throw err;
@@ -549,7 +594,7 @@
       throw err;
     }
     const body = {
-      model: AI_MODEL,
+      model: aiModel(),
       messages: clipped,
       stream: Boolean(stream),
       temperature: clampNumber(temperature, 0, 2, 0.4),
@@ -594,7 +639,7 @@
 
     let res;
     try {
-      res = await fetch(AI_ENDPOINT, {
+      res = await fetch(aiEndpoint(), {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -603,8 +648,8 @@
     } catch (err) {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
-      const classified = classifyRequestError(err, { url: AI_ENDPOINT });
-      logRequestFailure("fetch failed", err, { url: AI_ENDPOINT });
+      const classified = classifyRequestError(err, { url: aiEndpoint() });
+      logRequestFailure("fetch failed", err, { url: aiEndpoint() });
       const e = new Error(classified.message);
       e.code = classified.code;
       e.cause = err;
@@ -625,15 +670,15 @@
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
       if (res.status === 401 || res.status === 403) {
-        keyCache = { value: null, at: 0 };
+        storeCache(null);
       }
       const classified = classifyRequestError(null, {
-        url: AI_ENDPOINT,
+        url: aiEndpoint(),
         status: res.status,
         bodySnippet: redactSecrets(detail),
       });
       logRequestFailure("HTTP error", { name: "HttpError", message: classified.message, status: res.status }, {
-        url: AI_ENDPOINT,
+        url: aiEndpoint(),
         status: res.status,
       });
       const err = new Error(classified.message);
@@ -943,7 +988,7 @@
   function noKeyError() {
     return {
       ok: false,
-      error: "未找到 API Key。请点右上角 ⚙ 设置，粘贴 sk-… 密钥。",
+      error: `未找到 API Key。请在设置中为 ${currentProvider().label} 粘贴 ${currentProvider().keyHint} 密钥。`,
       code: "NO_KEY",
     };
   }
@@ -960,8 +1005,9 @@
     if (!key) {
       return {
         ok: false,
-        model: AI_MODEL,
-        base: AI_BASE,
+        provider: currentProvider().id,
+        model: aiModel(),
+        base: aiBase(),
         agent: true,
         tools,
         source: null,
@@ -974,8 +1020,9 @@
     }
     return {
       ok: true,
-      model: AI_MODEL,
-      base: AI_BASE,
+      provider: currentProvider().id,
+      model: aiModel(),
+      base: aiBase(),
       agent: true,
       tools,
       source: "settings",
@@ -1003,6 +1050,30 @@
     },
     async getApiKeyMask() {
       return { ok: true, mask: await hasApiKeyMasked() };
+    },
+    providers() {
+      return {
+        ok: true,
+        current: currentProvider().id,
+        list: Object.values(AI_PROVIDERS).map((p) => ({
+          id: p.id,
+          label: p.label,
+          model: p.model,
+          keyHint: p.keyHint,
+        })),
+      };
+    },
+    setProvider(id) {
+      if (!AI_PROVIDERS[id]) {
+        return { ok: false, error: "未知服务商：" + id };
+      }
+      try {
+        localStorage.setItem(PROVIDER_STORE, id);
+      } catch {
+        /* ignore */
+      }
+      const p = currentProvider();
+      return { ok: true, provider: p.id, model: p.model };
     },
 
     async complete(payload) {
@@ -1047,7 +1118,7 @@
         return {
           ok: true,
           requestId,
-          model: data.model || AI_MODEL,
+          model: data.model || aiModel(),
           message: {
             role: "assistant",
             content: msg.content || "",
@@ -1069,10 +1140,10 @@
         }
         if (err?.code === "NO_KEY") return { requestId, ...noKeyError() };
         const classified = classifyRequestError(err, {
-          url: AI_ENDPOINT,
+          url: aiEndpoint(),
           status: err?.status,
         });
-        logRequestFailure("complete", err, { url: AI_ENDPOINT, status: err?.status });
+        logRequestFailure("complete", err, { url: aiEndpoint(), status: err?.status });
         return {
           ok: false,
           requestId,
@@ -1181,10 +1252,10 @@
             return;
           }
           const classified = classifyRequestError(err, {
-            url: AI_ENDPOINT,
+            url: aiEndpoint(),
             status: err?.status,
           });
-          logRequestFailure("chat stream", err, { url: AI_ENDPOINT, status: err?.status });
+          logRequestFailure("chat stream", err, { url: aiEndpoint(), status: err?.status });
           emitError(requestId, classified.message);
         } finally {
           link?.dispose?.();
@@ -1192,7 +1263,7 @@
         }
       })();
 
-      return { ok: true, requestId, model: AI_MODEL };
+      return { ok: true, requestId, model: aiModel() };
     },
 
     async abort(requestId) {

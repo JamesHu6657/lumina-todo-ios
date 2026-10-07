@@ -1103,6 +1103,36 @@ async function main() {
     ok("API Key 预热失败后可重试");
   }
 
+  /* ---- AI 服务商切换：端点 / 模型 / key 存储位 ---- */
+  {
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-key", "sk-" + "a".repeat(24));
+    store.setItem("lumina-api-key-commandcode", "cmd-" + "c".repeat(24));
+    const sandbox = baseSandbox(store);
+    vm.createContext(sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "agent-tools.js"), "utf8"), sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "js/mobile-bridge.js"), "utf8"), sandbox);
+    await new Promise((r) => setTimeout(r, 30));
+    const pv = await sandbox.luminaAI.providers();
+    assert.equal(pv.ok, true);
+    assert.ok(pv.list.find((x) => x.id === "commandcode"), "应有 Command Code");
+    // 默认 OpenCode
+    let st = await sandbox.luminaAI.status({ refresh: true });
+    assert.equal(st.model, "deepseek-v4-flash");
+    assert.ok(st.base.includes("opencode.ai"));
+    // 切到 Command Code：模型带厂商前缀，端点走 api.commandcode.ai，key 各自独立
+    const sw = await sandbox.luminaAI.setProvider("commandcode");
+    assert.equal(sw.ok, true);
+    st = await sandbox.luminaAI.status({ refresh: true });
+    assert.equal(st.model, "deepseek/deepseek-v4.1-flash");
+    assert.ok(st.base.includes("api.commandcode.ai"));
+    assert.equal(st.ok, true, "Command Code 应读到自己存储位的 key");
+    // 非法 id 报错，当前服务商不变
+    const bad = await sandbox.luminaAI.setProvider("nope");
+    assert.equal(bad.ok, false);
+    ok("AI 服务商可切换 Command Code（独立 key 存储）");
+  }
+
   /* ---- app.js 触控排序文案与 O(n) 历史分组 ---- */
   {
     const appSrc = fs.readFileSync(path.join(WWW, "app.js"), "utf8");
