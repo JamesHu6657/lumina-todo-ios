@@ -270,6 +270,8 @@ html.is-ios-app .toast.show{
   background: transparent; color: var(--ink-2); border-color: var(--line);
 }
 body.settings-open .app{ pointer-events: none; }
+/* 设置面板里操作的反馈要浮在面板之上 */
+body.settings-open .toast{ z-index: 95; }
 
 /* ==========================================================================
    ≤900px：手机竖栏布局强化（与 styles.css 响应式配合）

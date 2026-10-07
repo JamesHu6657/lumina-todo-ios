@@ -25,6 +25,49 @@
     }
   }
 
+  const STORAGE_KEY = "lumina-todo-v2";
+
+  /**
+   * WKWebView 不处理 <a download> 的 blob 下载（点了没反应却提示「已导出」），
+   * 所以 App 内改走系统分享面板（可存到「文件」/AirDrop），不支持时退回剪贴板。
+   * 返回 "fallback" 表示非 App 环境，交给网页版原有导出。
+   */
+  async function exportViaShare() {
+    const inApp = !!window.Capacitor?.isNativePlatform?.();
+    if (!inApp) return "fallback";
+    let todos = [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+      if (saved && Array.isArray(saved.todos)) todos = saved.todos;
+      else if (Array.isArray(saved)) todos = saved;
+    } catch {
+      toast("读取本地数据失败");
+      return "error";
+    }
+    const day = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const name = `todo-${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}.json`;
+    const json = JSON.stringify({ v: 4, exportedAt: day.toISOString(), todos }, null, 2);
+    try {
+      const file = new File([json], name, { type: "application/json" });
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: name });
+        toast(`已导出 ${todos.length} 条`);
+        return "ok";
+      }
+    } catch (err) {
+      if (err?.name === "AbortError") return "cancelled";
+    }
+    try {
+      await navigator.clipboard.writeText(json);
+      toast(`已复制 ${todos.length} 条备份到剪贴板`);
+      return "ok";
+    } catch {
+      toast("导出失败：当前系统不支持分享或剪贴板");
+      return "error";
+    }
+  }
+
   function build() {
     if (document.getElementById("settingsSheet")) return;
 
@@ -163,6 +206,7 @@
       if (r?.ok) {
         document.getElementById("setApiKey").value = "";
         toast("已清除 AI Key");
+        document.getElementById("chatRecheck")?.click();
       } else {
         toast(r?.error || "清除失败，密钥可能仍在设备上");
       }
@@ -215,15 +259,28 @@
     });
 
     // 数据：转发到主界面已有按钮（顶栏 foot 在手机上已隐藏以省空间）
-    document.getElementById("setExport")?.addEventListener("click", () => {
-      document.getElementById("exportBtn")?.click();
+    document.getElementById("setExport")?.addEventListener("click", async () => {
+      const r = await exportViaShare();
+      if (r === "fallback") document.getElementById("exportBtn")?.click();
     });
     document.getElementById("setImport")?.addEventListener("click", () => {
       document.getElementById("importBtn")?.click();
     });
     document.getElementById("setClearDone")?.addEventListener("click", () => {
+      close();
       document.getElementById("clearCompleted")?.click();
     });
+
+    // 键盘「完成」键直接保存
+    const saveOnEnter = (inputId, btnId) => {
+      document.getElementById(inputId)?.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.isComposing) return;
+        e.preventDefault();
+        document.getElementById(btnId)?.click();
+      });
+    };
+    saveOnEnter("setApiKey", "setApiSave");
+    saveOnEnter("setCuToken", "setCuSave");
 
     // 工具栏按钮
     const toolbar = document.querySelector(".toolbar .tb-actions") || document.querySelector(".toolbar");

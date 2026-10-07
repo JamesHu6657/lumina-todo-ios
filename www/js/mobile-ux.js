@@ -267,10 +267,15 @@
       { passive: false }
     );
 
-    /* DOM 已被拖动改过序：数据没跟着改时要按数据重绘，否则界面和存储顺序不一致 */
-    const restoreDom = () => {
-      const api = window.__luminaTouchReorderApi;
-      if (api && typeof api.render === "function") api.render();
+    /* DOM 已被拖动改过序：数据没跟着改时要按原顺序摆回，否则界面和存储顺序不一致 */
+    const restoreDom = (origin) => {
+      const rows = new Map(
+        [...list.querySelectorAll(".row")].map((r) => [r.dataset.id || r.getAttribute("data-id"), r])
+      );
+      for (const id of origin) {
+        const r = rows.get(id);
+        if (r) list.appendChild(r);
+      }
     };
 
     const end = (cancelled) => {
@@ -287,7 +292,7 @@
       const changed = ids.join("\n") !== origin.join("\n");
       if (!changed) return;
       if (cancelled) {
-        restoreDom();
+        restoreDom(origin);
         return;
       }
       let ok = false;
@@ -299,7 +304,7 @@
         console.warn("[touch-sort]", err);
       }
       if (ok) haptic("medium");
-      else restoreDom();
+      else restoreDom(origin);
     };
     list.addEventListener("touchend", () => end(false));
     list.addEventListener("touchcancel", () => end(true));
