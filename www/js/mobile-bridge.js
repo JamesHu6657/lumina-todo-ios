@@ -1424,6 +1424,32 @@
   };
 
   /* ClickUp */
+  let pomoToastTimer = null;
+  function notifyPomoResult(result) {
+    const message =
+      result?.code === "INDETERMINATE"
+        ? "番茄已记录，但 ClickUp 上传结果未确认；稍后会自动核对，确认没写入会补发"
+        : result?.ok === false && result?.queued === true
+          ? "ClickUp 暂时连不上，番茄已加入待同步，联网后自动补传"
+          : "";
+    if (!message) return;
+    if (typeof globalThis.toast === "function") {
+      globalThis.toast(message);
+      return;
+    }
+    if (typeof document !== "undefined") {
+      const toastEl = document.getElementById("toast");
+      const toastMsg = document.getElementById("toastMsg");
+      if (toastEl && toastMsg) {
+        toastMsg.textContent = message;
+        toastEl.classList.add("show");
+        clearTimeout(pomoToastTimer);
+        pomoToastTimer = setTimeout(() => toastEl.classList.remove("show"), 2200);
+        return;
+      }
+    }
+    console.warn("[ClickUp]", message);
+  }
   window.luminaClickUp = {
     logPomo(payload) {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
@@ -1436,6 +1462,13 @@
         minutes: Number(src.minutes) || 0,
         endedAt,
         operationId: typeof src.operationId === "string" ? src.operationId : undefined,
+      }).then((r) => {
+        try {
+          notifyPomoResult(r);
+        } catch {
+          /* A notification must not affect the upload result. */
+        }
+        return r;
       });
     },
     pushTodo(payload) {

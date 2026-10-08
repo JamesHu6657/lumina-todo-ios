@@ -244,6 +244,43 @@ async function main() {
     ok("mobile-clickup token 读写 / 拒绝非法 minutes");
   }
 
+  /* ---- ClickUp 番茄上传状态提示不影响返回值 ---- */
+  {
+    const store = makeLocalStorage();
+    const expected = [
+      { ok: false, code: "INDETERMINATE" },
+      { ok: false, queued: true, code: "TIMEOUT" },
+      { ok: true },
+      { ok: false, code: "INDETERMINATE" },
+    ];
+    const replies = expected.slice();
+    const messages = [];
+    const sandbox = baseSandbox(store);
+    sandbox.LUMINA_MOBILE_CLICKUP = {
+      logPomodoro: () => Promise.resolve(replies.shift()),
+    };
+    sandbox.toast = (message) => messages.push(message);
+    vm.createContext(sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "js/secure-store.js"), "utf8"), sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "agent-tools.js"), "utf8"), sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "js/mobile-bridge.js"), "utf8"), sandbox);
+    const first = await sandbox.luminaClickUp.logPomo({ title: "focus", minutes: 25 });
+    assert.strictEqual(first, expected[0]);
+    const second = await sandbox.luminaClickUp.logPomo({ title: "focus", minutes: 25 });
+    assert.strictEqual(second, expected[1]);
+    const third = await sandbox.luminaClickUp.logPomo({ title: "focus", minutes: 25 });
+    assert.strictEqual(third, expected[2]);
+    assert.equal(messages.length, 2);
+    assert.match(messages[0], /上传结果未确认/);
+    assert.match(messages[1], /已加入待同步/);
+    sandbox.toast = () => {
+      throw new Error("toast unavailable");
+    };
+    const fourth = await sandbox.luminaClickUp.logPomo({ title: "focus", minutes: 25 });
+    assert.strictEqual(fourth, expected[3]);
+    ok("ClickUp 番茄不确定或排队时提示且 toast 故障不影响返回值");
+  }
+
   /* ---- operationId 标记 ---- */
   {
     const store = makeLocalStorage();
@@ -536,6 +573,9 @@ async function main() {
     const first = await api.flushQueue();
     assert.ok(Date.now() - started < 500, "body 超时必须及时释放 flush");
     assert.equal(first.left, 1);
+    const pendingPomos = JSON.parse(store.getItem("lumina-cu-pending-pomo-v1"));
+    pendingPomos[0].createdAt = Date.now() - 11 * 60 * 1000;
+    store.setItem("lumina-cu-pending-pomo-v1", JSON.stringify(pendingPomos));
     await api.flushQueue();
     assert.equal(postCount, 2, "释放后下一次 flush 必须能继续执行");
     ok("ClickUp body 超时释放 flush 单飞锁");
