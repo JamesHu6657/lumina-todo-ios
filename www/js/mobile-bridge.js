@@ -5,11 +5,45 @@
 (function () {
   "use strict";
 
-  const AI_BASE = "https://opencode.ai/zen/go/v1";
-  const AI_MODEL = "deepseek-v4-flash";
-  const AI_ENDPOINT = AI_BASE + "/chat/completions";
-  const API_KEY_STORE = "lumina-api-key";
+  /**
+   * 支持的 AI 服务商（都是 OpenAI Chat Completions 兼容端点）。
+   * 每个服务商有自己的模型、key 存储位与提示文案；切换不会清掉别家的 key。
+   */
+  const AI_PROVIDERS = {
+    opencode: {
+      id: "opencode",
+      label: "OpenCode Zen",
+      base: "https://opencode.ai/zen/go/v1",
+      model: "deepseek-v4-flash",
+      keyStore: "lumina-api-key",
+      keyHint: "sk-…",
+      keyPattern: /^sk-/,
+    },
+    commandcode: {
+      id: "commandcode",
+      label: "Command Code",
+      base: "https://api.commandcode.ai/provider/v1",
+      model: "deepseek/deepseek-v4.1-flash",
+      keyStore: "lumina-api-key-commandcode",
+      keyHint: "Studio 生成的 API Key",
+      keyPattern: null,
+    },
+  };
+  const DEFAULT_PROVIDER = "opencode";
+  const PROVIDER_STORE = "lumina-api-provider";
   const MIN_KEY = 20;
+
+  function currentProvider() {
+    let id = null;
+    try {
+      id = localStorage.getItem(PROVIDER_STORE);
+    } catch {
+      /* ignore */
+    }
+    return AI_PROVIDERS[id] || AI_PROVIDERS[DEFAULT_PROVIDER];
+  }
+  const aiEndpoint = () => currentProvider().base + "/chat/completions";
+  const aiModel = () => currentProvider().model;
 
   const LIMITS = {
     maxActiveRequests: 8,
@@ -46,7 +80,11 @@
 
   function redactSecrets(text) {
     if (typeof text !== "string" || !text) return text;
-    return text.replace(/sk-[A-Za-z0-9_-]{8,}/g, (m) => m.slice(0, 6) + "***");
+    let out = text.replace(/sk-[A-Za-z0-9_-]{8,}/g, (m) => m.slice(0, 6) + "***");
+    // 无固定前缀的 key（如 Command Code）：按已知 key 原文脱敏
+    const known = keyCache && keyCache.value;
+    if (known && known.length >= 8) out = out.split(known).join(known.slice(0, 4) + "***");
+    return out.replace(/(Bearer\s+)[^\s"']{8,}/gi, "$1***");
   }
 
   function normalizeRequestId(value) {
@@ -147,7 +185,7 @@
         message: err?.message,
         code: err?.code,
         status: err?.status ?? meta.status,
-        url: meta.url || AI_ENDPOINT,
+        url: meta.url || aiEndpoint(),
         stack: err?.stack,
         raw: err,
       });
@@ -162,8 +200,17 @@
   }
 
   /* ----------------------------- key store（Keychain / localStorage） ----------------------------- */
-  let keyCache = { value: null, at: 0 };
+  let keyCache = { provider: null, value: null, at: 0 };
+  function cacheFor(provider = currentProvider()) {
+    return keyCache.provider === provider.id ? keyCache : null;
+  }
+  /** providerId 显式传入：异步读 key 期间用户可能已切换服务商，别把旧家的 key 记到新家名下 */
+  function storeCache(key, providerId = currentProvider().id) {
+    if (providerId !== currentProvider().id) return;
+    keyCache = { provider: providerId, value: key, at: Date.now() };
+  }
   let keyWarm = null;
+  let keyWarmProvider = null;
 
   function secure() {
     return globalThis.LUMINA_SECURE_STORE || null;
@@ -172,37 +219,42 @@
     return secure()?.backend?.() === "keychain";
   }
 
-  function parseApiKey(raw) {
+  function parseApiKey(raw, provider = currentProvider()) {
     const line = String(raw || "").trim();
     if (!line) return null;
-    const m = line.match(/(?:api[_-]?key\s*[=:]\s*)?(sk-[A-Za-z0-9_-]+)/i);
-    const key = m ? m[1] : line;
-    if (key.startsWith("sk-") && key.length >= MIN_KEY) return key;
-    return null;
+    const m = line.match(/^(?:api[_-]?key\s*[=:]\s*)?(\S+)$/i);
+    const key = m ? m[1] : null;
+    if (!key || key.length < MIN_KEY) return null;
+    // ClickUp 个人 token 误贴到 AI 栏
+    if (/^pk_/.test(key)) return null;
+    if (provider.keyPattern && !provider.keyPattern.test(key)) return null;
+    return key;
   }
 
-  function loadKeyFromLocalStorage() {
+  function loadKeyFromLocalStorage(provider = currentProvider()) {
     try {
-      return parseApiKey(localStorage.getItem(API_KEY_STORE) || "");
+      return parseApiKey(localStorage.getItem(provider.keyStore) || "", provider);
     } catch {
       return null;
     }
   }
 
-  async function warmApiKey() {
-    if (keyWarm) return keyWarm;
+  async function warmApiKey(provider = currentProvider()) {
+    // 按服务商预热：切换后要给新服务商的 key 做一次 Keychain 迁移
+    if (keyWarm && keyWarmProvider === provider.id) return keyWarm;
     const p = (async () => {
       const s = secure();
       if (s?.migrateKey) {
-        const v = parseApiKey(await s.migrateKey(API_KEY_STORE));
-        keyCache = { value: v, at: Date.now() };
+        const v = parseApiKey(await s.migrateKey(provider.keyStore), provider);
+        storeCache(v, provider.id);
         return v;
       }
-      const v = loadKeyFromLocalStorage();
-      keyCache = { value: v, at: Date.now() };
+      const v = loadKeyFromLocalStorage(provider);
+      storeCache(v, provider.id);
       return v;
     })();
     keyWarm = p;
+    keyWarmProvider = provider.id;
     try {
       return await p;
     } catch (err) {
@@ -215,67 +267,70 @@
   // 启动预热
   warmApiKey().catch(() => {});
 
-  async function resolveApiKey({ refresh = false } = {}) {
+  async function resolveApiKey({ refresh = false, provider = currentProvider() } = {}) {
     const now = Date.now();
-    if (!refresh && keyCache.at && now - keyCache.at < LIMITS.apiKeyCacheMs) {
-      return keyCache.value;
+    let c = cacheFor(provider);
+    if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
+      return c.value;
     }
-    await warmApiKey();
-    if (!refresh && keyCache.at && now - keyCache.at < LIMITS.apiKeyCacheMs) {
-      return keyCache.value;
+    await warmApiKey(provider);
+    c = cacheFor(provider);
+    if (!refresh && c && now - c.at < LIMITS.apiKeyCacheMs) {
+      return c.value;
     }
     const s = secure();
     if (s?.get) {
       try {
-        const v = parseApiKey(await s.get(API_KEY_STORE));
-        keyCache = { value: v, at: Date.now() };
+        const v = parseApiKey(await s.get(provider.keyStore), provider);
+        storeCache(v, provider.id);
         return v;
       } catch (err) {
         if (usesKeychain()) throw err;
       }
     }
     if (usesKeychain()) return null;
-    const v = loadKeyFromLocalStorage();
-    keyCache = { value: v, at: Date.now() };
+    const v = loadKeyFromLocalStorage(provider);
+    storeCache(v, provider.id);
     return v;
   }
 
   async function setApiKey(raw) {
+    const provider = currentProvider();
     const line = String(raw || "").trim();
     if (!line) {
       const s = secure();
       if (s?.remove) {
         try {
-          const removed = await s.remove(API_KEY_STORE);
+          const removed = await s.remove(provider.keyStore);
           if (!removed && usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         } catch {
           if (usesKeychain()) return { ok: false, error: "Keychain 清除失败，请稍后重试" };
         }
       }
       if (usesKeychain()) {
-        keyCache = { value: null, at: 0 };
+        storeCache(null, provider.id);
         return { ok: true, backend: "keychain" };
       }
       try {
-        localStorage.removeItem(API_KEY_STORE);
+        localStorage.removeItem(provider.keyStore);
       } catch {
         /* ignore */
       }
-      keyCache = { value: null, at: 0 };
+      storeCache(null, provider.id);
       return { ok: true };
     }
-    const key = parseApiKey(line);
+    const key = parseApiKey(line, provider);
     if (!key) {
       return {
         ok: false,
-        error: `API Key 格式无效：需要 sk-… 且至少 ${MIN_KEY} 字符`,
+        error: `API Key 格式无效：需要 ${provider.keyHint} 且至少 ${MIN_KEY} 字符`,
       };
     }
     const s = secure();
     let ok = false;
     if (s?.set) {
       try {
-        ok = await s.set(API_KEY_STORE, key);
+        ok = await s.set(provider.keyStore, key);
       } catch {
         ok = false;
       }
@@ -285,14 +340,14 @@
     }
     if (!ok) {
       try {
-        localStorage.setItem(API_KEY_STORE, key);
+        localStorage.setItem(provider.keyStore, key);
         ok = true;
       } catch {
         ok = false;
       }
     }
     if (!ok) return { ok: false, error: "无法保存 Key（存储不可用）" };
-    keyCache = { value: key, at: Date.now() };
+    storeCache(key, provider.id);
     return { ok: true, backend: s?.backend?.() || "localStorage" };
   }
 
@@ -534,10 +589,12 @@
   }
 
   async function callChatApi({ messages, tools, tool_choice, stream, temperature, max_tokens, signal, timeoutMs }) {
-    const key = await resolveApiKey();
+    const provider = currentProvider();
+    const endpoint = provider.base + "/chat/completions";
+    const key = await resolveApiKey({ provider });
     if (!key) {
       const err = new Error(
-        "未找到 API Key。请在设置中粘贴 sk-… 密钥（OpenCode / DeepSeek）。"
+        `未找到 API Key。请在设置中为 ${provider.label} 粘贴 ${provider.keyHint} 密钥。`
       );
       err.code = "NO_KEY";
       throw err;
@@ -549,7 +606,7 @@
       throw err;
     }
     const body = {
-      model: AI_MODEL,
+      model: provider.model,
       messages: clipped,
       stream: Boolean(stream),
       temperature: clampNumber(temperature, 0, 2, 0.4),
@@ -594,7 +651,7 @@
 
     let res;
     try {
-      res = await fetch(AI_ENDPOINT, {
+      res = await fetch(endpoint, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -603,8 +660,8 @@
     } catch (err) {
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
-      const classified = classifyRequestError(err, { url: AI_ENDPOINT });
-      logRequestFailure("fetch failed", err, { url: AI_ENDPOINT });
+      const classified = classifyRequestError(err, { url: endpoint });
+      logRequestFailure("fetch failed", err, { url: endpoint });
       const e = new Error(classified.message);
       e.code = classified.code;
       e.cause = err;
@@ -625,15 +682,15 @@
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onParent);
       if (res.status === 401 || res.status === 403) {
-        keyCache = { value: null, at: 0 };
+        storeCache(null, provider.id);
       }
       const classified = classifyRequestError(null, {
-        url: AI_ENDPOINT,
+        url: endpoint,
         status: res.status,
         bodySnippet: redactSecrets(detail),
       });
       logRequestFailure("HTTP error", { name: "HttpError", message: classified.message, status: res.status }, {
-        url: AI_ENDPOINT,
+        url: endpoint,
         status: res.status,
       });
       const err = new Error(classified.message);
@@ -943,16 +1000,17 @@
   function noKeyError() {
     return {
       ok: false,
-      error: "未找到 API Key。请点右上角 ⚙ 设置，粘贴 sk-… 密钥。",
+      error: `未找到 API Key。请在设置中为 ${currentProvider().label} 粘贴 ${currentProvider().keyHint} 密钥。`,
       code: "NO_KEY",
     };
   }
 
   async function aiStatus(opts) {
+    const provider = currentProvider();
     let key;
     let storageError = null;
     try {
-      key = await resolveApiKey({ refresh: Boolean(opts && opts.refresh) });
+      key = await resolveApiKey({ refresh: Boolean(opts && opts.refresh), provider });
     } catch (err) {
       storageError = err;
     }
@@ -960,8 +1018,9 @@
     if (!key) {
       return {
         ok: false,
-        model: AI_MODEL,
-        base: AI_BASE,
+        provider: provider.id,
+        model: provider.model,
+        base: provider.base,
         agent: true,
         tools,
         source: null,
@@ -974,8 +1033,9 @@
     }
     return {
       ok: true,
-      model: AI_MODEL,
-      base: AI_BASE,
+      provider: provider.id,
+      model: provider.model,
+      base: provider.base,
       agent: true,
       tools,
       source: "settings",
@@ -1003,6 +1063,34 @@
     },
     async getApiKeyMask() {
       return { ok: true, mask: await hasApiKeyMasked() };
+    },
+    providers() {
+      return {
+        ok: true,
+        current: currentProvider().id,
+        list: Object.values(AI_PROVIDERS).map((p) => ({
+          id: p.id,
+          label: p.label,
+          model: p.model,
+          keyHint: p.keyHint,
+        })),
+      };
+    },
+    setProvider(id) {
+      if (!AI_PROVIDERS[id]) {
+        return { ok: false, error: "未知服务商：" + id };
+      }
+      try {
+        localStorage.setItem(PROVIDER_STORE, id);
+      } catch {
+        /* ignore */
+      }
+      if (currentProvider().id !== id) {
+        return { ok: false, error: "无法保存服务商选择（存储不可用）" };
+      }
+      const p = currentProvider();
+      warmApiKey(p).catch(() => {});
+      return { ok: true, provider: p.id, model: p.model };
     },
 
     async complete(payload) {
@@ -1047,7 +1135,7 @@
         return {
           ok: true,
           requestId,
-          model: data.model || AI_MODEL,
+          model: data.model || aiModel(),
           message: {
             role: "assistant",
             content: msg.content || "",
@@ -1069,10 +1157,10 @@
         }
         if (err?.code === "NO_KEY") return { requestId, ...noKeyError() };
         const classified = classifyRequestError(err, {
-          url: AI_ENDPOINT,
+          url: aiEndpoint(),
           status: err?.status,
         });
-        logRequestFailure("complete", err, { url: AI_ENDPOINT, status: err?.status });
+        logRequestFailure("complete", err, { url: aiEndpoint(), status: err?.status });
         return {
           ok: false,
           requestId,
@@ -1181,10 +1269,10 @@
             return;
           }
           const classified = classifyRequestError(err, {
-            url: AI_ENDPOINT,
+            url: aiEndpoint(),
             status: err?.status,
           });
-          logRequestFailure("chat stream", err, { url: AI_ENDPOINT, status: err?.status });
+          logRequestFailure("chat stream", err, { url: aiEndpoint(), status: err?.status });
           emitError(requestId, classified.message);
         } finally {
           link?.dispose?.();
@@ -1192,7 +1280,7 @@
         }
       })();
 
-      return { ok: true, requestId, model: AI_MODEL };
+      return { ok: true, requestId, model: aiModel() };
     },
 
     async abort(requestId) {

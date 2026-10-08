@@ -13,11 +13,12 @@
   - script-src 仅 'self'；主题首帧 theme-boot.js
   - connect-src：'self' + capacitor/ionic origin + https: 与显式 API 域
     * https://opencode.ai — OpenCode Zen/Go chat completions
+    * https://api.commandcode.ai — Command Code chat completions
     * https://api.clickup.com — ClickUp API v2
     * capacitor://localhost / ionic://localhost — WKWebView 页面 origin 自连
     * https: — 覆盖上述及将来 https 子资源（仍禁止 http:）
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' https: capacitor://localhost ionic://localhost https://opencode.ai https://api.clickup.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' https: capacitor://localhost ionic://localhost https://opencode.ai https://api.commandcode.ai https://api.clickup.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none';">
 <title>リスト · 我的小清单</title>
 <link rel="apple-touch-icon" href="./assets/icon.png">
 

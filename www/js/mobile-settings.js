@@ -88,8 +88,11 @@
       <div class="settings-body">
         <section class="settings-sec">
           <h3>AI 搭档</h3>
-          <p class="settings-hint">OpenCode Go · DeepSeek V4 Flash。密钥只保存在本机，不会上传到其它服务器。</p>
-          <label class="settings-label" for="setApiKey">API Key（sk-…）</label>
+          <p class="settings-hint">密钥只保存在本机，不会上传到其它服务器。</p>
+          <label class="settings-label" for="setProvider">服务商</label>
+          <select class="settings-input" id="setProvider"></select>
+          <p class="settings-hint" id="setProviderHint"></p>
+          <label class="settings-label" for="setApiKey" id="setApiKeyLabel">API Key</label>
           <input class="settings-input" id="setApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" enterkeyhint="done">
           <p class="settings-mask" id="setApiMask"></p>
           <div class="settings-row">
@@ -147,6 +150,20 @@
     async function refreshMasks() {
       const maskEl = document.getElementById("setApiMask");
       const cuMask = document.getElementById("setCuMask");
+      const keyLabel = document.getElementById("setApiKeyLabel");
+      const keyInput = document.getElementById("setApiKey");
+      const hintEl = document.getElementById("setProviderHint");
+      try {
+        const pv = await window.luminaAI?.providers?.();
+        const cur = pv?.list?.find((x) => x.id === pv.current);
+        if (cur) {
+          if (keyLabel) keyLabel.textContent = `API Key（${cur.keyHint}）`;
+          if (keyInput) keyInput.placeholder = cur.keyHint;
+          if (hintEl) hintEl.textContent = `${cur.label} · ${cur.model}`;
+        }
+      } catch {
+        /* ignore */
+      }
       try {
         const r = await window.luminaAI?.getApiKeyMask?.();
         if (maskEl) maskEl.textContent = r?.mask ? `已保存：${r.mask}` : "尚未配置";
@@ -172,6 +189,46 @@
         if (cuMask) cuMask.textContent = err?.message || "无法读取 ClickUp 状态";
       }
     }
+
+    // 服务商下拉：填充并记住当前项
+    const providerSel = document.getElementById("setProvider");
+    let previousProvider = providerSel?.value || "";
+    (async () => {
+      try {
+        const pv = await window.luminaAI?.providers?.();
+        if (!pv?.ok || !providerSel) return;
+        providerSel.innerHTML = "";
+        for (const it of pv.list) {
+          const opt = document.createElement("option");
+          opt.value = it.id;
+          opt.textContent = `${it.label}（${it.model}）`;
+          providerSel.appendChild(opt);
+        }
+        providerSel.value = pv.current;
+        previousProvider = pv.current;
+      } catch {
+        /* ignore */
+      }
+    })();
+    providerSel?.addEventListener("change", async () => {
+      const id = providerSel.value;
+      try {
+        const r = await window.luminaAI?.setProvider?.(id);
+        if (r?.ok) {
+          previousProvider = id;
+          document.getElementById("setApiKey").value = "";
+          toast(`已切换为 ${providerSel.options[providerSel.selectedIndex]?.textContent || id}`);
+          refreshMasks();
+          document.getElementById("chatRecheck")?.click();
+        } else {
+          providerSel.value = previousProvider;
+          toast(r?.error || "切换失败");
+        }
+      } catch (err) {
+        providerSel.value = previousProvider;
+        toast(err?.message || "切换失败");
+      }
+    });
 
     document.getElementById("settingsClose").addEventListener("click", close);
     backdrop.addEventListener("click", close);
