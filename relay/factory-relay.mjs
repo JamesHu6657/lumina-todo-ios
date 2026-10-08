@@ -54,6 +54,12 @@ export function loadConfig(env = process.env) {
     maxConcurrency: positiveInteger(env.MAX_CONCURRENCY, 2, "MAX_CONCURRENCY"),
     timeoutMs: positiveInteger(env.TIMEOUT_MS, 90000, "TIMEOUT_MS"),
     maxBodyBytes: positiveInteger(env.MAX_BODY_BYTES, 1024 * 1024, "MAX_BODY_BYTES"),
+    maxRequestsPerMinute: positiveInteger(
+      env.MAX_REQUESTS_PER_MINUTE,
+      30,
+      "MAX_REQUESTS_PER_MINUTE",
+      true
+    ),
   };
 }
 
@@ -398,7 +404,8 @@ async function runDroid(config, sandboxDir, prompt, model, req, res) {
     let timedOut = false;
     let disconnected = false;
     let overflow = false;
-    let stdout = "";
+    const stdoutChunks = [];
+    let stdoutBytes = 0;
     let timeout = null;
     let settled = false;
     const listeners = [];
@@ -436,14 +443,16 @@ async function runDroid(config, sandboxDir, prompt, model, req, res) {
         finish(err);
         return;
       }
+      // 按字节累计、结束后一次性解码：逐块 toString 会把跨块的多字节汉字解成乱码
       child.stdout.on("data", (chunk) => {
         if (overflow) return;
-        if (stdout.length + chunk.length > MAX_DROID_OUTPUT) {
+        if (stdoutBytes + chunk.length > MAX_DROID_OUTPUT) {
           overflow = true;
           kill();
           return;
         }
-        stdout += chunk.toString("utf8");
+        stdoutBytes += chunk.length;
+        stdoutChunks.push(chunk);
       });
       child.once("error", (err) => finish(err));
       child.once("close", (code, signal) => finish(null, { code, signal }));
@@ -452,6 +461,7 @@ async function runDroid(config, sandboxDir, prompt, model, req, res) {
         kill();
       }, config.timeoutMs);
     });
+    const stdout = Buffer.concat(stdoutChunks).toString("utf8");
     return { ...result, timedOut, disconnected, overflow, stdout };
   } finally {
     await fs.rm(promptDir, { recursive: true, force: true });
@@ -460,7 +470,19 @@ async function runDroid(config, sandboxDir, prompt, model, req, res) {
 
 export function createRelayServer(config = loadConfig()) {
   const sandboxDir = fs.mkdtemp(path.join(os.tmpdir(), "factory-relay-sandbox-"));
+  // 创建失败时由请求里的 await 报 502；这里只防止启动期未处理的 rejection 直接拖垮进程
+  sandboxDir.catch(() => {});
   let active = 0;
+  let recentStarts = [];
+
+  function rateLimited() {
+    if (!config.maxRequestsPerMinute) return false;
+    const now = Date.now();
+    recentStarts = recentStarts.filter((at) => now - at < 60_000);
+    if (recentStarts.length >= config.maxRequestsPerMinute) return true;
+    recentStarts.push(now);
+    return false;
+  }
 
   const server = http.createServer((req, res) => {
     setCors(res);
@@ -470,15 +492,16 @@ export function createRelayServer(config = loadConfig()) {
       return;
     }
     void (async () => {
-      const url = new URL(req.url || "/", "http://localhost");
-      if (req.method === "GET" && url.pathname === "/healthz") {
+      // 不用 new URL()：未鉴权的 "//a:99999/" 这类路径会让它抛错，进而让整个进程退出
+      const pathname = String(req.url || "/").split("?")[0];
+      if (req.method === "GET" && pathname === "/healthz") {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("ok");
         return;
       }
       if (
         req.method === "GET" &&
-        url.pathname === "/v1/models"
+        pathname === "/v1/models"
       ) {
         if (!authorized(req, config.relayToken)) {
           sendError(res, 401, "Invalid bearer token");
@@ -490,7 +513,7 @@ export function createRelayServer(config = loadConfig()) {
         });
         return;
       }
-      if (req.method !== "POST" || url.pathname !== "/v1/chat/completions") {
+      if (req.method !== "POST" || pathname !== "/v1/chat/completions") {
         sendError(res, 404, "Not found");
         return;
       }
@@ -500,6 +523,10 @@ export function createRelayServer(config = loadConfig()) {
       }
       if (active >= config.maxConcurrency) {
         sendError(res, 429, "Too many concurrent requests");
+        return;
+      }
+      if (rateLimited()) {
+        sendError(res, 429, "Too many requests per minute");
         return;
       }
       active++;
@@ -548,10 +575,17 @@ export function createRelayServer(config = loadConfig()) {
       } finally {
         active--;
       }
-    })();
+    })().catch(() => {
+      // 兜底：任何漏网异常只影响本次请求，不能变成未处理 rejection 让服务退出
+      if (!res.headersSent && !res.destroyed) sendError(res, 500, "Internal relay error");
+      else if (!res.writableEnded) res.destroy();
+    });
   });
   server.on("close", () => {
-    void fs.rm(sandboxDir, { recursive: true, force: true });
+    // sandboxDir 是 Promise，直接传给 fs.rm 会抛 TypeError，关停时进程以 1 退出且目录残留
+    void sandboxDir
+      .then((dir) => fs.rm(dir, { recursive: true, force: true }))
+      .catch(() => {});
   });
   return server;
 }

@@ -4,12 +4,28 @@ import fs from "node:fs";
 const args = process.argv.slice(2);
 const promptPath = args[args.indexOf("-f") + 1];
 const prompt = fs.readFileSync(promptPath, "utf8");
-const marker = prompt.match(/STUB:([A-Z-]+)/)?.[1] || "PLAIN";
+const marker = prompt.match(/STUB:([A-Z0-9-]+)/)?.[1] || "PLAIN";
 
 if (marker === "TIMEOUT") {
   setTimeout(() => {}, 60000);
 } else if (marker === "INVALID") {
   process.stdout.write("not-json\n");
+} else if (marker === "UTF8-SPLIT") {
+  // 故意把一个三字节汉字拆在两次写入之间，模拟管道分块边界落在字符中间
+  const line = Buffer.from(
+    `${JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "汉字跨块",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    })}\n`,
+    "utf8"
+  );
+  const cut = line.indexOf(Buffer.from("字", "utf8")) + 1;
+  process.stdout.write(line.subarray(0, cut));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  process.stdout.write(line.subarray(cut));
 } else {
   if (marker === "SLOW") await new Promise((resolve) => setTimeout(resolve, 400));
   const results = {
