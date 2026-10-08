@@ -7,6 +7,8 @@ import { loadConfig, renderPrompt } from "./factory-relay.mjs";
 
 const relayFile = fileURLToPath(new URL("./factory-relay.mjs", import.meta.url));
 const fixtureFile = fileURLToPath(new URL("./test-fixtures/stub-droid.mjs", import.meta.url));
+// 经 GitHub API 推送的文件会丢掉可执行位；中转是直接 spawn(DROID_BIN) 的，桩脚本必须可执行
+await fs.chmod(fixtureFile, 0o755);
 const token = "relay-test-token-that-is-long-enough";
 const testTools = [{
   type: "function",

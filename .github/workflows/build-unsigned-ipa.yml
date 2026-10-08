@@ -8,8 +8,38 @@ on:
     tags:
       - "v*"
 
+# 只需读代码与上传 artifact；不给 GITHUB_TOKEN 多余的写权限
+permissions:
+  contents: read
+
 jobs:
+  # 自包含、不依赖桌面版仓库的回归测试；不过就不浪费 45 分钟 macOS 构建
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Web bundle safety
+        run: |
+          set -euo pipefail
+          node scripts/test-assert-web-safe.js
+          node scripts/assert-web-safe.js
+
+      - name: iOS bridge (Factory) tests
+        run: node scripts/run-factory-bridge-tests.js
+
+      - name: Relay tests
+        run: node relay/test-relay.mjs
+
   build-unsigned-ipa:
+    needs: test
     runs-on: macos-15
     timeout-minutes: 45
 
