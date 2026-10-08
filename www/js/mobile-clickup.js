@@ -47,6 +47,8 @@
     maxMinutes: 180,
     maxResponseChars: 512 * 1024,
     endedAtSkewMs: 60 * 1000,
+    // 超时后服务端可能稍晚才落库；确认「没有」至少要隔这么久才转入补发队列
+    pendingRequeueGraceMs: 10 * 60 * 1000,
   };
 
   let tokenCache = { value: null, at: 0 };
@@ -586,6 +588,23 @@
   function hasPendingPomo(operationId) {
     return readPendingPomos().some((item) => item.operationId === operationId);
   }
+  /**
+   * 查询已确认远端没有这条记录：按原 operationId 转入补发队列。
+   * 先写队列再清 pending；队列里已有同 operationId 就只清 pending，不重复入队。
+   * 补发时 logPomodoro 会再预查一次，预查失败不会 POST。
+   */
+  function requeuePendingPomo(pending) {
+    const already = readQueue().some((item) => item.operationId === pending.operationId);
+    if (!already && !enqueue({
+      title: typeof pending.title === "string" ? pending.title : "",
+      minutes: pending.minutes,
+      endedAt: pending.endedAt,
+      operationId: pending.operationId,
+    })) {
+      return false;
+    }
+    return clearPendingPomo(pending.operationId);
+  }
 
   function dayLabel(ts) {
     const d = new Date(ts);
@@ -742,7 +761,7 @@
       code: "INDETERMINATE",
       error:
         redactSecrets(String(cause?.message || cause)).slice(0, 200) +
-        "；写入结果尚未确认，已保留待核对记录且不会自动重发",
+        "；写入结果尚未确认，已保留待核对记录，确认未写入后才会补发",
       retryable: false,
       operationId,
       queued: false,
@@ -1142,11 +1161,16 @@
     return { flushed, left: q.length };
   }
 
-  /** Query only: uncertain time-entry posts are never blindly replayed. */
+  /**
+   * Uncertain time-entry posts are never blindly replayed: a record is only
+   * re-queued after a successful lookup proves it is absent, and only once the
+   * grace period has passed. A failed lookup leaves everything untouched.
+   */
   async function reconcilePendingPomos() {
     const token = await readToken();
-    if (!token) return { reconciled: 0, left: readPendingPomos().length };
+    if (!token) return { reconciled: 0, requeued: 0, left: readPendingPomos().length };
     let reconciled = 0;
+    let requeued = 0;
     for (const pending of readPendingPomos()) {
       try {
         const hit = await findTimeEntryByOpMarker(
@@ -1158,12 +1182,17 @@
         if (hit) {
           clearPendingPomo(pending.operationId);
           reconciled++;
+        } else if (
+          Date.now() - (Number(pending.createdAt) || Date.now()) >= LIMITS.pendingRequeueGraceMs &&
+          requeuePendingPomo(pending)
+        ) {
+          requeued++;
         }
       } catch {
         break;
       }
     }
-    return { reconciled, left: readPendingPomos().length };
+    return { reconciled, requeued, left: readPendingPomos().length };
   }
 
   function flushQueue() {
