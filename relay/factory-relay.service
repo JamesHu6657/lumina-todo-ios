@@ -1,0 +1,22 @@
+[Unit]
+Description=Factory droid OpenAI-compatible relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/factory-relay
+Environment=HOME=/var/lib/factory-relay
+EnvironmentFile=/etc/factory-relay.env
+ExecStart=/usr/bin/node /opt/factory-relay/factory-relay.mjs
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/factory-relay
+
+[Install]
+WantedBy=multi-user.target

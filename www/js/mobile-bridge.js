@@ -28,6 +28,15 @@
       keyHint: "Studio 生成的 API Key",
       keyPattern: null,
     },
+    factory: {
+      id: "factory",
+      label: "Factory（VPS 中转）",
+      model: "deepseek-v4.1-flash",
+      keyStore: "lumina-api-key-factory",
+      keyHint: "中转口令",
+      keyPattern: null,
+      baseStore: "lumina-factory-base",
+    },
   };
   const DEFAULT_PROVIDER = "opencode";
   const PROVIDER_STORE = "lumina-api-provider";
@@ -42,7 +51,39 @@
     }
     return AI_PROVIDERS[id] || AI_PROVIDERS[DEFAULT_PROVIDER];
   }
-  const aiEndpoint = () => currentProvider().base + "/chat/completions";
+  function normalizeProviderBase(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    if (!/^https:\/\//i.test(raw)) return null;
+    try {
+      const url = new URL(raw);
+      if (
+        url.protocol !== "https:" ||
+        !url.hostname ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash
+      ) {
+        return null;
+      }
+      let pathname = url.pathname.replace(/\/+$/, "");
+      if (!pathname.endsWith("/v1")) pathname += "/v1";
+      return `${url.origin}${pathname || "/v1"}`;
+    } catch {
+      return null;
+    }
+  }
+  function providerBase(provider) {
+    if (!provider.baseStore) return provider.base;
+    try {
+      return normalizeProviderBase(localStorage.getItem(provider.baseStore)) || "";
+    } catch {
+      return "";
+    }
+  }
+  const aiEndpoint = (provider = currentProvider(), base = providerBase(provider)) =>
+    base ? `${base}/chat/completions` : "";
   const aiModel = () => currentProvider().model;
 
   const LIMITS = {
@@ -351,6 +392,27 @@
     return { ok: true, backend: s?.backend?.() || "localStorage" };
   }
 
+  function setProviderBase(id, value) {
+    const provider = AI_PROVIDERS[id];
+    if (!provider?.baseStore) {
+      return { ok: false, error: "该服务商不支持中转地址" };
+    }
+    const raw = String(value ?? "").trim();
+    const base = raw ? normalizeProviderBase(raw) : "";
+    if (base === null) {
+      return { ok: false, error: "中转地址必须是有效的 HTTPS 地址" };
+    }
+    try {
+      localStorage.setItem(provider.baseStore, base);
+      if (providerBase(provider) !== base) {
+        return { ok: false, error: "无法保存中转地址（存储不可用）" };
+      }
+    } catch {
+      return { ok: false, error: "无法保存中转地址（存储不可用）" };
+    }
+    return { ok: true, base };
+  }
+
   async function hasApiKeyMasked() {
     const k = await resolveApiKey({ refresh: true });
     if (!k) return null;
@@ -588,9 +650,24 @@
     if (active.get(requestId) === entry) active.delete(requestId);
   }
 
-  async function callChatApi({ messages, tools, tool_choice, stream, temperature, max_tokens, signal, timeoutMs }) {
-    const provider = currentProvider();
-    const endpoint = provider.base + "/chat/completions";
+  async function callChatApi({
+    messages,
+    tools,
+    tool_choice,
+    stream,
+    temperature,
+    max_tokens,
+    signal,
+    timeoutMs,
+    provider = currentProvider(),
+    base = providerBase(provider),
+  }) {
+    const endpoint = aiEndpoint(provider, base);
+    if (!base) {
+      const err = new Error("未设置 Factory 中转地址，请在设置里填写 https:// 开头的地址。");
+      err.code = "NO_BASE";
+      throw err;
+    }
     const key = await resolveApiKey({ provider });
     if (!key) {
       const err = new Error(
@@ -997,16 +1074,40 @@
     safeCall(entry.handlers.onError, error || "未知错误");
   }
 
-  function noKeyError() {
+  function noKeyError(provider = currentProvider()) {
     return {
       ok: false,
-      error: `未找到 API Key。请在设置中为 ${currentProvider().label} 粘贴 ${currentProvider().keyHint} 密钥。`,
+      error: `未找到 API Key。请在设置中为 ${provider.label} 粘贴 ${provider.keyHint} 密钥。`,
       code: "NO_KEY",
+    };
+  }
+
+  function noBaseError() {
+    return {
+      ok: false,
+      error: "未设置 Factory 中转地址，请在设置里填写 https:// 开头的地址。",
+      code: "NO_BASE",
     };
   }
 
   async function aiStatus(opts) {
     const provider = currentProvider();
+    const base = providerBase(provider);
+    const tools = getTools().map((t) => t.function.name);
+    if (!base) {
+      return {
+        ...noBaseError(),
+        provider: provider.id,
+        model: provider.model,
+        base,
+        agent: true,
+        tools,
+        source: null,
+        budget: requestBudget.snapshot(),
+        platform: "ios",
+        secureBackend: secure()?.backend?.() || "localStorage",
+      };
+    }
     let key;
     let storageError = null;
     try {
@@ -1014,17 +1115,16 @@
     } catch (err) {
       storageError = err;
     }
-    const tools = getTools().map((t) => t.function.name);
     if (!key) {
       return {
         ok: false,
         provider: provider.id,
         model: provider.model,
-        base: provider.base,
+        base,
         agent: true,
         tools,
         source: null,
-        error: storageError?.message || noKeyError().error,
+        error: storageError?.message || noKeyError(provider).error,
         code: storageError?.code || "NO_KEY",
         budget: requestBudget.snapshot(),
         platform: "ios",
@@ -1035,7 +1135,7 @@
       ok: true,
       provider: provider.id,
       model: provider.model,
-      base: provider.base,
+      base,
       agent: true,
       tools,
       source: "settings",
@@ -1073,8 +1173,13 @@
           label: p.label,
           model: p.model,
           keyHint: p.keyHint,
+          baseStore: Boolean(p.baseStore),
+          base: providerBase(p),
         })),
       };
+    },
+    setProviderBase(id, url) {
+      return setProviderBase(id, url);
     },
     setProvider(id) {
       if (!AI_PROVIDERS[id]) {
@@ -1102,7 +1207,13 @@
       } catch (err) {
         return { ok: false, error: err?.message || "参数不合法" };
       }
-      if (!(await resolveApiKey())) return { requestId, ...noKeyError() };
+      const provider = currentProvider();
+      const base = providerBase(provider);
+      const endpoint = aiEndpoint(provider, base);
+      if (!base) return { requestId, ...noBaseError() };
+      if (!(await resolveApiKey({ provider }))) {
+        return { requestId, ...noKeyError(provider) };
+      }
 
       let entry;
       try {
@@ -1123,6 +1234,8 @@
           max_tokens: body.max_tokens ?? LIMITS.maxTokens.default,
           signal: entry.ac.signal,
           timeoutMs: LIMITS.completeTimeoutMs,
+          provider,
+          base,
         });
         link = call;
         const text = await call.res.text();
@@ -1135,7 +1248,7 @@
         return {
           ok: true,
           requestId,
-          model: data.model || aiModel(),
+          model: data.model || provider.model,
           message: {
             role: "assistant",
             content: msg.content || "",
@@ -1155,12 +1268,13 @@
             code: err?.name === "TimeoutError" ? "TIMEOUT" : "ABORTED",
           };
         }
-        if (err?.code === "NO_KEY") return { requestId, ...noKeyError() };
+        if (err?.code === "NO_KEY") return { requestId, ...noKeyError(provider) };
+        if (err?.code === "NO_BASE") return { requestId, ...noBaseError() };
         const classified = classifyRequestError(err, {
-          url: aiEndpoint(),
+          url: endpoint,
           status: err?.status,
         });
-        logRequestFailure("complete", err, { url: aiEndpoint(), status: err?.status });
+        logRequestFailure("complete", err, { url: endpoint, status: err?.status });
         return {
           ok: false,
           requestId,
@@ -1185,6 +1299,9 @@
         safeCall(handlers?.onError, message);
         return { ok: false, requestId: null, error: message };
       }
+      const provider = currentProvider();
+      const base = providerBase(provider);
+      const endpoint = aiEndpoint(provider, base);
 
       if (pending.has(requestId)) {
         const message = "requestId 正在使用中";
@@ -1196,8 +1313,13 @@
         safeCall(handlers?.onError, message);
         return { ok: false, requestId, error: message };
       }
-      if (!(await resolveApiKey())) {
-        const fail = noKeyError();
+      if (!base) {
+        const fail = noBaseError();
+        safeCall(handlers?.onError, fail.error);
+        return { ok: false, requestId, error: fail.error, code: fail.code };
+      }
+      if (!(await resolveApiKey({ provider }))) {
+        const fail = noKeyError(provider);
         safeCall(handlers?.onError, fail.error);
         return { ok: false, requestId, error: fail.error };
       }
@@ -1236,6 +1358,8 @@
             max_tokens: body.max_tokens,
             signal: entry.ac.signal,
             timeoutMs: LIMITS.connectTimeoutMs,
+            provider,
+            base,
           });
           link = call;
           const result = await consumeStream(
@@ -1269,10 +1393,10 @@
             return;
           }
           const classified = classifyRequestError(err, {
-            url: aiEndpoint(),
+            url: endpoint,
             status: err?.status,
           });
-          logRequestFailure("chat stream", err, { url: aiEndpoint(), status: err?.status });
+          logRequestFailure("chat stream", err, { url: endpoint, status: err?.status });
           emitError(requestId, classified.message);
         } finally {
           link?.dispose?.();
@@ -1280,7 +1404,7 @@
         }
       })();
 
-      return { ok: true, requestId, model: aiModel() };
+      return { ok: true, requestId, model: provider.model };
     },
 
     async abort(requestId) {

@@ -1116,6 +1116,7 @@ async function main() {
     const pv = await sandbox.luminaAI.providers();
     assert.equal(pv.ok, true);
     assert.ok(pv.list.find((x) => x.id === "commandcode"), "应有 Command Code");
+    assert.ok(pv.list.find((x) => x.id === "factory"), "应有 Factory 中转");
     // 默认 OpenCode
     let st = await sandbox.luminaAI.status({ refresh: true });
     assert.equal(st.model, "deepseek-v4-flash");
@@ -1168,6 +1169,114 @@ async function main() {
     assert.equal(request.headers.Authorization, `Bearer ${key}`);
     assert.equal(request.body.model, "deepseek/deepseek-v4.1-flash");
     ok("complete 使用 Command Code URL、key 与模型");
+  }
+
+  /* ---- Factory 中转地址配置、规范化与 complete 请求 ---- */
+  {
+    const key = "relay-token-" + "f".repeat(24);
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-provider", "factory");
+    store.setItem("lumina-api-key-factory", key);
+    let request;
+    const { ai } = loadBridge(store, async (url, options) => {
+      request = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+          });
+        },
+      };
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const first = ai.setProviderBase("factory", "  https://relay.example.com///  ");
+    assert.deepEqual(first, { ok: true, base: "https://relay.example.com/v1" });
+    assert.equal(
+      ai.setProviderBase("factory", "https://x.com").base,
+      "https://x.com/v1"
+    );
+    assert.equal(
+      ai.setProviderBase("factory", "https://x.com/v1/").base,
+      "https://x.com/v1"
+    );
+    assert.equal(ai.setProviderBase("factory", "http://x.com").ok, false);
+    assert.equal(ai.setProviderBase("commandcode", "https://x.com").ok, false);
+    const base = ai.setProviderBase("factory", "https://relay.example.com/v1");
+    assert.equal(base.ok, true);
+    const result = await ai.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(request.url, "https://relay.example.com/v1/chat/completions");
+    assert.equal(request.headers.Authorization, `Bearer ${key}`);
+    assert.equal(request.body.model, "deepseek-v4.1-flash");
+    ok("Factory 地址规范化并使用中转 URL、口令和模型");
+  }
+
+  /* ---- Factory 未配置中转地址时不发起网络请求 ---- */
+  {
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-provider", "factory");
+    let fetchCalls = 0;
+    const { ai } = loadBridge(store, async () => {
+      fetchCalls++;
+      throw new Error("unexpected fetch");
+    });
+    const status = await ai.status({ refresh: true });
+    assert.equal(status.code, "NO_BASE");
+    assert.match(status.error, /未设置 Factory 中转地址/);
+    const complete = await ai.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: false,
+    });
+    assert.equal(complete.code, "NO_BASE");
+    assert.match(complete.error, /https/);
+    const chat = await ai.chat({ messages: [{ role: "user", content: "hi" }] });
+    assert.equal(chat.code, "NO_BASE");
+    assert.equal(fetchCalls, 0);
+    ok("Factory 缺少中转地址时状态和请求均不发起 fetch");
+  }
+
+  /* ---- Factory 请求在服务商及地址切换期间固定配置 ---- */
+  {
+    const key = "relay-token-" + "g".repeat(24);
+    const store = makeLocalStorage();
+    store.setItem("lumina-api-provider", "factory");
+    store.setItem("lumina-api-key-factory", key);
+    store.setItem("lumina-factory-base", "https://old-relay.example.com/v1");
+    let request;
+    const { ai } = loadBridge(store, async (url, options) => {
+      request = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" } }],
+          });
+        },
+      };
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const pending = ai.complete({
+      messages: [{ role: "user", content: "hi" }],
+      tools: false,
+    });
+    await Promise.resolve();
+    assert.equal(ai.setProvider("opencode").ok, true);
+    assert.equal(
+      ai.setProviderBase("factory", "https://new-relay.example.com/v1").ok,
+      true
+    );
+    const result = await pending;
+    assert.equal(result.ok, true);
+    assert.equal(request.url, "https://old-relay.example.com/v1/chat/completions");
+    assert.equal(request.headers.Authorization, `Bearer ${key}`);
+    assert.equal(request.body.model, "deepseek-v4.1-flash");
+    ok("Factory 请求在服务商和中转地址切换期间固定配置");
   }
 
   /* ---- 请求期间切换服务商不会混用 endpoint / key / model ---- */
