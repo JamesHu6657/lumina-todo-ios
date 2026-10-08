@@ -13,6 +13,7 @@
     "cap:open": "npx cap open ios",
     "ios:prepare": "npm run build:www && npm run cap:sync",
     "test": "npm run build:www && node scripts/run-bridge-tests.js && node scripts/assert-web-safe.js",
+    "test:relay": "node relay/test-relay.mjs",
     "test:ios": "npm run ios:prepare && node scripts/assert-web-safe.js && node scripts/assert-web-safe.js ios/App/App/public && node scripts/verify-ios-public.js",
     "post-cap-sync": "node scripts/post-cap-sync.js",
     "serve": "node scripts/assert-web-safe.js && npx --yes serve www --listen tcp://127.0.0.1:5173 --no-clipboard"

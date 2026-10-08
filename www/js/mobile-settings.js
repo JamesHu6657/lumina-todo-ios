@@ -92,6 +92,13 @@
           <label class="settings-label" for="setProvider">服务商</label>
           <select class="settings-input" id="setProvider"></select>
           <p class="settings-hint" id="setProviderHint"></p>
+          <div id="setFactoryBaseRow" hidden>
+            <label class="settings-label" for="setFactoryBase">中转地址</label>
+            <input class="settings-input" id="setFactoryBase" type="text" autocomplete="url" spellcheck="false" placeholder="https://relay.你的域名" enterkeyhint="done">
+            <div class="settings-row">
+              <button type="button" class="settings-btn" id="setFactoryBaseSave">保存中转地址</button>
+            </div>
+          </div>
           <label class="settings-label" for="setApiKey" id="setApiKeyLabel">API Key</label>
           <input class="settings-input" id="setApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" enterkeyhint="done">
           <p class="settings-mask" id="setApiMask"></p>
@@ -153,6 +160,8 @@
       const keyLabel = document.getElementById("setApiKeyLabel");
       const keyInput = document.getElementById("setApiKey");
       const hintEl = document.getElementById("setProviderHint");
+      const baseRow = document.getElementById("setFactoryBaseRow");
+      const baseInput = document.getElementById("setFactoryBase");
       try {
         const pv = await window.luminaAI?.providers?.();
         const cur = pv?.list?.find((x) => x.id === pv.current);
@@ -160,6 +169,10 @@
           if (keyLabel) keyLabel.textContent = `API Key（${cur.keyHint}）`;
           if (keyInput) keyInput.placeholder = cur.keyHint;
           if (hintEl) hintEl.textContent = `${cur.label} · ${cur.model}`;
+          if (baseRow) baseRow.hidden = !cur.baseStore;
+          if (baseInput && cur.baseStore && document.activeElement !== baseInput) {
+            baseInput.value = cur.base || "";
+          }
         }
       } catch {
         /* ignore */
@@ -229,6 +242,38 @@
         toast(err?.message || "切换失败");
       }
     });
+
+    let baseSavePending = false;
+    async function saveFactoryBase() {
+      if (baseSavePending) return;
+      baseSavePending = true;
+      try {
+        const bridge = window.luminaAI;
+        if (!bridge?.providers || !bridge?.setProviderBase) {
+          toast("AI 模块未加载");
+          return;
+        }
+        const pv = await bridge.providers();
+        const cur = pv?.list?.find((x) => x.id === pv.current);
+        const baseInput = document.getElementById("setFactoryBase");
+        if (!cur?.baseStore || !baseInput || baseInput.value === cur.base) return;
+        const result = await bridge.setProviderBase(pv.current, baseInput.value);
+        if (result?.ok) {
+          baseInput.value = result.base || "";
+          toast(result.base ? "中转地址已保存" : "中转地址已清除");
+          refreshMasks();
+          document.getElementById("chatRecheck")?.click();
+        } else {
+          toast(result?.error || "保存中转地址失败");
+        }
+      } catch (err) {
+        toast(err?.message || "保存中转地址失败");
+      } finally {
+        baseSavePending = false;
+      }
+    }
+    document.getElementById("setFactoryBaseSave").addEventListener("click", saveFactoryBase);
+    document.getElementById("setFactoryBase").addEventListener("blur", saveFactoryBase);
 
     document.getElementById("settingsClose").addEventListener("click", close);
     backdrop.addEventListener("click", close);
@@ -337,6 +382,7 @@
       });
     };
     saveOnEnter("setApiKey", "setApiSave");
+    saveOnEnter("setFactoryBase", "setFactoryBaseSave");
     saveOnEnter("setCuToken", "setCuSave");
 
     // 工具栏按钮
