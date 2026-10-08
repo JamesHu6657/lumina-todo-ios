@@ -35,6 +35,9 @@ jobs:
       - name: iOS bridge (Factory) tests
         run: node scripts/run-factory-bridge-tests.js
 
+      - name: ClickUp pending pomodoro tests
+        run: node scripts/run-clickup-pending-tests.js
+
       - name: Relay tests
         run: node relay/test-relay.mjs
 
