@@ -12,7 +12,7 @@
     "cap:sync": "node scripts/assert-web-safe.js && npx cap sync ios && node scripts/post-cap-sync.js && node scripts/assert-web-safe.js ios/App/App/public && node scripts/verify-ios-public.js",
     "cap:open": "npx cap open ios",
     "ios:prepare": "npm run build:www && npm run cap:sync",
-    "test": "npm run build:www && node scripts/run-bridge-tests.js && node scripts/run-factory-bridge-tests.js && node scripts/assert-web-safe.js",
+    "test": "npm run build:www && node scripts/run-bridge-tests.js && node scripts/run-factory-bridge-tests.js && node scripts/test-assert-web-safe.js && node scripts/assert-web-safe.js",
     "test:relay": "node relay/test-relay.mjs",
     "test:ios": "npm run ios:prepare && node scripts/assert-web-safe.js && node scripts/assert-web-safe.js ios/App/App/public && node scripts/verify-ios-public.js",
     "post-cap-sync": "node scripts/post-cap-sync.js",

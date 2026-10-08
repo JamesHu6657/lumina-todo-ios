@@ -9,6 +9,12 @@ www/data/desktop-state.json
 .lumina-local/
 _export_desktop_state.json
 
+# 中转服务的环境变量（FACTORY_API_KEY / RELAY_TOKEN），公开仓库绝不能提交
+.env
+.env.*
+*.env
+!*.env.example
+
 # Xcode / CocoaPods
 ios/App/Pods/
 ios/App/build/
