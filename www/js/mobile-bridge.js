@@ -36,6 +36,9 @@
       keyHint: "中转口令",
       keyPattern: null,
       baseStore: "lumina-factory-base",
+      // 中转要等 droid exec 整轮跑完才回包（服务端默认最多 90s），CapacitorHttp 又会缓冲整个响应，
+      // 流式请求沿用 30s 连接超时会把正常的慢回复全部掐断。须小于 STREAM_IDLE_TIMEOUT_MS（120s）。
+      requestTimeoutMs: 105_000,
     },
   };
   const DEFAULT_PROVIDER = "opencode";
@@ -1357,7 +1360,7 @@
             temperature: body.temperature,
             max_tokens: body.max_tokens,
             signal: entry.ac.signal,
-            timeoutMs: LIMITS.connectTimeoutMs,
+            timeoutMs: provider.requestTimeoutMs || LIMITS.connectTimeoutMs,
             provider,
             base,
           });

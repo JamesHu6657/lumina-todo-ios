@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { loadConfig, renderPrompt } from "./factory-relay.mjs";
 
@@ -93,6 +94,21 @@ function request(relay, route, { method = "GET", body, auth = token, headers = {
     method,
     headers: requestHeaders,
     body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+function rawRequestLine(relay, target) {
+  const { hostname, port } = new URL(relay.address);
+  return new Promise((resolve) => {
+    let received = "";
+    const socket = net.connect(Number(port), hostname, () => {
+      socket.write(`GET ${target} HTTP/1.1\r\nHost: relay.test\r\nConnection: close\r\n\r\n`);
+    });
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { received += chunk; });
+    socket.on("error", () => {});
+    socket.on("close", () => resolve(received.split("\r\n")[0] || ""));
+    setTimeout(() => socket.destroy(), 1000);
   });
 }
 
@@ -311,6 +327,41 @@ await withRelay({}, async (relay) => {
       assert.equal((await response.json()).error.type, "invalid_request_error");
     }
   });
+
+  await test("multi-byte characters split across stdout chunks are decoded intact", async () => {
+    const response = await request(relay, "/v1/chat/completions", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "STUB:UTF8-SPLIT" }] },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).choices[0].message.content, "汉字跨块");
+  });
+
+  await test("malformed unauthenticated request targets cannot crash the relay", async () => {
+    for (const target of ["//a:99999/", "//[/", "http://[/"]) {
+      assert.match(await rawRequestLine(relay, target), /^HTTP\/1\.1 404 /);
+    }
+    assert.equal(relay.child.exitCode, null);
+    const health = await request(relay, "/healthz", { auth: null });
+    assert.equal(health.status, 200);
+  });
+});
+
+await test("SIGTERM shuts down cleanly and removes the droid sandbox", async () => {
+  const relay = await startRelay();
+  const response = await request(relay, "/v1/chat/completions", {
+    method: "POST",
+    body: { messages: [{ role: "user", content: "STUB:CAPTURE" }] },
+  });
+  const captured = JSON.parse((await response.json()).choices[0].message.content);
+  const sandboxDir = captured.args[captured.args.indexOf("--cwd") + 1];
+  await fs.access(sandboxDir);
+  const exitCode = await new Promise((resolve) => {
+    relay.child.once("exit", (code) => resolve(code));
+    relay.child.kill("SIGTERM");
+  });
+  assert.equal(exitCode, 0);
+  await assert.rejects(fs.access(sandboxDir));
 });
 
 await withRelay({ TIMEOUT_MS: "60" }, async (relay) => {
@@ -337,6 +388,20 @@ await withRelay({ MAX_CONCURRENCY: "1", TIMEOUT_MS: "3000" }, async (relay) => {
     });
     assert.equal(second.status, 429);
     assert.equal((await first).status, 200);
+  });
+});
+
+await withRelay({ MAX_REQUESTS_PER_MINUTE: "2" }, async (relay) => {
+  await test("sequential requests are capped per minute, not just per moment", async () => {
+    const send = () => request(relay, "/v1/chat/completions", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "STUB:PLAIN" }] },
+    });
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200);
+    const third = await send();
+    assert.equal(third.status, 429);
+    assert.match((await third.json()).error.message, /per minute/);
   });
 });
 

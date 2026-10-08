@@ -14,7 +14,8 @@ DROID_MODEL=deepseek-v4.1-flash
 # ALLOWED_MODELS=deepseek-v4.1-flash
 # DROID_REASONING=high
 # MAX_CONCURRENCY=2
-# TIMEOUT_MS=90000
+# MAX_REQUESTS_PER_MINUTE=30   # 每分钟最多启动的 droid 次数，0 表示不限
+# TIMEOUT_MS=90000             # App 端为 Factory 留了 105s，调大这里时别超过它
 # MAX_BODY_BYTES=1048576
 ```
 
