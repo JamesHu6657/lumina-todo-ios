@@ -14,6 +14,8 @@ const privateNames = new Set(["personal-config.local.js", "personal-secrets.json
 const secretPatterns = [
   /\bsk-[A-Za-z0-9_-]{8,}\b/,
   /\bpk_[A-Za-z0-9_-]{8,}\b/,
+  // Factory API key（中转 VPS 用）：只该在 /etc/factory-relay.env，绝不能进 App 包
+  /\bfk-[A-Za-z0-9_-]{8,}\b/,
 ];
 
 function walk(dir, files = []) {
