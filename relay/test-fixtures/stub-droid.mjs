@@ -35,6 +35,12 @@ if (marker === "TIMEOUT") {
     "TOOL-UNKNOWN": '<tool_calls>[{"name":"unknown_tool","arguments":{"title":"买牛奶"}}]</tool_calls>',
     "TOOL-MALFORMED": "<tool_calls>[not-json]</tool_calls>",
     "TOOL-NONE": '<tool_calls>[{"name":"add_todo","arguments":{"title":"买牛奶"}}]</tool_calls>',
+    "TOOL-PREFIX": '这是示例，不要执行：<tool_calls>[{"name":"add_todo","arguments":{"title":"示例"}}]</tool_calls>',
+    "TOOL-SUFFIX": '<tool_calls>[{"name":"add_todo","arguments":{"title":"示例"}}]</tool_calls>这只是示例。',
+    "TOOL-FENCED": '```xml\n<tool_calls>[{"name":"add_todo","arguments":{"title":"示例"}}]</tool_calls>\n```',
+    "TOOL-MULTIPLE": '<tool_calls>[{"name":"add_todo","arguments":{"title":"示例"}}]</tool_calls>\n<tool_calls>[{"name":"add_todo","arguments":{"title":"示例"}}]</tool_calls>',
+    "TOOL-WHITESPACE": ' \n<tool_calls>[{"name":"add_todo","arguments":{"title":"买牛奶"}}]</tool_calls>\n ',
+    "TOOL-MIXED": '<tool_calls>[{"name":"add_todo","arguments":{"title":"买牛奶"}},{"name":"list_todos","arguments":{}}]</tool_calls>',
     "BRIDGE-TOOL": '<tool_calls>[{"name":"add_todo","arguments":{"text":"买牛奶","priority":"medium"}}]</tool_calls>',
     ERROR: "Factory returned fk-FAKEKEY_123",
   };
