@@ -26,7 +26,7 @@ function makeStore() {
 
 /** lookup: "empty" | "hit" | "fail" —— time_entries 查询的行为 */
 function makeClickUp() {
-  const state = { lookup: "empty", posts: [] };
+  const state = { lookup: "empty", posts: [], postFail: 0 };
   const reply = (status, body) => ({
     ok: status < 400,
     status,
@@ -50,6 +50,7 @@ function makeClickUp() {
     }
     if (u.includes("/time_entries") && method === "POST") {
       state.posts.push(JSON.parse(opts.body));
+      if (state.postFail && state.postFail-- > 0) return reply(504, "gateway timeout");
       return reply(200, {});
     }
     return reply(200, {});
@@ -182,6 +183,37 @@ async function main() {
     assert.equal(r.requeued, 0);
     assert.equal(r.left, 1, "队列写不进去时必须保留待核对");
     console.log("✔ 队列写失败时保留待核对，不丢记录");
+  }
+
+  // 7. 年长 pending 重入队后遇到不确定 POST：宽限期内不能立即再次 POST
+  {
+    const operationId = "op-retry-grace-1";
+    const cu = makeClickUp();
+    cu.postFail = 1;
+    const { api, store } = await load([pending(operationId, GRACE_MS + 60_000)], cu);
+    await api.reconcilePendingPomos();
+    await api.flushQueue();
+    assert.equal(cu.posts.length, 1);
+    assert.equal((await api.status()).queue, 1);
+    assert.equal((await api.status()).pendingPomo, 1);
+
+    await api.reconcilePendingPomos();
+    await api.flushQueue();
+    assert.equal(cu.posts.length, 1, "宽限期内再次前台同步不得立刻重 POST");
+    assert.equal((await api.status()).queue, 1);
+    assert.equal((await api.status()).pendingPomo, 1);
+
+    const pendingItems = JSON.parse(store.getItem(PENDING_KEY));
+    pendingItems[0].createdAt = Date.now() - GRACE_MS - 60_000;
+    store.setItem(PENDING_KEY, JSON.stringify(pendingItems));
+    await api.reconcilePendingPomos();
+    await api.flushQueue();
+    assert.equal(cu.posts.length, 2, "宽限期结束并确认远端没有后只补发一次");
+    assert.equal((await api.status()).queue, 0);
+    assert.equal((await api.status()).pendingPomo, 0);
+    assert.match(cu.posts[0].description, /\[lumina-op:op-retry-grace-1\]/);
+    assert.match(cu.posts[1].description, /\[lumina-op:op-retry-grace-1\]/);
+    console.log("✔ 不确定的队列 POST 在宽限期内不重复发送，过期后按原 operationId 补发");
   }
 }
 

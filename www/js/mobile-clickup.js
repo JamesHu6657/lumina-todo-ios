@@ -588,6 +588,13 @@
   function hasPendingPomo(operationId) {
     return readPendingPomos().some((item) => item.operationId === operationId);
   }
+  function pendingPomoAge(operationId) {
+    const pending = readPendingPomos().find((item) => item.operationId === operationId);
+    if (!pending) return null;
+    const createdAt = Number(pending.createdAt);
+    if (!Number.isFinite(createdAt) || createdAt <= 0) return 0;
+    return Date.now() - createdAt;
+  }
   /**
    * 查询已确认远端没有这条记录：按原 operationId 转入补发队列。
    * 先写队列再清 pending；队列里已有同 operationId 就只清 pending，不重复入队。
@@ -838,6 +845,17 @@
           minutes: mins,
           deduped: true,
           operationId,
+        };
+      }
+      const pendingAge = pendingPomoAge(operationId);
+      if (pendingAge !== null && pendingAge < LIMITS.pendingRequeueGraceMs) {
+        return {
+          ok: false,
+          code: "INDETERMINATE",
+          error: "上次提交结果尚未确认，宽限期内不重发；确认未写入后才会补发",
+          retryable: false,
+          operationId,
+          queued: false,
         };
       }
     } catch (err) {
