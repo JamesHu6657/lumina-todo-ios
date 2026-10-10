@@ -1441,6 +1441,11 @@
       const toastEl = document.getElementById("toast");
       const toastMsg = document.getElementById("toastMsg");
       if (toastEl && toastMsg) {
+        const toastAction = document.getElementById("toastAction");
+        if (toastAction) {
+          toastAction.hidden = true;
+          toastAction.onclick = null;
+        }
         toastMsg.textContent = message;
         toastEl.classList.add("show");
         clearTimeout(pomoToastTimer);
