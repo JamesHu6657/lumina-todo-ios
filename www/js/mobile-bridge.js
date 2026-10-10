@@ -653,6 +653,35 @@
     if (active.get(requestId) === entry) active.delete(requestId);
   }
 
+  async function awaitRequest(entry, timeoutMs, run) {
+    const signal = entry.ac.signal;
+    const abortReason = () => signal.reason || new DOMException("已停止", "AbortError");
+    if (signal.aborted) throw abortReason();
+    let timer;
+    let onAbort;
+    const interrupted = new Promise((_, reject) => {
+      onAbort = () => reject(abortReason());
+      signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(
+        () => entry.ac.abort(new DOMException("请求超时", "TimeoutError")),
+        timeoutMs
+      );
+    });
+    try {
+      // CapacitorHttp 可能忽略 signal；本地等待必须独立收尾，包括正文读取。
+      return await Promise.race([
+        Promise.resolve().then(() => {
+          if (signal.aborted) throw abortReason();
+          return run();
+        }),
+        interrupted,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
   async function callChatApi({
     messages,
     tools,
@@ -1225,41 +1254,50 @@
         return { ok: false, requestId, error: err.message, code: err.code };
       }
 
-      let link = null;
       try {
-        const useTools = payload?.tools !== false;
-        const call = await callChatApi({
-          messages: body.messages,
-          tools: useTools ? getTools() : undefined,
-          tool_choice: body.tool_choice || (useTools ? "auto" : undefined),
-          stream: false,
-          temperature: body.temperature,
-          max_tokens: body.max_tokens ?? LIMITS.maxTokens.default,
-          signal: entry.ac.signal,
-          timeoutMs: LIMITS.completeTimeoutMs,
-          provider,
-          base,
+        return await awaitRequest(entry, LIMITS.completeTimeoutMs, async () => {
+          let link = null;
+          try {
+            const useTools = payload?.tools !== false;
+            const call = await callChatApi({
+              messages: body.messages,
+              tools: useTools ? getTools() : undefined,
+              tool_choice: body.tool_choice || (useTools ? "auto" : undefined),
+              stream: false,
+              temperature: body.temperature,
+              max_tokens: body.max_tokens ?? LIMITS.maxTokens.default,
+              signal: entry.ac.signal,
+              timeoutMs: 0,
+              provider,
+              base,
+            });
+            link = call;
+            if (entry.ac.signal.aborted) throw entry.ac.signal.reason;
+            const text = await call.res.text();
+            if (entry.ac.signal.aborted) throw entry.ac.signal.reason;
+            if (text.length > LIMITS.maxCompleteResponseChars) {
+              return { ok: false, requestId, error: "回复过大", code: "RESPONSE_TOO_LARGE" };
+            }
+            const data = JSON.parse(text);
+            const choice = data?.choices?.[0] || {};
+            const msg = choice.message || {};
+            return {
+              ok: true,
+              requestId,
+              model: data.model || provider.model,
+              message: {
+                role: "assistant",
+                content: msg.content || "",
+                reasoning_content: msg.reasoning_content || "",
+                tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
+              },
+              finish_reason: choice.finish_reason || null,
+            };
+          } finally {
+            // 即使原生请求在停止后才返回，也必须清理它自己的监听器。
+            link?.dispose?.();
+          }
         });
-        link = call;
-        const text = await call.res.text();
-        if (text.length > LIMITS.maxCompleteResponseChars) {
-          return { ok: false, requestId, error: "回复过大", code: "RESPONSE_TOO_LARGE" };
-        }
-        const data = JSON.parse(text);
-        const choice = data?.choices?.[0] || {};
-        const msg = choice.message || {};
-        return {
-          ok: true,
-          requestId,
-          model: data.model || provider.model,
-          message: {
-            role: "assistant",
-            content: msg.content || "",
-            reasoning_content: msg.reasoning_content || "",
-            tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
-          },
-          finish_reason: choice.finish_reason || null,
-        };
       } catch (err) {
         if (isAbortLike(err)) {
           return {
@@ -1286,7 +1324,6 @@
           status: classified.status || err?.status,
         };
       } finally {
-        link?.dispose?.();
         endRequest(requestId, entry);
       }
     },
