@@ -358,7 +358,13 @@
   function focusScrollIntoView(el) {
     if (!el || el.disabled) return;
     const run = () => {
-      if (document.activeElement !== el || !el.isConnected || el.id === "chatInput") return;
+      if (document.activeElement !== el || !el.isConnected) return;
+      if (el.id === "chatInput") {
+        if (el.selectionStart === el.value.length && el.selectionEnd === el.selectionStart) {
+          el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        }
+        return;
+      }
       try {
         const scroller =
           el.closest(".settings-body, .scroller, .main");

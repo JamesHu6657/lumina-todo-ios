@@ -150,10 +150,25 @@ async function main() {
   console.log("✓ Pending focus timers cannot jump to a field after focus leaves it");
 
   const chat = field(web.sandbox.document, "chatInput", scroller);
+  chat.tagName = "TEXTAREA";
+  chat.value = "Line 1\nLine 2\nLine 3";
+  chat.selectionStart = chat.value.length;
+  chat.selectionEnd = chat.value.length;
+  chat.scrollHeight = 90;
+  chat.clientHeight = 60;
+  chat.scrollTop = 0;
   web.documentEvents.get("focusin")({ target: chat });
   web.runTimers();
   assert.equal(scroller.scrollTop, 0);
-  console.log("✓ The docked chat composer does not scroll the document");
+  assert.equal(chat.scrollTop, 30);
+  chat.selectionStart = 0;
+  chat.selectionEnd = 0;
+  chat.scrollTop = 12;
+  web.sandbox.visualViewport.height = 180;
+  web.viewportEvents.get("resize")();
+  web.runTimers();
+  assert.equal(chat.scrollTop, 12);
+  console.log("✓ Rotating a docked chat keeps the last line visible without scrolling the document");
 
   const fallback = await load({ visual: false });
   fallback.sandbox.innerHeight = 400;
