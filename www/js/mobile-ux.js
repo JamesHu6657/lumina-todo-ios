@@ -29,6 +29,7 @@
     root.style.setProperty("--vvh", `${h}px`);
     root.style.setProperty("--vvt", `${top}px`);
     root.style.setProperty("--vvb", `${Math.max(0, window.innerHeight - h - top)}px`);
+    root.classList.toggle("kb-compact", h <= 320);
     // 无 Capacitor Keyboard 事件时，用 layout vs visual 差估键盘高度
     if (!kbFromPlugin) {
       const layoutH = window.innerHeight;

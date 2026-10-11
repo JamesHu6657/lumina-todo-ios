@@ -167,6 +167,27 @@ html.is-ios-app .chat-composer{
   flex-shrink: 0;
   padding-bottom: max(8px, var(--sab));
 }
+html.is-ios-app.kb-open.kb-compact .chat-head{
+  padding: 4px 12px;
+}
+html.is-ios-app.kb-open.kb-compact .chat-sub,
+html.is-ios-app.kb-open.kb-compact .chat-status-row{
+  display: none;
+}
+html.is-ios-app.kb-open.kb-compact .chat-msgs{
+  padding-block: 0;
+}
+html.is-ios-app.kb-open.kb-compact .chat-composer{
+  padding: 6px 12px;
+}
+html.is-ios-app.kb-open.kb-compact #chatInput{
+  min-height: 36px;
+  max-height: clamp(36px, calc(var(--vvh) - 110px), 140px);
+  padding: 4px 12px;
+}
+html.is-ios-app.kb-open.kb-compact .chat-composer-bar{
+  margin-top: 4px;
+}
 /* iOS 聚焦放大：输入框 ≥16px */
 html.is-ios-app .chat-input,
 html.is-ios-app #chatInput,

@@ -90,7 +90,18 @@ async function main() {
   assert.equal(native.properties.get("--vvh"), "500px");
   assert.equal(native.properties.get("--vvb"), "0px");
   assert.ok(native.classes.has("kb-open"));
+  assert.ok(!native.classes.has("kb-compact"));
   console.log("✓ A resized native WebView does not subtract the keyboard twice");
+
+  native.sandbox.innerHeight = 150;
+  native.sandbox.visualViewport.height = 150;
+  native.viewportEvents.get("resize")();
+  assert.ok(native.classes.has("kb-compact"));
+  native.sandbox.innerHeight = 500;
+  native.sandbox.visualViewport.height = 500;
+  native.viewportEvents.get("resize")();
+  assert.ok(!native.classes.has("kb-compact"));
+  console.log("✓ Short keyboard viewports compact the chat and restore on rotation");
 
   native.keyboardEvents.get("keyboardWillHide")();
   native.sandbox.innerHeight = 844;
@@ -124,6 +135,11 @@ async function main() {
   web.runTimers();
   assert.equal(scroller.scrollTop, 156);
   console.log("✓ Settings fields scroll within the sheet, including later keyboard changes");
+
+  web.sandbox.visualViewport.height = 250;
+  web.viewportEvents.get("resize")();
+  assert.ok(web.classes.has("kb-compact"));
+  console.log("✓ Compact chat uses the visual viewport even with a full layout viewport");
 
   scroller.scrollTop = 0;
   const stale = field(web.sandbox.document, "setCuToken", scroller);
