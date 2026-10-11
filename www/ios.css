@@ -13,6 +13,8 @@
   --sal: env(safe-area-inset-left, 0px);
   --sar: env(safe-area-inset-right, 0px);
   --vvh: 100dvh;
+  --vvt: 0px;
+  --vvb: 0px;
   --kb: 0px; /* 软键盘高度（mobile-ux 写入） */
   --ios-pad-x: 12px;
   --ios-hit: 44px;
@@ -152,6 +154,9 @@ html.is-ios-app.is-list-scrolling .float-pet{
 
 /* ── 聊天 / Toast / 设置 ── */
 html.is-ios-app .chat-drawer{
+  top: var(--vvt);
+  bottom: var(--vvb);
+  height: var(--vvh);
   padding-top: var(--sat);
   padding-bottom: var(--sab);
   max-height: var(--vvh);
@@ -159,6 +164,7 @@ html.is-ios-app .chat-drawer{
   max-width: 100%;
 }
 html.is-ios-app .chat-composer{
+  flex-shrink: 0;
   padding-bottom: max(8px, var(--sab));
 }
 /* iOS 聚焦放大：输入框 ≥16px */
@@ -691,6 +697,9 @@ body.settings-open .toast{ z-index: 95; }
 html.is-ios-app{
   --kb: 0px;
 }
+html.is-ios-app.kb-open{
+  --sab: 0px;
+}
 html.is-ios-app.kb-open .side{
   display: none !important;
 }
@@ -717,22 +726,20 @@ html.is-ios-app.kb-open .composer{
   padding-bottom: 6px;
   box-shadow: 0 8px 16px oklch(10% .02 280 / .12);
 }
-/*
-  Keyboard.resize=body 时视口已上缩，fixed bottom:0 会跟着抬。
-  这里只收紧 max-height / 可滚区域，避免 bottom+=kb 双重上移。
-*/
-html.is-ios-app .chat-composer{
-  padding-bottom: max(8px, var(--sab));
-}
 html.is-ios-app.kb-open .chat-drawer{
   max-height: var(--vvh);
 }
+html.is-ios-app.kb-open .chat-suggest{
+  display: none;
+}
 html.is-ios-app .settings-sheet{
-  max-height: min(88dvh, calc(var(--vvh) - 12px));
+  bottom: var(--vvb);
+  max-height: min(640px, calc(var(--vvh) - 12px));
 }
 html.is-ios-app.kb-open .settings-sheet{
-  max-height: min(92dvh, calc(var(--vvh) - 4px));
+  max-height: calc(var(--vvh) - 4px);
 }
 html.is-ios-app .settings-body{
+  min-height: 0;
   scroll-padding-bottom: 28px;
 }
