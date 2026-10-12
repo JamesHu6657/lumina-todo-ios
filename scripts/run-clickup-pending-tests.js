@@ -72,6 +72,10 @@ async function load(pendings, cu, opts = {}) {
     URL,
   };
   if (opts.navigator) sandbox.navigator = opts.navigator;
+  // 默认模拟 iOS App（单 WebView）；跨标签页场景显式传 navigator.locks 或 native:false
+  if (opts.native === true || (opts.native === undefined && !opts.navigator)) {
+    sandbox.Capacitor = { isNativePlatform: () => true };
+  }
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox);
@@ -328,11 +332,23 @@ async function main() {
     const nav = mode === "two-tabs-locks" ? { locks: makeLockManager() } : undefined;
     const realFetch = cu.fetch;
     cu.fetch = slowFetch;   // 加载阶段不计入时序
-    const first = await load([{ ...pending("op-overlap-1", GRACE_MS + 60_000), needsManual: true }], cu, { navigator: nav });
-    const second = mode === "same-page" ? first : await load(null, cu, { store: first.store, navigator: nav });
+    // 审查四④：两个标签页且没有 Web Locks（非 App 单 WebView）时没有可靠互斥，必须失败关闭
+    const native = mode === "two-tabs-no-locks" ? false : undefined;
+    const first = await load([{ ...pending("op-overlap-1", GRACE_MS + 60_000), needsManual: true }], cu, { navigator: nav, native });
+    const second = mode === "same-page" ? first : await load(null, cu, { store: first.store, navigator: nav, native });
     cu.fetch = realFetch;
     const [r1, r2] = await Promise.all([first.api.retryPendingPomos(), second.api.retryPendingPomos()]);
     assert.ok(r1 && r2);
+    if (mode === "two-tabs-no-locks") {
+      assert.equal(cu.posts.length, 0, "无可靠跨页锁：不得补发");
+      assert.equal(r1.code, "LOCK_UNAVAILABLE");
+      assert.equal(r2.code, "LOCK_UNAVAILABLE");
+      assert.equal(JSON.parse(first.store.getItem(PENDING_KEY) || "[]").length, 1, "无锁时待核对记录原样保留");
+      await first.api.flushQueue();
+      await first.api.reconcilePendingPomos();
+      assert.equal(cu.posts.length, 0);
+      continue;
+    }
     assert.equal(cu.posts.length, 1, `${mode}：重叠重试只允许补发一次`);
     const pend = JSON.parse(first.store.getItem(PENDING_KEY) || "[]");
     assert.equal(pend.length, 1, `${mode}：504 后的新待核对记录不得被旧快照清掉`);
@@ -345,6 +361,34 @@ async function main() {
     assert.equal(cu.posts.length, 1, `${mode}：自动刷新不得重复 POST`);
   }
   console.log("✔ 审查三⑥ 重叠手动重试：single-flight + 锁 + 版本校验，504 后不被旧快照清除、不重复补发");
+
+  // 审查四⑨：single-flight 只合并相同过滤条件；[A] 与 [B] 重叠时两条都要处理
+  {
+    const cu = makeClickUp();
+    const slow = cu.fetch;
+    cu.fetch = async (url, opts) => {
+      if (String(url).includes("/time_entries") && ((opts && opts.method) || "GET") === "GET") {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      return slow(url, opts);
+    };
+    const { api, store } = await load([
+      { ...pending("op-filter-a", GRACE_MS + 60_000), needsManual: true },
+      { ...pending("op-filter-b", GRACE_MS + 60_000), needsManual: true },
+    ], cu);
+    const same1 = api.retryPendingPomos(["op-filter-a"]);
+    const same2 = api.retryPendingPomos(["op-filter-a"]);
+    assert.strictEqual(same1, same2, "相同过滤条件的重叠调用共享同一次执行");
+    const other = api.retryPendingPomos(["op-filter-b"]);
+    assert.notStrictEqual(other, same1, "不同过滤条件不得被合并吞掉");
+    const [ra, rb] = await Promise.all([same1, other]);
+    assert.equal(ra.requeued, 1);
+    assert.equal(rb.requeued, 1, "[B] 的重试必须真的处理 B");
+    const posted = cu.posts.map((p) => (p.description.match(/lumina-op:([^\]]+)/) || [])[1]).sort();
+    assert.deepEqual(posted, ["op-filter-a", "op-filter-b"]);
+    assert.equal(JSON.parse(store.getItem(PENDING_KEY) || "[]").length, 0);
+  }
+  console.log("✔ 审查四⑨ 重试待核对按过滤条件 single-flight：[A] 与 [B] 各自执行，相同条件才合并");
 }
 
 main().catch((err) => {
