@@ -1298,7 +1298,12 @@ function mergeRemoteBeforeRecoveryWrite(){
   if (!remoteSrc && pendingExternal) remoteSrc = pendingExternal;
   if (!remoteSrc) return false;
   const before = JSON.stringify(todos);
-  mergeRemoteWindow(remoteSrc, dirtyBase, true);
+  const adopted = mergeRemoteWindow(remoteSrc, dirtyBase, true);
+  /* 合并基线前移到「已采纳的远端版」：内存已包含它的全部改动。
+     恢复写若再次失败，下一次合并必须以它为基线——否则用户随后删掉的
+     远端条目会被当成远端新增再合回来（审查第二轮 #4） */
+  dirtyBase = adopted.map((t) => ({ ...t }));
+  lastAppliedList = adopted.map((t) => ({ ...t }));
   pendingExternal = null;
   return JSON.stringify(todos) !== before;
 }
@@ -2106,7 +2111,7 @@ function findClickUpBtn(todoId){
  * UI 按钮与 AI Agent 共用。永远 resolve，不 throw。
  * @returns {Promise<{ok:boolean, message?:string, error?:string, code?:string, taskId?:string, url?:string, already?:boolean}>}
  */
-async function pushTodoToClickUp(id, btnEl){
+async function pushTodoToClickUp(id, btnEl, pushOpts){
   const t = todos.find((x) => x.id === id);
   if (!t){
     return { ok:false, code:"NOT_FOUND", error:"找不到该待办", message:"找不到该待办" };
@@ -2149,13 +2154,27 @@ async function pushTodoToClickUp(id, btnEl){
     dueDate: t.dueDate || null,
     todoId: t.id,
   };
+  /* 只有用户在「长时间未确认」提示上点了「重新上传」才允许重建 */
+  if (pushOpts && pushOpts.manualRetry === true) payload.manualRetry = true;
   const snapDue = payload.dueDate;
 
   try {
     const r = await bridge.pushTodo(payload);
     if (!r || !r.ok){
       const err = (r && r.error) || "传到 ClickUp 失败";
-      toast(err);
+      if (r && r.code === "NEEDS_MANUAL_RETRY"){
+        /* 上次提交长时间未确认：不自动重建，把决定交给用户 */
+        toast(err, {
+          label: "重新上传",
+          run: () => {
+            if (confirm("ClickUp 里确实没有这条任务吗？重新上传会再查一次，仍查不到才创建。")){
+              pushTodoToClickUp(id, null, { manualRetry:true });
+            }
+          },
+        });
+      } else {
+        toast(err);
+      }
       console.warn("[clickup] pushTodo 失败：", r);
       return {
         ok:false,
@@ -2491,8 +2510,12 @@ function syncTodosFromDisk(){
     let remoteSrc = pendingExternal;
     if (parsed && !Array.isArray(parsed) && parsed.writer && parsed.writer !== TAB_ID
         && Array.isArray(parsed.todos)) remoteSrc = parsed;   // 盘上这份是远端写的，必然 ≥ 排队快照
-    mergeRemoteWindow(remoteSrc, dirtyBase, true);
+    const adopted = mergeRemoteWindow(remoteSrc, dirtyBase, true);
     pendingExternal = null;
+    /* 盘上就是这份远端版：persist 失败时 dirtyBase 取 lastAppliedList，
+       基线必须包含已采纳的远端条目，否则之后删掉它们会被再次合回 */
+    lastAppliedList = adopted.map((t) => ({ ...t }));
+    dirtyBase = null;
     if (!persist()) return false;
     try { parsed = JSON.parse(store.get(STORAGE_KEY) || "null"); } catch { parsed = null; }
     mergedFromDirty = true;
@@ -2566,6 +2589,8 @@ function mergeRemoteWindow(parsed, base, followDeletes){
   todos = merged;
   /* 远端快照的结算标记一并采纳：它和这份列表同源 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  /* 返回已采纳的远端版：调用方据此把合并基线前移 */
+  return remote;
 }
 
 /* 软合并：把被覆盖的远端快照并进内存，但绝不删条目、不盖本页更新——
