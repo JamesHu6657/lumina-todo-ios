@@ -319,6 +319,9 @@
     }
     try {
       const st = await window.luminaAI.status(refresh ? { refresh: true } : {});
+      if (chatModelLabel && st?.model) {
+        chatModelLabel.textContent = `${st.model} · Agent`;
+      }
       if (st?.ok) {
         everReady = true;
         const n = Array.isArray(st.tools) ? st.tools.length : 0;
@@ -332,9 +335,6 @@
           "ok",
           `Agent 已就绪 · ${sourceLabel} · ${st.model || "deepseek-v4-flash"} · ${n} 个工具`
         );
-        if (chatModelLabel) {
-          chatModelLabel.textContent = `${st.model || "deepseek-v4-flash"} · Agent`;
-        }
         syncSendEnabled();
       } else {
         everReady = false;
