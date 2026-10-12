@@ -379,6 +379,11 @@ let dirtyBase = null;          // localDirty 窗口起点时的盘基线
 let localDirty = false;        // 有改动还没落盘：内存领先于盘
 let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
 const remoteIds = new Set();   // 当前版本由远端写入（流入过内存）的条目 id——undo 归因要用
+/* 审查五 A：三方合并里「双方都改了同一字段组、本页胜出」时记下远端的值。
+   key=`${id}\u0000${组序号}` → { ours: 胜出时本页的值, theirs: 远端值 }。
+   撤销一个未落盘的本地操作时，这组若被远端改过，逆操作取远端最新值而不是历史 before——
+   历史 before 写回盘会把别页的编辑盖掉。本页成功落盘后整张清空（落盘即我方版本已覆盖远端） */
+const remoteFieldConflicts = new Map();
 /* 「出身」归因：远端新增的条目。本页改写只销版本标记（remoteIds.delete），
    不动出身——否则撤销更早的快照时，「远端加的、后来被本页碰过的条目」
    会被误判成本页新增，直接被撤掉并广播删除 */
@@ -1329,6 +1334,7 @@ function persist(){
     flashSaved();
     localDirty = false;
     lastAppliedList = todos.map((t) => ({ ...t }));
+    remoteFieldConflicts.clear();
     /* 恢复写已经带上了合并结果：窗口基线和排队快照都用完了 */
     if (wasDirty){ dirtyBase = null; pendingExternal = null; }
     if (mergedRemote){
@@ -1449,7 +1455,7 @@ function snapshot(label){
   syncUndoBtn();
 }
 /* 纯函数：把 entry 描述的操作在 current 上逆向应用，返回新列表 */
-function invertUndoEntry(entry, current){
+function invertUndoEntry(entry, current, conflicts){
   const S = entry.todos;
   const A = entry.after || entry.todos;
   const sMap = new Map(S.map((t) => [t.id, t]));
@@ -1467,11 +1473,15 @@ function invertUndoEntry(entry, current){
     const s = sMap.get(t.id), a = aMap.get(t.id);
     if (!s || !a) return t;
     let next = t;
-    for (const g of USER_FIELD_GROUPS){
-      if (groupEq(s, a, g) || !groupEq(t, a, g)) continue;
+    USER_FIELD_GROUPS.forEach((g, gi) => {
+      if (groupEq(s, a, g) || !groupEq(t, a, g)) return;
+      /* 审查五 A：这组在本操作之后被远端改过（合并时本页 after 胜出）→ 只撤掉本页的增量，
+         露出远端的最新值；绝不把历史 before 写回去盖掉别页的编辑 */
+      const c = conflicts && conflicts.get(t.id + "\u0000" + gi);
+      const src = c && groupEq(c.ours, a, g) ? c.theirs : s;
       if (next === t) next = { ...t };
-      for (const f of g) next[f] = s[f];
-    }
+      for (const f of g) next[f] = src[f];
+    });
     if (next !== t) next.updatedAt = Math.max(t.updatedAt || 0, Date.now());
     return next;
   });
@@ -1538,7 +1548,7 @@ function undo(){
      pendingExternal，随后的 persist 会按 dirtyBase 三方合并——两种情况下
      撤销都只在「当前内存」上做操作级逆操作，不会整条回滚任何已合入的远端字段 */
   syncTodosFromDisk();
-  const next = invertUndoEntry(snap, todos);
+  const next = invertUndoEntry(snap, todos, remoteFieldConflicts);
   for (const t of next){
     const prev = todos.find((x) => x.id === t.id);
     if (!prev || !userEq(prev, t)) remoteIds.delete(t.id);   // 撤销写出的版本是本页的
@@ -2645,12 +2655,19 @@ function syncTodosFromDisk(){
 function mergeThreeWay(ours, base, theirs){
   const out = { ...ours };
   let tookTheirs = false, keptOurs = false;
-  for (const g of USER_FIELD_GROUPS){
+  USER_FIELD_GROUPS.forEach((g, gi) => {
     if (groupEq(ours, base, g)){
       if (!groupEq(theirs, base, g)) tookTheirs = true;
       for (const f of g) out[f] = theirs[f];
-    } else keptOurs = true;
-  }
+    } else {
+      keptOurs = true;
+      /* 双方都改了这组、本页胜出：记下远端值，撤销本页这次操作时要还给远端（审查五 A） */
+      if (ours.id && !groupEq(theirs, base, g) && !groupEq(theirs, ours, g)){
+        const pick = (o) => Object.fromEntries(g.map((f) => [f, o[f]]));
+        remoteFieldConflicts.set(ours.id + "\u0000" + gi, { ours: pick(ours), theirs: pick(theirs) });
+      }
+    }
+  });
   Object.assign(out, mergeSystemFields(ours, theirs));
   const ou = ours.updatedAt || 0, tu = theirs.updatedAt || 0;
   out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
