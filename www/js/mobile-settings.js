@@ -35,19 +35,31 @@
   async function exportViaShare() {
     const inApp = !!window.Capacitor?.isNativePlatform?.();
     if (!inApp) return "fallback";
-    let todos = [];
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-      if (saved && Array.isArray(saved.todos)) todos = saved.todos;
-      else if (Array.isArray(saved)) todos = saved;
-    } catch {
-      toast("读取本地数据失败");
-      return "error";
-    }
     const day = new Date();
+    let snap = null;
+    // 与网页导出共用应用内存快照：写盘失败时界面里的最新改动只在内存里
+    try {
+      if (typeof window.__luminaExportSnapshot === "function") snap = window.__luminaExportSnapshot();
+    } catch {
+      snap = null;
+    }
+    if (!snap || !Array.isArray(snap.todos)) {
+      // 应用脚本没起来时才退回读盘
+      let todos = [];
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+        if (saved && Array.isArray(saved.todos)) todos = saved.todos;
+        else if (Array.isArray(saved)) todos = saved;
+      } catch {
+        toast("读取本地数据失败");
+        return "error";
+      }
+      snap = { v: 4, exportedAt: day.toISOString(), todos };
+    }
+    const todos = snap.todos;
     const pad = (n) => String(n).padStart(2, "0");
     const name = `todo-${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}.json`;
-    const json = JSON.stringify({ v: 4, exportedAt: day.toISOString(), todos }, null, 2);
+    const json = JSON.stringify(snap, null, 2);
     try {
       const file = new File([json], name, { type: "application/json" });
       if (navigator.canShare?.({ files: [file] })) {
