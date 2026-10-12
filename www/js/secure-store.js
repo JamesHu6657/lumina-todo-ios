@@ -46,6 +46,27 @@
     return err;
   }
 
+  /**
+   * 同一 key 的迁移 / 保存 / 删除串行执行：迁移读取挂起期间用户保存了新密钥或清除了密钥，
+   * 迁移不得在之后把旧明文写回去（覆盖新值或复活已清除的值）。
+   * generation 在每次保存/删除时递增，迁移落盘前再核对一次。
+   */
+  const keyLocks = new Map();
+  const keyGenerations = new Map();
+  function withKeyLock(k, fn) {
+    const prev = keyLocks.get(k) || Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    const tail = run.catch(() => {});
+    keyLocks.set(k, tail);
+    tail.then(() => {
+      if (keyLocks.get(k) === tail) keyLocks.delete(k);
+    });
+    return run;
+  }
+  function bumpGeneration(k) {
+    keyGenerations.set(k, (keyGenerations.get(k) || 0) + 1);
+  }
+
   async function get(key) {
     const k = String(key || "");
     if (!k) return null;
@@ -67,6 +88,11 @@
     const k = String(key || "");
     if (!k) return false;
     const v = String(value ?? "");
+    bumpGeneration(k);
+    return withKeyLock(k, () => setNow(k, v));
+  }
+
+  async function setNow(k, v) {
     const plugin = nativePlugin();
     if (plugin?.set) {
       try {
@@ -84,6 +110,11 @@
   async function remove(key) {
     const k = String(key || "");
     if (!k) return true;
+    bumpGeneration(k);
+    return withKeyLock(k, () => removeNow(k));
+  }
+
+  async function removeNow(k) {
     const plugin = nativePlugin();
     if (plugin?.remove) {
       try {
@@ -104,9 +135,14 @@
     const k = String(key || "");
     if (!k) return null;
     const plugin = nativePlugin();
-    const legacy = lsGet(k);
-    if (!plugin?.get || !plugin?.set) return legacy;
+    if (!plugin?.get || !plugin?.set) return lsGet(k);
+    return withKeyLock(k, () => migrateNow(k, plugin));
+  }
 
+  async function migrateNow(k, plugin) {
+    const gen = keyGenerations.get(k) || 0;
+    // 明文必须在锁内读：排在前面的保存/删除已经处理过 localStorage
+    const legacy = lsGet(k);
     try {
       const r = await plugin.get({ key: k });
       const existing = r && typeof r.value === "string" ? r.value : null;
@@ -115,6 +151,8 @@
         return existing;
       }
       if (legacy) {
+        // 读取期间有新的保存/删除排队：以用户操作为准，不写回旧明文
+        if ((keyGenerations.get(k) || 0) !== gen) return null;
         await plugin.set({ key: k, value: legacy });
         lsRemove(k);
         return legacy;
