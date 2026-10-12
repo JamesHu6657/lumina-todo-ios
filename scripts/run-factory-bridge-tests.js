@@ -247,6 +247,27 @@ async function main() {
     console.log("✔ Factory 缓冲 SSE：多行/事件型错误失败关闭，合法多行 data 正常组装");
   }
 
+  // 审查五 B：Factory 中转流里显式 null 的参数片段不得让旧参数被执行（流式 reader 与缓冲 SSE）
+  {
+    const tool = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"delete_todo","arguments":"{\\"id\\":\\"t1\\"}"}}]},"finish_reason":null}]}\n\n';
+    const tail = 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n';
+    const enc = new TextEncoder();
+    for (const bad of ['{"index":0,"function":{"arguments":null}}', '{"index":0,"function":null}']) {
+      const raw = tool + 'data: {"choices":[{"index":0,"delta":{"tool_calls":[' + bad + ']},"finish_reason":null}]}\n\n' + tail;
+      const buf = await runChat(loadBridge(store, async () => ({ ok: true, status: 200, body: null, text: async () => raw })));
+      assert.equal(buf.done, undefined, "Factory 缓冲 SSE 显式 null 不得 onDone：" + bad);
+      assert.ok(buf.error);
+      const st = await runChat(loadBridge(store, async () => ({
+        ok: true, status: 200,
+        body: new ReadableStream({ start(c) { c.enqueue(enc.encode(raw)); c.close(); } }),
+        text: async () => raw,
+      })));
+      assert.equal(st.done, undefined, "Factory 流式显式 null 不得 onDone：" + bad);
+      assert.ok(st.error);
+    }
+    console.log("✔ Factory 中转：显式 null 的工具参数/函数片段失败关闭（流式/缓冲）");
+  }
+
   for (const stop of [true, false]) {
     const text = deferred();
     const bodyStarted = deferred();
