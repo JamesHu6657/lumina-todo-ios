@@ -3461,6 +3461,105 @@ async function main() {
   }
   ok("审查七① 侧表记录绑定撤销步（删除代/编辑步）：重复删除→撤销（单条/批量）与编辑循环都不复用上一代基线或已消费记录");
 
+  /* ---- 审查八① 编辑冲突记录必须始终反映「自该步以来最近一次观察到的远端值」：
+     远端后来改成与本页相同的值时也要刷新，否则依次撤销会把陈旧的 R1 写回盖掉远端最新 ---- */
+  for (const deliverEvent of [true, false]) {
+    for (const later of ["L", "R2"]) {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "Original" }).todo;
+      const B = loadApp({ storage });
+      const tag = `${deliverEvent ? "有" : "无"} storage 事件 / 远端后来=${later}`;
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);   // A: Original→L（写失败）
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);  // B 存 R1
+      if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      storage.failTodoWrites = true;
+      const y = A.invoke("add_todo", { text: "unrelated" }).todo;                 // 合并看到 R1（记冲突 theirs=R1），写又失败
+      assert.ok(y && y.id);
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: later }).ok, true); // B 后来存 later
+      if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(A.invoke("undo").ok, true);                                    // 撤销新增（写已恢复）
+      let d = diskTodos(storage);
+      assert.ok(!d.some((t) => t.id === y.id), `${tag}：撤销新增后无关条目移除`);
+      assert.equal(d.find((t) => t.id === x.id).text, "L", `${tag}：撤销新增不动 x（本页 L 胜出）`);
+      assert.equal(A.invoke("undo").ok, true);                                    // 撤销原编辑
+      d = diskTodos(storage);
+      assert.equal(d.find((t) => t.id === x.id).text, later, `${tag}：撤销原编辑须露出远端最新 ${later}，不得写回陈旧 R1 或 Original`);
+    }
+  }
+  for (const deliverEvent of [true, false]) {
+    // 本页恢复落盘后（非脏）别页先改 R3 再独立改回 L：storage 事件采纳 / mutator 入口读盘同样刷新冲突基准
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Original" }).todo;
+    const B = loadApp({ storage });
+    const tag = `${deliverEvent ? "有" : "无"} storage 事件 / 非脏采纳`;
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    const y = A.invoke("add_todo", { text: "unrelated" }).todo;                   // 合并记 R1，这次写成功（盘上 L）
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L");
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    for (const v of ["R3", "L"]) {
+      assert.equal(B.invoke("update_todo", { id: x.id, text: v }).ok, true);
+      if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    }
+    assert.equal(A.invoke("undo").ok, true);
+    assert.ok(!diskTodos(storage).some((t) => t.id === y.id));
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L", `${tag}：撤销原编辑露出远端最新 L，不得写回陈旧 R1`);
+  }
+  {
+    // 回显不是远端改动：本页 L 已落盘、别页只存了无关条目（x 原样回显）→ 冲突记录不被回显刷新，撤销仍还给 R1
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Original" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    const y = A.invoke("add_todo", { text: "unrelated" }).todo;
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    const z = B.invoke("add_todo", { text: "from B" }).todo;
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    const d = diskTodos(storage);
+    assert.ok(!d.some((t) => t.id === y.id) && d.some((t) => t.id === z.id));
+    assert.equal(d.find((t) => t.id === x.id).text, "R1", "远端只是回显本页已落盘的 L：撤销仍还给最近一次独立远端值 R1");
+  }
+  {
+    // 每个撤销步各一条记录：同组较晚一步的新冲突不得顶掉较早一步的记录
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);    // E1: O→L
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    storage.failTodoWrites = true;
+    A.invoke("add_todo", { text: "u1" });                                        // 合并：E1 记 R1
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "M" }).ok, true);    // E2: L→M
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R2" }).ok, true);
+    storage.failTodoWrites = true;
+    A.invoke("add_todo", { text: "u2" });                                        // 合并：E2 记 R2，E1 刷新为 R2
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "L" }).ok, true);    // 远端独立改成 L
+    for (let i = 0; i < 2; i++) assert.equal(A.invoke("undo").ok, true);        // 撤销 u2、E2
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L", "撤销 E2 露出远端最新 L");
+    for (let i = 0; i < 2; i++) assert.equal(A.invoke("undo").ok, true);        // 撤销 u1、E1
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L", "撤销 E1 不得写回 Original / R1，远端最新 L 保留");
+  }
+  ok("审查八① 编辑冲突记录随每次合并刷新远端基准（远端改成与本页相同也刷新）：依次撤销露出远端最新值（有/无 storage 事件，L/R2；非脏采纳；回显不刷新；每步各一条）");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
