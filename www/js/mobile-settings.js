@@ -130,6 +130,7 @@
             <button type="button" class="settings-btn ghost" id="setCuClear">清除</button>
           </div>
           <div class="settings-row">
+            <button type="button" class="settings-btn ghost" id="setCuRetryPending">重试待核对</button>
             <button type="button" class="settings-btn ghost" id="setCuClearFailed">清除失败记录</button>
           </div>
         </section>
@@ -204,6 +205,7 @@
             const pending = (st.pendingPush || 0) + (st.pendingPomo || 0);
             cuMask.textContent = `已保存 Token · 待同步 ${st.queue || 0}`
               + (pending ? ` · 待核对 ${pending}` : "")
+              + (st.pendingManual ? `（${st.pendingManual} 条长时间未确认，需手动重试）` : "")
               + (st.failed ? ` · 失败记录 ${st.failed}` : "")
               + (st.queueCorrupt ? " · 队列损坏已保全" : "");
           } else {
@@ -358,6 +360,23 @@
         toast("已清除 ClickUp Token");
       } else {
         toast(r?.error || "清除失败，Token 可能仍在设备上");
+      }
+      refreshMasks();
+    });
+    document.getElementById("setCuRetryPending")?.addEventListener("click", async () => {
+      if (!confirm("重新核对长时间未确认的 ClickUp 记录？ClickUp 里仍查不到的番茄打卡会按原标记补传一次。")) return;
+      try {
+        const r = await window.luminaClickUp?.retryPending?.();
+        if (!r) toast("ClickUp 模块未加载");
+        else if (!r.ok) toast(r.pomo?.code === "LOOKUP_FAILED" ? "暂时查不到 ClickUp，稍后再试" : (r.error || "重试失败"));
+        else {
+          const found = (r.pomo?.reconciled || 0) + (r.push?.reconciled || 0);
+          const pushLeft = r.push?.needsManual || 0;
+          toast(`已核对：找到 ${found} 条，补传 ${r.pomo?.requeued || 0} 条`
+            + (pushLeft ? `；${pushLeft} 条待办请在该待办上点「重新上传」` : ""));
+        }
+      } catch (err) {
+        toast(err?.message || "重试失败");
       }
       refreshMasks();
     });
