@@ -4,7 +4,8 @@
  * - 队列落 localStorage；创建任务/时间记录带 [lumina-op:…] 幂等标记
  * - flush 单飞；超时先查询再决定是否重试
  * - 结果不确定的提交只做 marker 对账，不自动重建/补发；长时间未确认交给用户手动重试
- * - 同一待办的上传：同页 single-flight + 跨页 localStorage 租约
+ * - 同一待办的上传：同页 single-flight + 跨页 Web Lock；没有可靠跨页锁时不自动提交
+ * - 共享集合（队列/待核对/已创建/失败记录）的读-改-写都在同一把全局 "store" 锁内完成
  */
 (function (root) {
   "use strict";
@@ -34,8 +35,8 @@
   const PENDING_POMO_KEY = "lumina-cu-pending-pomo-v1";
   const PUSHED_KEY = "lumina-cu-pushed-v1";
   const CORRUPT_QUEUE_KEY = "lumina-cu-queue-corrupt-v1";
-  // 跨标签页的上传租约：同一 operationId 同时只允许一个页面做「查询→创建→落盘」
-  const PUSH_LEASE_PREFIX = "lumina-cu-push-lease-v1:";
+  // 番茄打卡时按标题新建任务的「不确定」记录（审查四⑦）：结果未知的建任务 POST 只对账、不重发
+  const PENDING_TASK_KEY = "lumina-cu-pending-task-v1";
   // 容量上限只用来拒绝新增，绝不淘汰未确认的旧记录
   const MAX_QUEUE = 200;
   const MAX_FAILED = 200;
@@ -58,8 +59,6 @@
     // 超时后服务端可能稍晚才落库。宽限期只决定「多久后提示用户手动处理」：
     // 宽限期过后一次空查询也不能证明原请求不会再提交，绝不自动重建/补发
     pendingRequeueGraceMs: 10 * 60 * 1000,
-    // 上传租约有效期：覆盖查询 + 创建（单次请求 15s 截止）+ 落盘，页面崩溃后自动过期
-    pushLeaseMs: 2 * 60 * 1000,
   };
 
   let tokenCache = { value: null, at: 0 };
@@ -73,15 +72,17 @@
   const pushInflight = new Map();
   let flushPromise = null;
   let tokenReady = null;
-  // 本页标识：跨标签页上传租约的持有者
-  const PAGE_ID = newId("page-");
 
   /* ----------------------------- 互斥 ----------------------------- */
   /**
    * 跨页面原子互斥：优先 Web Locks（navigator.locks，iOS WKWebView 15.4+ 支持）。
-   * 锁由浏览器在所有同源页面间仲裁，持有页崩溃/关闭时自动释放，不存在
-   * 「两页同时读到空锁再各自写入」的窗口。不支持时退回本页内互斥（push 另有
-   * localStorage 租约兜底）。
+   * 锁由浏览器在所有同源页面间仲裁，持有页崩溃/关闭时自动释放。
+   *
+   * 审查四④：没有可靠跨页锁时绝不退回 localStorage 租约（写后回读不是原子操作，两页仍可能同时 POST）。
+   *   - iOS App（Capacitor 原生壳）只有一个 WKWebView / 一个 JS 上下文，不存在第二个页面，
+   *     本页 FIFO 互斥就是完整互斥（iOS 14–15.3 没有 Web Locks 时靠这一条）；
+   *   - 其它环境（老浏览器、锁服务抛 SecurityError）一律失败关闭：不自动提交，
+   *     返回可重试的 LOCK_UNAVAILABLE，记录原样保留。
    */
   function lockManager() {
     try {
@@ -91,9 +92,30 @@
       return null;
     }
   }
+  /** 原生壳里的唯一 WebView：本页互斥即全局互斥 */
+  function singleWebView() {
+    try {
+      return Boolean(root.Capacitor && typeof root.Capacitor.isNativePlatform === "function" && root.Capacitor.isNativePlatform());
+    } catch {
+      return false;
+    }
+  }
+  function lockUnavailableError() {
+    const err = new Error("当前环境没有可靠的跨页面锁，为避免重复提交已暂停自动提交，记录已保留");
+    err.code = "LOCK_UNAVAILABLE";
+    err.lockUnavailable = true;
+    err.retryable = true;
+    return err;
+  }
+  function isLockUnavailable(err) {
+    return Boolean(err && err.lockUnavailable);
+  }
   const LOCK_PREFIX = "lumina-clickup:";
   const pageLockTails = new Map();
-  /** 排队等待的互斥（本页 FIFO + 跨页 Web Lock）。fn 内绝不能再请求同名锁。 */
+  /**
+   * 排队等待的互斥（本页 FIFO + 跨页 Web Lock）。fn 内绝不能再请求同名锁。
+   * 拿不到可靠的跨页锁时 reject LOCK_UNAVAILABLE，fn 不会执行。
+   */
   function withLock(name, fn) {
     const prev = pageLockTails.get(name) || Promise.resolve();
     let release;
@@ -105,18 +127,22 @@
     return prev.then(async () => {
       try {
         const lm = lockManager();
-        if (!lm) return await fn();
-        let entered = false;
-        try {
-          return await lm.request(LOCK_PREFIX + name, { mode: "exclusive" }, () => {
-            entered = true;
-            return fn();
-          });
-        } catch (err) {
-          // 锁服务本身不可用（SecurityError 等，回调从未进入）：退回本页互斥
-          if (!entered) return await fn();
-          throw err;
+        if (lm) {
+          let entered = false;
+          try {
+            return await lm.request(LOCK_PREFIX + name, { mode: "exclusive" }, () => {
+              entered = true;
+              return fn();
+            });
+          } catch (err) {
+            if (entered) throw err;
+            // 锁服务本身不可用（SecurityError 等，回调从未进入）
+            if (singleWebView()) return await fn();
+            throw lockUnavailableError();
+          }
         }
+        if (singleWebView()) return await fn();
+        throw lockUnavailableError();
       } finally {
         release();
         if (pageLockTails.get(name) === tail) pageLockTails.delete(name);
@@ -124,12 +150,16 @@
     });
   }
   /**
-   * 不等待的互斥：锁被（任一页面）占用时立即调用 onBusy。
-   * 无 Web Locks 时直接执行 fn（由调用方的租约/本页 single-flight 兜底）。
+   * 不等待的互斥：锁被（任一页面）占用时立即调用 onBusy；
+   * 没有可靠跨页锁时调用 onUnavailable（默认 reject LOCK_UNAVAILABLE），fn 不执行。
    */
-  async function withLockIfAvailable(name, fn, onBusy) {
+  async function withLockIfAvailable(name, fn, onBusy, onUnavailable) {
+    const unavailable = () => {
+      if (onUnavailable) return onUnavailable();
+      throw lockUnavailableError();
+    };
     const lm = lockManager();
-    if (!lm) return fn(false);
+    if (!lm) return singleWebView() ? fn(false) : unavailable();
     let entered = false;
     try {
       return await lm.request(LOCK_PREFIX + name, { mode: "exclusive", ifAvailable: true }, (lock) => {
@@ -137,7 +167,20 @@
         return lock ? fn(true) : onBusy();
       });
     } catch (err) {
-      if (!entered) return fn(false);   // 锁服务不可用：退回租约 / 本页 single-flight
+      if (entered) throw err;
+      return singleWebView() ? fn(false) : unavailable();
+    }
+  }
+  /**
+   * 审查四⑤：共享集合的读-改-写放进同一把全局 "store" 锁。mutator 必须是同步函数
+   * （锁内不 await、不再请求任何锁），所以它总是最内层的锁，不会死锁。
+   * 拿不到锁时返回 fallback（默认 false = 写失败），调用方按写失败处理。
+   */
+  async function mutateStore(mutator, fallback = false) {
+    try {
+      return await withLock("store", () => mutator());
+    } catch (err) {
+      if (isLockUnavailable(err)) return fallback;
       throw err;
     }
   }
@@ -452,7 +495,15 @@
         page: String(page),
       });
       const listed = await cu(token, "GET", "/list/" + listId() + "/task?" + q);
-      const tasks = Array.isArray(listed.tasks) ? listed.tasks : [];
+      // 审查四⑧：200 但缺 tasks 数组（代理页、错误体、接口变形）不是「空清单」，而是查询失败
+      if (!listed || typeof listed !== "object" || !Array.isArray(listed.tasks)) {
+        const err = new Error("ClickUp 任务列表响应格式异常（缺少 tasks 数组）");
+        err.retryable = true;
+        err.inconclusive = true;
+        err.badShape = true;
+        throw err;
+      }
+      const tasks = listed.tasks;
       rememberTasks(tasks);
       all.push(...tasks);
       // Page size is not an API contract. Only an explicit last page (or an
@@ -488,6 +539,24 @@
     return null;
   }
 
+  function taskIndeterminate(cause, operationId) {
+    const err = new Error(
+      (cause ? redactSecrets(String(cause.message || cause)).slice(0, 160) + "；" : "") +
+        "新建 ClickUp 任务的结果尚未确认，只做核对、不会重复创建；这条打卡已保留"
+    );
+    err.code = "TASK_INDETERMINATE";
+    err.taskIndeterminate = true;
+    err.retryable = true;
+    err.taskOperationId = operationId || null;
+    return err;
+  }
+
+  /**
+   * 按标题找任务，找不到才新建（番茄打卡用）。
+   * 审查四⑦：新建任务的 POST 带稳定 marker，发出前先落盘「不确定」记录；
+   * 结果未知（传输失败、5xx、读正文失败、2xx 无 id）时记录保留，之后只按 marker 对账，
+   * 绝不自动重发。只有明确成功/明确拒绝才清掉记录。
+   */
   async function ensureTask(token, title, dueTs) {
     const key = normTitle(title);
     const hit = taskCache.get(key);
@@ -495,9 +564,32 @@
     const pending = ensureInflight.get(key);
     if (pending) return pending;
 
-    const work = (async () => {
+    // 同名建任务跨页串行：后到者在锁内能看到先到者的不确定记录或结果
+    const work = withLock("task:" + key, async () => {
       const again = taskCache.get(key);
       if (again && Date.now() - again.at < LIMITS.taskCacheMs) return again.id;
+
+      const pend = findPendingTask(key);
+      if (pend) {
+        let found = null;
+        try {
+          found = await findTaskByOpMarker(token, pend.operationId);
+        } catch (err) {
+          throw taskIndeterminate(err, pend.operationId);
+        }
+        if (!found || !found.id) {
+          const createdAt = Number(pend.createdAt);
+          if (!Number.isFinite(createdAt) || Date.now() - createdAt >= LIMITS.pendingRequeueGraceMs) {
+            await markPendingTaskManual(key);
+          }
+          throw taskIndeterminate(null, pend.operationId);
+        }
+        const id = String(found.id);
+        await clearPendingTask(key, pend.operationId);
+        taskCache.set(key, { id, at: Date.now() });
+        return id;
+      }
+
       const { tasks, exhausted } = await listTasksPages(token, {
         includeClosed: false,
         maxPages: MAX_LIST_PAGES,
@@ -513,22 +605,46 @@
       if (found && found.id) {
         id = String(found.id);
       } else {
-        const body = { name: title };
+        const operationId = newId("ptask-");
+        const body = {
+          name: title,
+          description: "从 Lumina Todo 番茄打卡创建\n" + opMarker(operationId),
+        };
         if (Number.isFinite(dueTs) && dueTs > 0) {
           body.due_date = dueTs;
           body.due_date_time = false;
         }
-        const made = await cu(token, "POST", "/list/" + listId() + "/task", body);
-        if (!made || !made.id) {
-          const err = new Error("ClickUp 创建任务未返回 id");
+        if (!(await upsertPendingTask({ key, operationId, title, createdAt: Date.now() }))) {
+          const err = new Error("无法保存新建任务的核对记录，已取消提交以避免重复创建");
+          err.code = "PENDING_WRITE_FAILED";
           err.retryable = true;
           throw err;
         }
+        let made;
+        try {
+          made = await cu(token, "POST", "/list/" + listId() + "/task", body);
+        } catch (err) {
+          if (isDefiniteRejection(err)) {
+            await clearPendingTask(key, operationId);
+            throw err;
+          }
+          // 结果未知：立刻按 marker 查一次，查到就用；查不到/查询失败都保留记录，不重发
+          let late = null;
+          try {
+            late = await findTaskByOpMarker(token, operationId);
+          } catch {
+            late = null;
+          }
+          if (!late || !late.id) throw taskIndeterminate(err, operationId);
+          made = late;
+        }
+        if (!made || !made.id) throw taskIndeterminate(new Error("ClickUp 创建任务未返回 id"), operationId);
         id = String(made.id);
+        await clearPendingTask(key, operationId);
       }
       taskCache.set(key, { id, at: Date.now() });
       return id;
-    })();
+    });
 
     ensureInflight.set(key, work);
     try {
@@ -566,8 +682,19 @@
       return [];
     }
   }
+  /** 只在 mutateStore 的同步临界区里调用 */
   function writeQueue(arr) {
     return storeSet(QUEUE_KEY, JSON.stringify(arr));
+  }
+  /** 队列读-改-写（全局 store 锁内）：fn(q) 改 q 并返回结果；返回 false 表示不写 */
+  function mutateQueue(fn, fallback = { ok: false, lock: true }) {
+    return mutateStore(() => {
+      const q = readQueue();
+      const r = fn(q);
+      if (r === false) return { ok: false, q };
+      if (!writeQueue(q)) return { ok: false, q, writeFailed: true };
+      return { ok: true, q, value: r };
+    }, fallback);
   }
   function readFailedQueue() {
     try {
@@ -580,7 +707,7 @@
   function writeFailedQueue(arr) {
     return storeSet(FAILED_QUEUE_KEY, JSON.stringify(arr));
   }
-  function recordFailed(item, result) {
+  function recordFailedSync(item, result) {
     const failed = readFailedQueue().filter((entry) => entry.queueId !== item.queueId);
     // 失败记录满了就拒绝写入：调用方会把这条留在队列里，而不是挤掉更早的失败记录
     if (failed.length >= MAX_FAILED) return false;
@@ -595,47 +722,49 @@
   }
   // 凭证类失败：换上新 token 后可以重试（旧版本会把缺 token 的离线记录误记为永久失败）
   const AUTH_FAILURE_CODES = new Set(["NO_TOKEN", "HTTP_401", "HTTP_403"]);
-  async function retryFailedQueue({ includeAuth = false } = {}) {
-    const failed = readFailedQueue();
-    if (!failed.length) return { restored: 0, left: 0 };
-    const queue = readQueue();
-    const ids = new Set(queue.map((entry) => entry.queueId));
-    const retryableCodes = new Set(["TIMEOUT", "REQUEST_FAILED", "QUEUE_WRITE_FAILED"]);
-    const keep = [];
-    let room = Math.max(0, MAX_QUEUE - queue.length);
-    const restore = failed
-      .filter((entry) => {
-        if (ids.has(entry.queueId)) return false;
-        const code = entry.failureCode || "REQUEST_FAILED";
-        const restorable =
-          (includeAuth && AUTH_FAILURE_CODES.has(code)) ||
-          (entry.failureRetryable !== false && retryableCodes.has(code));
-        // 队列放不下的留在失败记录里，下次再放回，不挤掉队列里的记录
-        if (!restorable || room <= 0) {
-          keep.push(entry);
-          return false;
-        }
-        room--;
-        return true;
-      })
-      .map((entry) => ({
-        queueId: entry.queueId || newQueueId(),
-        operationId: entry.operationId || newOpId(),
-        title: entry.title || "",
-        taskId: isClickUpTaskId(entry.taskId) ? entry.taskId : null,
-        minutes: entry.minutes,
-        endedAt: entry.endedAt,
-        tries: 0,
-        queuedAt: entry.queuedAt || Date.now(),
-      }));
-    if (!writeQueue(queue.concat(restore))) return { restored: 0, left: failed.length, error: "QUEUE_WRITE_FAILED" };
-    if (!writeFailedQueue(keep)) return { restored: 0, left: failed.length, error: "FAILED_QUEUE_WRITE_FAILED" };
-    return { restored: restore.length, left: keep.length };
+  function retryFailedQueue({ includeAuth = false } = {}) {
+    return mutateStore(() => {
+      const failed = readFailedQueue();
+      if (!failed.length) return { restored: 0, left: 0 };
+      const queue = readQueue();
+      const ids = new Set(queue.map((entry) => entry.queueId));
+      const retryableCodes = new Set(["TIMEOUT", "REQUEST_FAILED", "QUEUE_WRITE_FAILED"]);
+      const keep = [];
+      let room = Math.max(0, MAX_QUEUE - queue.length);
+      const restore = failed
+        .filter((entry) => {
+          if (ids.has(entry.queueId)) return false;
+          const code = entry.failureCode || "REQUEST_FAILED";
+          const restorable =
+            (includeAuth && AUTH_FAILURE_CODES.has(code)) ||
+            (entry.failureRetryable !== false && retryableCodes.has(code));
+          // 队列放不下的留在失败记录里，下次再放回，不挤掉队列里的记录
+          if (!restorable || room <= 0) {
+            keep.push(entry);
+            return false;
+          }
+          room--;
+          return true;
+        })
+        .map((entry) => ({
+          queueId: entry.queueId || newQueueId(),
+          operationId: entry.operationId || newOpId(),
+          title: entry.title || "",
+          taskId: isClickUpTaskId(entry.taskId) ? entry.taskId : null,
+          minutes: entry.minutes,
+          endedAt: entry.endedAt,
+          tries: 0,
+          queuedAt: entry.queuedAt || Date.now(),
+        }));
+      if (!writeQueue(queue.concat(restore))) return { restored: 0, left: failed.length, error: "QUEUE_WRITE_FAILED" };
+      if (!writeFailedQueue(keep)) return { restored: 0, left: failed.length, error: "FAILED_QUEUE_WRITE_FAILED" };
+      return { restored: restore.length, left: keep.length };
+    }, { restored: 0, left: readFailedQueue().length, error: "LOCK_UNAVAILABLE" });
   }
   function clearFailedQueue() {
-    return writeFailedQueue([]);
+    return mutateStore(() => writeFailedQueue([]));
   }
-  function enqueue(entry) {
+  function enqueueSync(entry) {
     const q = readQueue();
     if (q.length >= MAX_QUEUE) return false;
     q.push({
@@ -662,7 +791,7 @@
   function writePendingPushes(arr) {
     return storeSet(PENDING_PUSH_KEY, JSON.stringify(arr));
   }
-  function upsertPendingPush(entry) {
+  function upsertPendingPushSync(entry) {
     const list = readPendingPushes().filter((x) => x.operationId !== entry.operationId);
     if (list.length >= MAX_PENDING) return false;
     const rec = {
@@ -683,37 +812,46 @@
     list.push(rec);
     return writePendingPushes(list);
   }
+  function upsertPendingPush(entry) {
+    return mutateStore(() => upsertPendingPushSync(entry));
+  }
   function markPendingPushManual(operationId) {
-    const list = readPendingPushes();
-    const item = list.find((x) => x.operationId === operationId);
-    if (!item || item.needsManual) return Boolean(item);
-    item.needsManual = true;
-    return writePendingPushes(list);
+    return mutateStore(() => {
+      const list = readPendingPushes();
+      const item = list.find((x) => x.operationId === operationId);
+      if (!item || item.needsManual) return Boolean(item);
+      item.needsManual = true;
+      return writePendingPushes(list);
+    });
   }
   /**
    * 远端已有 taskId：先可靠写入「已创建」记录，成功后才清 pending；
    * 写失败就把 taskId 留在 pending，下次直接复用，绝不再 POST。
+   * 整段在 store 锁内：别页对其它 operationId 的写入不会把这条覆盖掉。
    */
   function settleCreatedPush(operationId, taskId, url, meta) {
-    if (rememberPushed(operationId, taskId, url)) {
-      clearPendingPush(operationId);
-      return true;
-    }
-    const prev = readPendingPushes().find((x) => x.operationId === operationId) || {};
-    upsertPendingPush({
-      operationId,
-      title: (meta && meta.title) || prev.title || "",
-      priority: (meta && meta.priority) || prev.priority || "",
-      dueDate: (meta && meta.dueDate) || prev.dueDate || null,
-      createdAt: prev.createdAt,
-      taskId,
-      url,
+    return mutateStore(() => {
+      if (rememberPushedSync(operationId, taskId, url)) {
+        writePendingPushes(readPendingPushes().filter((x) => x.operationId !== operationId));
+        return true;
+      }
+      const prev = readPendingPushes().find((x) => x.operationId === operationId) || {};
+      upsertPendingPushSync({
+        operationId,
+        title: (meta && meta.title) || prev.title || "",
+        priority: (meta && meta.priority) || prev.priority || "",
+        dueDate: (meta && meta.dueDate) || prev.dueDate || null,
+        createdAt: prev.createdAt,
+        taskId,
+        url,
+      });
+      return false;
     });
-    return false;
   }
   function clearPendingPush(operationId) {
-    const list = readPendingPushes().filter((x) => x.operationId !== operationId);
-    return writePendingPushes(list);
+    return mutateStore(() =>
+      writePendingPushes(readPendingPushes().filter((x) => x.operationId !== operationId))
+    );
   }
 
   /**
@@ -732,7 +870,7 @@
   function findPushedRecord(operationId) {
     return readPushedRecords().find((x) => x && x.operationId === operationId && isClickUpTaskId(x.taskId)) || null;
   }
-  function rememberPushed(operationId, taskId, url) {
+  function rememberPushedSync(operationId, taskId, url) {
     if (!operationId || !isClickUpTaskId(taskId)) return false;
     const list = readPushedRecords().filter((x) => x && x.operationId !== operationId);
     list.push({ operationId, taskId, url: url || null, at: Date.now() });
@@ -750,29 +888,56 @@
   function writePendingPomos(arr) {
     return storeSet(PENDING_POMO_KEY, JSON.stringify(arr));
   }
+  /** 已确认写入、只等队列项移除的回执（审查四⑥）：不算「待核对」 */
+  function isConfirmedPomo(item) {
+    return Boolean(item && item.state === "confirmed");
+  }
   function pendingPomosFull(operationId) {
     const list = readPendingPomos();
     return list.length >= MAX_PENDING && !list.some((item) => item.operationId === operationId);
   }
   function upsertPendingPomo(entry) {
-    const list = readPendingPomos().filter((item) => item.operationId !== entry.operationId);
-    if (list.length >= MAX_PENDING) return false;
-    // rev：每次写入换新版本号，清除时比对（compare-and-clear），旧快照清不掉新记录
-    list.push({ ...entry, createdAt: entry.createdAt || Date.now(), rev: newId("rev-") });
-    return writePendingPomos(list);
+    return mutateStore(() => {
+      const list = readPendingPomos().filter((item) => item.operationId !== entry.operationId);
+      if (list.length >= MAX_PENDING) return false;
+      // rev：每次写入换新版本号，清除时比对（compare-and-clear），旧快照清不掉新记录
+      list.push({ ...entry, createdAt: entry.createdAt || Date.now(), rev: newId("rev-") });
+      return writePendingPomos(list);
+    });
+  }
+  /**
+   * 审查四⑥：POST 成功后先把待核对记录改成「已确认」回执（同一把锁内落盘），
+   * 队列项移除成功后才清掉回执。回执在时任何重试都直接判成功，不依赖远端立即可见。
+   */
+  function markPendingPomoConfirmed(operationId, taskId) {
+    return mutateStore(() => {
+      const list = readPendingPomos();
+      const item = list.find((x) => x.operationId === operationId);
+      if (!item) return false;
+      item.state = "confirmed";
+      item.confirmedAt = Date.now();
+      if (taskId) item.confirmedTaskId = String(taskId);
+      item.rev = newId("rev-");
+      delete item.needsManual;
+      return writePendingPomos(list);
+    });
   }
   function markPendingPomoManual(operationId) {
-    const list = readPendingPomos();
-    const item = list.find((x) => x.operationId === operationId);
-    if (!item || item.needsManual) return Boolean(item);
-    item.needsManual = true;
-    return writePendingPomos(list);
+    return mutateStore(() => {
+      const list = readPendingPomos();
+      const item = list.find((x) => x.operationId === operationId);
+      if (!item || item.needsManual || isConfirmedPomo(item)) return Boolean(item);
+      item.needsManual = true;
+      return writePendingPomos(list);
+    });
   }
   function clearPendingPomo(operationId) {
-    return writePendingPomos(readPendingPomos().filter((item) => item.operationId !== operationId));
+    return mutateStore(() =>
+      writePendingPomos(readPendingPomos().filter((item) => item.operationId !== operationId))
+    );
   }
   /** 仅当当前记录仍是 expected 那一版时才清除；返回是否清掉 */
-  function clearPendingPomoIf(operationId, expectedRev) {
+  function clearPendingPomoIfSync(operationId, expectedRev) {
     const list = readPendingPomos();
     const cur = list.find((item) => item.operationId === operationId);
     if (!cur || (cur.rev ?? null) !== (expectedRev ?? null)) return false;
@@ -793,25 +958,65 @@
   }
   /**
    * 用户手动重试且查询已确认远端没有这条记录：按原 operationId 转入补发队列（绝不自动调用）。
-   * 先写队列再清 pending；队列里已有同 operationId 就只清 pending，不重复入队。
+   * 「比对版本 → 入队 → 清 pending」整段在 store 锁内一次完成。
    * 补发时 logPomodoro 会再预查一次，预查失败不会 POST。
    */
   function requeuePendingPomo(pending) {
-    // compare-and-clear：读到的这一版已被别的流程改写/清除（例如另一次重试已开始
-    // POST 并写入新 pending），就什么都不做——旧快照绝不能清掉新记录
-    const cur = currentPendingPomo(pending.operationId);
-    if (!cur || (cur.rev ?? null) !== (pending.rev ?? null)) return "stale";
-    const already = readQueue().some((item) => item.operationId === pending.operationId);
-    if (!already && !enqueue({
-      title: typeof pending.title === "string" ? pending.title : "",
-      taskId: pending.taskId,
-      minutes: pending.minutes,
-      endedAt: pending.endedAt,
-      operationId: pending.operationId,
-    })) {
-      return false;
+    return mutateStore(() => {
+      // compare-and-clear：读到的这一版已被别的流程改写/清除（例如另一次重试已开始
+      // POST 并写入新 pending），就什么都不做——旧快照绝不能清掉新记录
+      const cur = currentPendingPomo(pending.operationId);
+      if (!cur || (cur.rev ?? null) !== (pending.rev ?? null)) return "stale";
+      const already = readQueue().some((item) => item.operationId === pending.operationId);
+      if (!already && !enqueueSync({
+        title: typeof pending.title === "string" ? pending.title : "",
+        taskId: pending.taskId,
+        minutes: pending.minutes,
+        endedAt: pending.endedAt,
+        operationId: pending.operationId,
+      })) {
+        return false;
+      }
+      return clearPendingPomoIfSync(pending.operationId, pending.rev);
+    });
+  }
+
+  /* ---------- 审查四⑦：番茄打卡按标题新建任务的不确定记录 ---------- */
+  function readPendingTasks() {
+    try {
+      const arr = JSON.parse(storeGet(PENDING_TASK_KEY) || "[]");
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
     }
-    return clearPendingPomoIf(pending.operationId, pending.rev);
+  }
+  function findPendingTask(key) {
+    return readPendingTasks().find((x) => x && x.key === key) || null;
+  }
+  function upsertPendingTask(rec) {
+    return mutateStore(() => {
+      const list = readPendingTasks().filter((x) => x && x.key !== rec.key);
+      if (list.length >= MAX_PENDING) return false;
+      list.push(rec);
+      return storeSet(PENDING_TASK_KEY, JSON.stringify(list));
+    });
+  }
+  function markPendingTaskManual(key) {
+    return mutateStore(() => {
+      const list = readPendingTasks();
+      const item = list.find((x) => x && x.key === key);
+      if (!item || item.needsManual) return Boolean(item);
+      item.needsManual = true;
+      return storeSet(PENDING_TASK_KEY, JSON.stringify(list));
+    });
+  }
+  function clearPendingTask(key, operationId) {
+    return mutateStore(() => {
+      const list = readPendingTasks();
+      const next = list.filter((x) => !(x && x.key === key && (!operationId || x.operationId === operationId)));
+      if (next.length === list.length) return true;
+      return storeSet(PENDING_TASK_KEY, JSON.stringify(next));
+    });
   }
 
   function dayLabel(ts) {
@@ -933,11 +1138,16 @@
     });
     try {
       const data = await cu(token, "GET", "/team/" + teamId() + "/time_entries?" + q);
-      const entries = Array.isArray(data?.data)
-        ? data.data
-        : Array.isArray(data)
-          ? data
-          : [];
+      // 审查四⑧：缺 data 数组的 200 响应不能当作「查无」——否则会补发并清掉待核对
+      let entries;
+      if (Array.isArray(data?.data)) entries = data.data;
+      else if (Array.isArray(data)) entries = data;
+      else {
+        const err = new Error("ClickUp 时间记录响应格式异常（缺少 data 数组）");
+        err.retryable = true;
+        err.badShape = true;
+        throw err;
+      }
       for (const e of entries) {
         const desc = typeof e?.description === "string" ? e.description : "";
         if (desc.includes(marker) || extractOpId(desc) === operationId) return e;
@@ -959,12 +1169,37 @@
     });
   }
 
+  /**
+   * 审查四⑥：远端已确认有这条打卡。在 store 锁内把待核对记录改成「已确认」回执；
+   * 队列里没有同 operationId 的补发项时顺手清掉回执（同一临界区，原子）。
+   * 有队列项时回执保留，直到 flush 把队列项移除成功（同一临界区里一起清）。
+   */
+  function confirmPomo(operationId, taskId) {
+    return mutateStore(() => {
+      const list = readPendingPomos();
+      const item = list.find((x) => x.operationId === operationId);
+      const queued = readQueue().some((x) => x.operationId === operationId);
+      if (!queued) {
+        if (!item) return true;
+        return writePendingPomos(list.filter((x) => x !== item));
+      }
+      const rec = item || { operationId, createdAt: Date.now() };
+      rec.state = "confirmed";
+      rec.confirmedAt = Date.now();
+      if (taskId) rec.confirmedTaskId = String(taskId);
+      rec.rev = newId("rev-");
+      delete rec.needsManual;
+      if (!item) list.push(rec);
+      return writePendingPomos(list);
+    });
+  }
+
   /** A timeout/5xx can be committed remotely after the client loses the reply. */
   async function settleUncertainPomo(token, { start, duration, operationId, taskId, name, minutes, noQueue, cause }) {
     try {
       const hit = await findTimeEntryByOpMarker(token, start, duration, operationId);
       if (hit) {
-        clearPendingPomo(operationId);
+        await confirmPomo(operationId, hit.task?.id || taskId);
         if (!noQueue) flushQueue().catch(() => {});
         return {
           ok: true,
@@ -990,17 +1225,49 @@
     };
   }
 
+  function lockUnavailableResult(operationId, extra) {
+    return {
+      ok: false,
+      code: "LOCK_UNAVAILABLE",
+      error: "当前环境没有可靠的跨页面锁，为避免重复提交已暂停自动提交；记录已保留，换到 App 或新版浏览器后会继续",
+      retryable: true,
+      operationId,
+      queued: false,
+      ...(extra || {}),
+    };
+  }
+
   /**
    * 同一 operationId 的打卡（队列补发、手动重试、别页同段打卡）跨页面串行：
    * 后到者在锁内预查时能看到先到者的结果或 pending，不会两边同时 POST。
+   * 审查四④：拿不到可靠的跨页锁就不提交（新打卡尽量放进本地队列，等有锁时再补）。
    */
-  function logPomodoro(opts) {
-    const op =
+  async function logPomodoro(opts) {
+    const callerOp =
       typeof opts?.operationId === "string" && /^[A-Za-z0-9._:-]{6,80}$/.test(opts.operationId)
         ? opts.operationId
         : null;
-    if (!op) return logPomodoroImpl(opts);
-    return withLock("pomo-op:" + op, () => logPomodoroImpl(opts));
+    const op = callerOp || newOpId();
+    try {
+      return await withLock("pomo-op:" + op, () => logPomodoroImpl({ ...(opts || {}), __opId: op }));
+    } catch (err) {
+      if (!isLockUnavailable(err)) throw err;
+      if (opts && opts.__noQueue) return lockUnavailableResult(op);
+      // 新打卡：没锁也先把记录留在本地队列（不提交）。队列写入同样需要锁，写不进去就如实告知
+      const mins = Math.round(Number(opts && opts.minutes));
+      if (!Number.isFinite(mins) || mins <= 0 || mins > LIMITS.maxMinutes) {
+        return { ok: false, code: "BAD_ARGS", error: "minutes 不合法", retryable: false };
+      }
+      let endedAt = Number(opts && opts.endedAt);
+      if (!Number.isFinite(endedAt) || endedAt <= 0) endedAt = Date.now();
+      return enqueuePomoResult(lockUnavailableResult(op), {
+        title: cleanTaskTitle(opts && opts.title),
+        taskId: isClickUpTaskId(opts && opts.taskId) ? opts.taskId : null,
+        minutes: mins,
+        endedAt,
+        operationId: op,
+      });
+    }
   }
 
   async function logPomodoroImpl(opts) {
@@ -1047,26 +1314,49 @@
       typeof opts?.operationId === "string" && /^[A-Za-z0-9._:-]{6,80}$/.test(opts.operationId)
         ? opts.operationId
         : null;
-    const operationId = newOpId(callerOpId);
+    const operationId = newOpId(callerOpId || opts?.__opId);
     const noQueue = Boolean(opts && opts.__noQueue);
     const failPayload = (err) => ({
       ok: false,
-      code: isTimeoutError(err)
-        ? "TIMEOUT"
-        : Number.isFinite(err?.status) && err.status >= 400 && err.status < 500
-          ? "HTTP_" + err.status
-          : "REQUEST_FAILED",
+      code: err?.taskIndeterminate
+        ? "TASK_INDETERMINATE"
+        : isLockUnavailable(err)
+          ? "LOCK_UNAVAILABLE"
+          : err?.code === "PENDING_WRITE_FAILED"
+            ? "PENDING_WRITE_FAILED"
+            : isTimeoutError(err)
+              ? "TIMEOUT"
+              : Number.isFinite(err?.status) && err.status >= 400 && err.status < 500
+                ? "HTTP_" + err.status
+                : "REQUEST_FAILED",
       error: redactSecrets(String((err && err.message) || err)).slice(0, 300),
       retryable: err && err.retryable === false ? false : true,
       operationId,
     });
+
+    if (callerOpId) {
+      // 审查四⑥：本机已有「已确认」回执 → 远端肯定有这条，直接判成功，不依赖远端立即可见
+      const receipt = currentPendingPomo(operationId);
+      if (isConfirmedPomo(receipt)) {
+        if (!noQueue) await confirmPomo(operationId, receipt.confirmedTaskId);
+        return {
+          ok: true,
+          taskId: receipt.confirmedTaskId || knownTaskId,
+          name,
+          minutes: mins,
+          deduped: true,
+          localReceipt: true,
+          operationId,
+        };
+      }
+    }
 
     // A random id created for a brand-new request cannot be found remotely.
     // Preflight only when the caller supplied a stable retry/idempotency key.
     if (callerOpId) try {
       const existing = await findTimeEntryByOpMarker(token, start, duration, operationId);
       if (existing) {
-        clearPendingPomo(operationId);
+        if (hasPendingPomo(operationId)) await confirmPomo(operationId, existing.task?.id || existing.tid);
         if (!noQueue) flushQueue().catch(() => {});
         return {
           ok: true,
@@ -1090,7 +1380,7 @@
       }
       // 过了宽限期仍查无：不能证明原请求不会再提交，不自动补发，交给用户手动重试
       if (pendingAge !== null) {
-        markPendingPomoManual(operationId);
+        await markPendingPomoManual(operationId);
         return {
           ok: false,
           code: "NEEDS_MANUAL_RETRY",
@@ -1128,9 +1418,9 @@
     let pendingPomo = false;
     try {
       const tid = knownTaskId || (await ensureTask(token, name, endedAt));
-      if (!upsertPendingPomo({
+      if (!(await upsertPendingPomo({
         operationId, title: clean, taskId: knownTaskId, minutes: mins, endedAt, start, duration,
-      })) {
+      }))) {
         return {
           ok: false,
           code: "PENDING_WRITE_FAILED",
@@ -1158,7 +1448,7 @@
             }
             throw retryErr;
           }
-          clearPendingPomo(operationId);
+          await confirmPomo(operationId, tid2);
           if (!noQueue) flushQueue().catch(() => {});
           return { ok: true, taskId: tid2, name, minutes: mins, retried: true, operationId };
         }
@@ -1170,11 +1460,12 @@
         }
         throw err;
       }
+      // 审查四⑥：先落「已确认」回执（有队列项时保留到队列项移除成功），再返回成功
+      await confirmPomo(operationId, tid);
       if (!noQueue) flushQueue().catch(() => {});
-      clearPendingPomo(operationId);
       return { ok: true, taskId: tid, name, minutes: mins, operationId };
     } catch (err) {
-      if (pendingPomo) clearPendingPomo(operationId);
+      if (pendingPomo) await clearPendingPomo(operationId);
       const result = failPayload(err);
       // 仅明确可重试且非 INDETERMINATE 时入队；入队复用 operationId
       if (!noQueue && result.retryable && result.code !== "INDETERMINATE") {
@@ -1191,56 +1482,34 @@
   }
 
   /** 入队并给出明确结果：队列满或写失败都要如实告诉调用方，不能显示「已入队」 */
-  function enqueuePomoResult(result, entry) {
-    const full = readQueue().length >= MAX_QUEUE;
-    if (full || !enqueue(entry)) {
+  async function enqueuePomoResult(result, entry) {
+    const r = await mutateStore(() => {
+      if (readQueue().length >= MAX_QUEUE) return "full";
+      return enqueueSync(entry) ? "ok" : "write";
+    }, "lock");
+    if (r !== "ok") {
       return {
         ...result,
-        code: full ? "QUEUE_FULL" : "QUEUE_WRITE_FAILED",
+        code: r === "full" ? "QUEUE_FULL" : r === "lock" ? "LOCK_UNAVAILABLE" : "QUEUE_WRITE_FAILED",
         retryable: false,
         queued: false,
-        error: full
-          ? result.error + "；离线队列已满（" + MAX_QUEUE + " 条），这条记录未保存"
-          : result.error + "；离线队列写入失败，记录未保存",
+        error:
+          r === "full"
+            ? result.error + "；离线队列已满（" + MAX_QUEUE + " 条），这条记录未保存"
+            : r === "lock"
+              ? "当前环境没有可靠的跨页面锁，无法安全保存或提交这条打卡（记录未保存）"
+              : result.error + "；离线队列写入失败，记录未保存",
       };
     }
     return { ...result, queued: true };
   }
 
-  function readPushLease(operationId) {
-    try {
-      const v = JSON.parse(storeGet(PUSH_LEASE_PREFIX + operationId) || "null");
-      return v && typeof v === "object" ? v : null;
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * 跨标签页租约（localStorage，带过期）：同一 operationId 已被别的页面持有且未过期时拒绝。
-   * 写入后回读校验 token，两页同时抢占时至多一方拿到。返回租约 token 或 null。
-   * 存储不可用时放行：pending 写不进去，后续本来就会中止提交。
-   */
-  function acquirePushLease(operationId) {
-    const now = Date.now();
-    const cur = readPushLease(operationId);
-    if (cur && cur.owner !== PAGE_ID && Number(cur.exp) > now) return null;
-    const token = newId("lease-");
-    if (!storeSet(PUSH_LEASE_PREFIX + operationId, JSON.stringify({ owner: PAGE_ID, token, exp: now + LIMITS.pushLeaseMs }))) {
-      return "unstored";
-    }
-    const back = readPushLease(operationId);
-    return back && back.token === token ? token : null;
-  }
-  function releasePushLease(operationId, token) {
-    if (!token || token === "unstored") return;
-    const cur = readPushLease(operationId);
-    if (cur && cur.token === token) storeRemove(PUSH_LEASE_PREFIX + operationId);
-  }
-
   /**
    * 上传待办。同一 operationId（同一待办）：
    * - 同页并发调用共享同一次执行（single-flight）；
-   * - 跨标签页靠 localStorage 租约互斥，另一页正在上传时直接返回 BUSY。
+   * - 跨页靠 Web Lock 原子互斥，另一页正在上传时直接返回 BUSY；
+   * - 审查四④：没有可靠跨页锁（且不是单 WebView 的 App）时不提交，返回可重试的 LOCK_UNAVAILABLE。
+   *   不再用 localStorage 租约兜底（写后回读不是原子操作）。
    */
   function pushTodo(opts) {
     const opHint =
@@ -1256,20 +1525,12 @@
       retryable: true,
       operationId,
     });
-    // 「查询 → 创建 → 确认落盘」整段持有 Web Lock（原子、跨页面、崩溃自动释放）；
-    // 锁内仍写 localStorage 租约：不支持 Web Locks 的环境靠它兜底，也让旧版本页面看得见
+    // 「查询 → 创建 → 确认落盘」整段持有锁（原子、跨页面、崩溃自动释放）
     const p = withLockIfAvailable(
       "push:" + operationId,
-      async () => {
-        const lease = acquirePushLease(operationId);
-        if (!lease) return busy();
-        try {
-          return await pushTodoImpl(opts, operationId, operationId === opHint);
-        } finally {
-          releasePushLease(operationId, lease);
-        }
-      },
-      busy
+      () => pushTodoImpl(opts, operationId, operationId === opHint),
+      busy,
+      () => lockUnavailableResult(operationId)
     );
     pushInflight.set(operationId, p);
     p.finally(() => {
@@ -1297,10 +1558,10 @@
     const pendingPush = readPendingPushes().find((x) => x.operationId === operationId) || null;
     const hadPending = Boolean(pendingPush);
     const meta = { title: clean, priority: opts && opts.priority, dueDate: opts && opts.dueDate };
-    const recovered = (taskId, rawUrl, extra) => {
+    const recovered = async (taskId, rawUrl, extra) => {
       const url = safeClickUpTaskUrl(rawUrl, taskId);
       taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
-      settleCreatedPush(operationId, taskId, url, meta);
+      await settleCreatedPush(operationId, taskId, url, meta);
       return {
         ok: true,
         taskId,
@@ -1371,7 +1632,7 @@
           };
         }
         if (!manualRetry) {
-          markPendingPushManual(operationId);
+          await markPendingPushManual(operationId);
           return {
             ok: false,
             code: "NEEDS_MANUAL_RETRY",
@@ -1412,13 +1673,13 @@
         body.due_date_time = false;
       }
 
-      if (!upsertPendingPush({
+      if (!(await upsertPendingPush({
         operationId,
         title: clean,
         priority: opts && opts.priority,
         dueDate: opts && opts.dueDate,
         state: "indeterminate",
-      })) {
+      }))) {
         const full = readPendingPushes().filter((x) => x.operationId !== operationId).length >= MAX_PENDING;
         return {
           ok: false,
@@ -1462,7 +1723,7 @@
             };
           }
         }
-        clearPendingPush(operationId);
+        await clearPendingPush(operationId);
         throw err;
       }
 
@@ -1480,7 +1741,7 @@
       const url = safeClickUpTaskUrl(made.url, taskId);
       taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
       // 「已创建」记录可靠落盘后才清 pending；写失败时 taskId 留在 pending，重传直接复用
-      const durable = settleCreatedPush(operationId, taskId, url, meta);
+      const durable = await settleCreatedPush(operationId, taskId, url, meta);
       return {
         ok: true,
         taskId,
@@ -1513,10 +1774,19 @@
       token = null;
     }
     if (!token) return { flushed: 0, left: q.length, paused: "NO_TOKEN" };
-    if (!writeQueue(q)) {
-      return { flushed: 0, left: q.length, error: "QUEUE_WRITE_FAILED" };
+    // 写探测（也把缺 queueId/operationId 的旧记录固化下来）
+    const probe = await mutateQueue(() => true);
+    if (!probe.ok) {
+      return { flushed: 0, left: readQueue().length, error: probe.lock ? "LOCK_UNAVAILABLE" : "QUEUE_WRITE_FAILED" };
     }
+    q = probe.q;
     let flushed = 0;
+    /** 队列写失败时如实报告「盘上真实剩余」（审查四⑥：别用已在内存里删掉一项的数组算） */
+    const writeFail = (res) => ({
+      flushed,
+      left: readQueue().length,
+      error: res && res.lock ? "LOCK_UNAVAILABLE" : "QUEUE_WRITE_FAILED",
+    });
     while (q.length) {
       const item = q[0];
       const queueId = item.queueId;
@@ -1534,25 +1804,50 @@
       if (index < 0) continue;
 
       if (r.ok) {
-        q.splice(index, 1);
-        if (!writeQueue(q)) {
-          return { flushed, left: q.length, error: "QUEUE_WRITE_FAILED" };
+        // 审查四⑥：队列项移除与「已确认」回执清除在同一 store 临界区内完成；
+        // 队列写失败时回执保留，下一轮直接按回执判成功，不会因远端暂不可见而重 POST
+        const res = await mutateQueue((qq) => {
+          const i = qq.findIndex((x) => x.queueId === queueId);
+          if (i < 0) return "gone";
+          const op = qq[i].operationId;
+          qq.splice(i, 1);
+          return op;
+        });
+        if (!res.ok) return writeFail(res);
+        const op = res.value;
+        if (op && op !== "gone" && !res.q.some((x) => x.operationId === op)) {
+          await mutateStore(() => {
+            const list = readPendingPomos();
+            const cur = list.find((x) => x.operationId === op);
+            if (!isConfirmedPomo(cur)) return true;
+            return writePendingPomos(list.filter((x) => x !== cur));
+          });
         }
+        q = res.q;
         flushed++;
         continue;
       }
       // INDETERMINATE：保留队列项但不增加 tries 的盲目重 POST；等下次能查询时 dedupe
       // PENDING_FULL：待核对记录满了，等对账消化后再发
-      if (r.code === "INDETERMINATE" || r.code === "PENDING_FULL") {
+      // TASK_INDETERMINATE：新建任务结果未知，只对账不重建（审查四⑦）
+      // LOCK_UNAVAILABLE：没有可靠跨页锁，暂停
+      if (
+        r.code === "INDETERMINATE" ||
+        r.code === "PENDING_FULL" ||
+        r.code === "TASK_INDETERMINATE" ||
+        r.code === "LOCK_UNAVAILABLE"
+      ) {
         break;
       }
       // 长时间未确认：待核对记录（含完整打卡信息）接管这条，等用户手动重试；
       // 队列项移除，免得它把后面的记录永远堵住
       if (r.code === "NEEDS_MANUAL_RETRY") {
-        q.splice(index, 1);
-        if (!writeQueue(q)) {
-          return { flushed, left: q.length, error: "QUEUE_WRITE_FAILED" };
-        }
+        const res = await mutateQueue((qq) => {
+          const i = qq.findIndex((x) => x.queueId === queueId);
+          if (i >= 0) qq.splice(i, 1);
+        });
+        if (!res.ok) return writeFail(res);
+        q = res.q;
         continue;
       }
       // 凭证缺失/失效不是这条记录的错：整队暂停，不消耗重试次数、不移入失败记录
@@ -1560,19 +1855,28 @@
         return { flushed, left: q.length, paused: r.code };
       }
       if (!r.retryable || (item.tries || 0) >= MAX_TRIES) {
-        if (!recordFailed(item, r)) {
-          return { flushed, left: q.length, error: "FAILED_QUEUE_WRITE_FAILED" };
+        const res = await mutateStore(() => {
+          const qq = readQueue();
+          const i = qq.findIndex((x) => x.queueId === queueId);
+          if (i < 0) return { ok: true, q: qq };
+          if (!recordFailedSync(qq[i], r)) return { ok: false, failed: true, q: qq };
+          qq.splice(i, 1);
+          if (!writeQueue(qq)) return { ok: false, q: qq };
+          return { ok: true, q: qq };
+        }, { ok: false, lock: true });
+        if (!res.ok) {
+          if (res.failed) return { flushed, left: readQueue().length, error: "FAILED_QUEUE_WRITE_FAILED" };
+          return writeFail(res);
         }
-        q.splice(index, 1);
-        if (!writeQueue(q)) {
-          return { flushed, left: q.length, error: "QUEUE_WRITE_FAILED" };
-        }
+        q = res.q;
         continue;
       }
-      q[index].tries = (q[index].tries || 0) + 1;
-      if (!writeQueue(q)) {
-        return { flushed, left: q.length, error: "QUEUE_WRITE_FAILED" };
-      }
+      const res = await mutateQueue((qq) => {
+        const i = qq.findIndex((x) => x.queueId === queueId);
+        if (i >= 0) qq[i].tries = (qq[i].tries || 0) + 1;
+      });
+      if (!res.ok) return writeFail(res);
+      q = res.q;
       break;
     }
     return { flushed, left: q.length };
@@ -1581,6 +1885,10 @@
   function countManual(list) {
     return list.filter((x) => x && x.needsManual).length;
   }
+  /** 需要用户处理/仍待核对的打卡（不含「已确认」回执） */
+  function openPendingPomos() {
+    return readPendingPomos().filter((x) => !isConfirmedPomo(x));
+  }
 
   /**
    * Uncertain time-entry posts are never replayed automatically. Each pass
@@ -1588,17 +1896,30 @@
    * period only flags it for the user (an empty lookup does not prove the
    * original request will never commit). A failed lookup leaves everything untouched.
    */
-  function reconcilePendingPomos() {
-    return withLock("pomo-pending", reconcilePendingPomosImpl);
+  async function reconcilePendingPomos() {
+    try {
+      return await withLock("pomo-pending", reconcilePendingPomosImpl);
+    } catch (err) {
+      if (!isLockUnavailable(err)) throw err;
+      const left = openPendingPomos();
+      return { reconciled: 0, requeued: 0, needsManual: countManual(left), left: left.length, code: "LOCK_UNAVAILABLE" };
+    }
   }
   async function reconcilePendingPomosImpl() {
+    // 「已确认」回执：队列里已没有对应补发项的直接清掉（队列移除成功后清回执失败的残留）
+    await mutateStore(() => {
+      const list = readPendingPomos();
+      const queued = new Set(readQueue().map((x) => x.operationId));
+      const next = list.filter((x) => !(isConfirmedPomo(x) && !queued.has(x.operationId)));
+      return next.length === list.length ? true : writePendingPomos(next);
+    });
     const token = await readToken();
     if (!token) {
-      const list = readPendingPomos();
+      const list = openPendingPomos();
       return { reconciled: 0, requeued: 0, needsManual: countManual(list), left: list.length };
     }
     let reconciled = 0;
-    for (const pending of readPendingPomos()) {
+    for (const pending of openPendingPomos()) {
       try {
         const hit = await findTimeEntryByOpMarker(
           token,
@@ -1607,18 +1928,18 @@
           pending.operationId
         );
         if (hit) {
-          clearPendingPomo(pending.operationId);   // 远端已有这条：任何版本的 pending 都可清
+          await confirmPomo(pending.operationId, hit.task?.id);   // 远端已有这条：任何版本的 pending 都可了结
           reconciled++;
         } else if (
           Date.now() - (Number(pending.createdAt) || Date.now()) >= LIMITS.pendingRequeueGraceMs
         ) {
-          markPendingPomoManual(pending.operationId);
+          await markPendingPomoManual(pending.operationId);
         }
       } catch {
         break;
       }
     }
-    const left = readPendingPomos();
+    const left = openPendingPomos();
     return { reconciled, requeued: 0, needsManual: countManual(left), left: left.length };
   }
 
@@ -1626,15 +1947,26 @@
    * 用户手动重试长时间未确认的打卡：再查一次 marker，查到就清掉；明确查无才按原
    * operationId 转入补发队列并立即补传。查询失败什么都不动。
    * operationIds 省略时处理所有已过宽限期的待核对记录。
+   * 审查四⑨：single-flight 只合并「同一组过滤条件」的重叠调用；不同过滤条件各自排队
+   * （都在 pomo-pending 锁上串行），不会被吞掉。
    */
-  let retryPendingInflight = null;
+  const retryPendingInflight = new Map();
+  function retryFilterKey(operationIds) {
+    if (!Array.isArray(operationIds) || !operationIds.length) return "*";
+    return JSON.stringify(Array.from(new Set(operationIds.map(String))).sort());
+  }
   function retryPendingPomos(operationIds) {
-    // 本页 single-flight：重叠点击共享同一次执行（不只依赖按钮禁用）
-    if (retryPendingInflight) return retryPendingInflight;
-    const p = withLock("pomo-pending", () => retryPendingPomosImpl(operationIds));
-    retryPendingInflight = p;
+    const key = retryFilterKey(operationIds);
+    const running = retryPendingInflight.get(key);
+    if (running) return running;
+    const p = withLock("pomo-pending", () => retryPendingPomosImpl(operationIds)).catch((err) => {
+      if (!isLockUnavailable(err)) throw err;
+      const left = openPendingPomos();
+      return { ok: false, code: "LOCK_UNAVAILABLE", reconciled: 0, requeued: 0, needsManual: countManual(left), left: left.length };
+    });
+    retryPendingInflight.set(key, p);
     p.finally(() => {
-      if (retryPendingInflight === p) retryPendingInflight = null;
+      if (retryPendingInflight.get(key) === p) retryPendingInflight.delete(key);
     }).catch(() => {});
     return p;
   }
@@ -1642,15 +1974,34 @@
   async function retryPendingPomosImpl(operationIds) {
     const token = await readToken();
     const only = Array.isArray(operationIds) && operationIds.length ? new Set(operationIds) : null;
-    if (!token) return { ok: false, code: "NO_TOKEN", reconciled: 0, requeued: 0, left: readPendingPomos().length };
+    if (!token) return { ok: false, code: "NO_TOKEN", reconciled: 0, requeued: 0, left: openPendingPomos().length };
     let reconciled = 0;
     let requeued = 0;
     let error = null;
-    for (const listed of readPendingPomos()) {
+    // 审查四⑦：用户手动重试时一并处理「新建任务结果未知」的记录：查到就采用；
+    // 过了宽限期且明确查无，才在用户授权下放行重新创建
+    if (!only) {
+      for (const pt of readPendingTasks()) {
+        const aged = Date.now() - (Number(pt.createdAt) || 0) >= LIMITS.pendingRequeueGraceMs;
+        if (!pt.needsManual && !aged) continue;
+        let found;
+        try {
+          found = await findTaskByOpMarker(token, pt.operationId);
+        } catch {
+          error = "LOOKUP_FAILED";
+          break;
+        }
+        if (found && found.id) taskCache.set(pt.key, { id: String(found.id), at: Date.now() });
+        await clearPendingTask(pt.key, pt.operationId);
+        reconciled += found && found.id ? 1 : 0;
+        requeued += found && found.id ? 0 : 1;   // 队列里等着它的打卡随后的 flush 会重新建任务
+      }
+    }
+    for (const listed of error ? [] : openPendingPomos()) {
       if (only && !only.has(listed.operationId)) continue;
       // 每条都按最新存储重新读取：之前的 await 期间它可能已被别的流程改写
       const pending = currentPendingPomo(listed.operationId);
-      if (!pending) continue;
+      if (!pending || isConfirmedPomo(pending)) continue;
       const aged = Date.now() - (Number(pending.createdAt) || Date.now()) >= LIMITS.pendingRequeueGraceMs;
       if (!pending.needsManual && !aged) continue;
       let hit;
@@ -1661,11 +2012,11 @@
         break;
       }
       if (hit) {
-        clearPendingPomo(pending.operationId);
+        await confirmPomo(pending.operationId, hit.task?.id);
         reconciled++;
         continue;
       }
-      const r = requeuePendingPomo(pending);   // compare-and-clear：版本变了就跳过
+      const r = await requeuePendingPomo(pending);   // compare-and-clear：版本变了就跳过
       if (r === "stale") continue;
       if (r) requeued++;
       else {
@@ -1681,7 +2032,7 @@
         flush = null;
       }
     }
-    const left = readPendingPomos();
+    const left = openPendingPomos();
     return { ok: !error, code: error, reconciled, requeued, flush, needsManual: countManual(left), left: left.length };
   }
 
@@ -1694,6 +2045,7 @@
     const list = readPendingPushes();
     if (!token || !list.length) return { reconciled: 0, left: list.length };
     let reconciled = 0;
+    let lockMissing = false;
     for (const pending of list) {
       // 正在上传（本页 single-flight 或别页持锁）的条目由上传流程自己收尾，对账跳过
       if (pushInflight.has(pending.operationId)) continue;
@@ -1707,30 +2059,34 @@
         () => {
           busy = true;
           return false;
+        },
+        () => {
+          lockMissing = true;
+          return true;
         }
       );
       if (busy) continue;
       if (stop) break;
     }
     const left = readPendingPushes();
-    return { reconciled, needsManual: countManual(left), left: left.length };
+    return { reconciled, needsManual: countManual(left), left: left.length, ...(lockMissing ? { code: "LOCK_UNAVAILABLE" } : {}) };
   }
   async function reconcileOnePush(token, listed) {
     const pending = readPendingPushes().find((x) => x.operationId === listed.operationId);
     if (!pending) return "skip";
     // 已知 taskId（只差「已创建」记录落盘）：重试落盘，不查不建
     if (isClickUpTaskId(pending.taskId)) {
-      return settleCreatedPush(pending.operationId, pending.taskId, pending.url) ? "reconciled" : "skip";
+      return (await settleCreatedPush(pending.operationId, pending.taskId, pending.url)) ? "reconciled" : "skip";
     }
     try {
       const found = await findTaskByOpMarker(token, pending.operationId);
       if (found && found.id) {
         const taskId = String(found.id);
-        settleCreatedPush(pending.operationId, taskId, safeClickUpTaskUrl(found.url, taskId));
+        await settleCreatedPush(pending.operationId, taskId, safeClickUpTaskUrl(found.url, taskId));
         return "reconciled";
       }
       if (Date.now() - (Number(pending.createdAt) || Date.now()) >= LIMITS.pendingRequeueGraceMs) {
-        markPendingPushManual(pending.operationId);
+        await markPendingPushManual(pending.operationId);
       }
       return "skip";
     } catch {
@@ -1741,9 +2097,14 @@
   function flushQueue() {
     if (flushPromise) return flushPromise;
     // 与自动对账、手动重试共用 pomo-pending 锁：补发与「清除待核对」绝不交错
-    flushPromise = withLock("pomo-pending", flushQueueImpl).finally(() => {
-      flushPromise = null;
-    });
+    flushPromise = withLock("pomo-pending", flushQueueImpl)
+      .catch((err) => {
+        if (!isLockUnavailable(err)) throw err;
+        return { flushed: 0, left: readQueue().length, paused: "LOCK_UNAVAILABLE" };
+      })
+      .finally(() => {
+        flushPromise = null;
+      });
     return flushPromise;
   }
 
@@ -1763,8 +2124,11 @@
       queue: readQueue().length,
       failed: readFailedQueue().length,
       pendingPush: readPendingPushes().length,
-      pendingPomo: readPendingPomos().length,
-      pendingManual: countManual(readPendingPushes()) + countManual(readPendingPomos()),
+      pendingPomo: openPendingPomos().length,
+      pendingTask: readPendingTasks().length,
+      pendingManual:
+        countManual(readPendingPushes()) + countManual(openPendingPomos()) + countManual(readPendingTasks()),
+      lockMode: lockManager() ? "web-locks" : singleWebView() ? "single-webview" : "unavailable",
       queueCorrupt: Boolean(storeGet(CORRUPT_QUEUE_KEY)),
       secureBackend: secure()?.backend?.() || "localStorage",
     };
