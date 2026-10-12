@@ -281,7 +281,7 @@
         for (const it of pv.list) {
           const opt = document.createElement("option");
           opt.value = it.id;
-          opt.textContent = `${it.label}（${it.model}）`;
+          opt.textContent = it.label;
           providerSel.appendChild(opt);
         }
         providerSel.value = pv.current;
