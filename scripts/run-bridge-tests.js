@@ -94,8 +94,9 @@ function baseSandbox(store, fetchImpl) {
   return sandbox;
 }
 
-function loadClickup(store, fetchImpl, { timeoutCapMs, navigator, native } = {}) {
-  const sandbox = baseSandbox(store, fetchImpl);
+function loadClickup(store, fetchImpl, { timeoutCapMs, navigator, native, rawFetch } = {}) {
+  // 旧替身补上任务详情端点（审查六④ 复用 id 前回查）；rawFetch:true 时原样使用
+  const sandbox = baseSandbox(store, rawFetch ? fetchImpl : withTaskDetail(fetchImpl));
   if (navigator) sandbox.navigator = navigator;
   // 默认模拟 iOS App（Capacitor 原生壳只有一个 WebView：本页互斥即全局互斥）；
   // 跨标签页场景要显式传 navigator.locks，或 native:false 模拟没有可靠锁的浏览器
@@ -111,6 +112,8 @@ function loadClickup(store, fetchImpl, { timeoutCapMs, navigator, native } = {})
   vm.runInContext(fs.readFileSync(path.join(WWW, "js/mobile-clickup.js"), "utf8"), sandbox);
   return { sandbox, api: sandbox.LUMINA_MOBILE_CLICKUP, secure: sandbox.LUMINA_SECURE_STORE };
 }
+
+const { withTaskDetail } = require("./clickup-task-detail-shim");
 
 function loadBridge(store, fetchImpl) {
   const sandbox = baseSandbox(store, fetchImpl);
@@ -3262,10 +3265,315 @@ async function main() {
       assert.equal((await t2.status()).pendingTask, 0);
     } else {
       assert.equal((await t1.status()).pendingTask, 1, "映射写不进去：建任务的 pending 必须保留");
-      assert.equal(r2.ok, false, "映射缺失 + pending 在：只对账，不建");
+      // 审查六③：pending 里带着已知 taskId → 另一页直接了结并记到同一任务上，仍不重建
+      assert.equal(r2.ok, true, "映射缺失 + pending 带已知 taskId：直接复用，不建");
+      assert.deepEqual(st.entryTids, ["task-d-1", "task-d-1"]);
     }
   }
   ok("审查五 D 按标题建任务的 taskId 持久化（账号+清单+标题）；映射落盘后才清 pending，另一页不重建");
+
+  /* ======================= Linear 复审第六轮回归 ======================= */
+
+  /* ---- 审查六① 撤销未落盘的删除：远端在删除后改过 → 恢复远端最新版，绝不写回历史快照 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Original" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);   // 写盘失败 → 脏窗口
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "REMOTE EDIT", priority: "high" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.ok(dx, `${deliverEvent}：撤销删除后条目回来`);
+    assert.equal(dx.text, "REMOTE EDIT", `${deliverEvent}：撤销删除不得把历史快照写回盘盖掉远端编辑`);
+    assert.equal(dx.priority, "high", `${deliverEvent}：远端其它字段编辑保留`);
+  }
+  {
+    // 批量清除已完成（同一删除类逆操作）：远端在清除后改过其中一条 → 恢复远端最新版
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Done original" }).todo;
+    assert.equal(A.invoke("complete_todo", { id: x.id }).ok, true);
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("clear_completed").ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "Done remote" }).ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.ok(dx && dx.completed, "批量清除撤销后条目回来且仍是已完成");
+    assert.equal(dx.text, "Done remote", "批量清除撤销同样取远端最新版");
+  }
+  {
+    // 删除前本页还有一步未落盘编辑（另一字段）：恢复时本页改动与远端改动三方合并，再撤销那步编辑也只撤本页增量
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Base" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "Remote text" }).ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    let dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "Remote text");
+    assert.equal(dx.priority, "high", "本页删除前的未落盘改动保留");
+    assert.equal(A.invoke("undo").ok, true);
+    dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "Remote text", "撤销更早的编辑也不能动远端正文");
+    assert.notEqual(dx.priority, "high", "本页那步优先级编辑被撤掉");
+  }
+  {
+    // 没有远端改动的删除：撤销照常恢复删除前快照（行为不变）
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Plain" }).todo;
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "Plain");
+  }
+  {
+    // 同类：未落盘编辑与远端同字段冲突后，本页后续写成功落盘，再撤销那步编辑 → 取远端值而不是历史 before
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R" }).ok, true);
+    assert.equal(A.invoke("add_todo", { text: "later" }).ok, true);   // 恢复写成功（本页 L 盖住 R）
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L");
+    assert.equal(A.invoke("undo").ok, true);   // 撤销 add
+    assert.equal(A.invoke("undo").ok, true);   // 撤销编辑
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "R", "落盘成功后冲突记录仍有效：撤销露出远端值");
+  }
+  ok("审查六① 撤销删除/批量清除：远端删除后改过 → 恢复远端最新版（与本页改动三方合并）；冲突记录落盘后仍有效");
+
+  /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
+  for (const mode of ["throw", "silent"]) {
+    const mk = () => {
+      const st = { posts: 0 };
+      const fetchImpl = async (url, o) => {
+        const u = String(url);
+        const method = (o && o.method) || "GET";
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });   // 远端暂不可见
+        if (u.includes("/time_entries") && method === "POST") { st.posts++; return reply(200, { id: "te" }); }
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        return reply(200, {});
+      };
+      return { st, fetchImpl };
+    };
+    const breakDone = (store) => {
+      const rawSet = store.setItem;
+      store.setItem = (k, v) => {
+        if (k === "lumina-cu-pomo-done-v1") {
+          if (mode === "throw") throw new Error("quota");
+          return;   // silent：写调用「成功」但没落盘（只有读回能发现）
+        }
+        return rawSet(k, v);
+      };
+      return () => { store.setItem = rawSet; };
+    };
+    const PK = "lumina-cu-pending-pomo-v1";
+    // 直接打卡成功 → 自动对账（无队列项）→ 同 operationId 重试
+    {
+      const { st, fetchImpl } = mk();
+      const store = makeLocalStorage();
+      const { api } = loadClickup(store, fetchImpl);
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const restore = breakDone(store);
+      const args = { operationId: "op-r6-2-" + mode, title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000 };
+      assert.equal((await api.logPomodoro(args)).ok, true);
+      assert.equal(st.posts, 1);
+      let pend = JSON.parse(store.getItem(PK) || "[]");
+      assert.equal(pend.length, 1, `${mode}：回执未落盘时保留已确认记录`);
+      assert.equal(pend[0].state, "confirmed");
+      await api.reconcilePendingPomos();
+      pend = JSON.parse(store.getItem(PK) || "[]");
+      assert.equal(pend.length, 1, `${mode}：自动对账不得清掉唯一的已确认记录`);
+      assert.equal((await api.logPomodoro(args)).ok, true);
+      assert.equal(st.posts, 1, `${mode}：同 operationId 重试不得再 POST`);
+      // 回执恢复可写后，下一次对账补写回执并读回确认，才释放已确认记录
+      restore();
+      await api.reconcilePendingPomos();
+      assert.equal(JSON.parse(store.getItem(PK) || "[]").length, 0, `${mode}：回执可证明落盘后才释放`);
+      assert.ok(JSON.parse(store.getItem("lumina-cu-pomo-done-v1") || "[]").some((x) => x.operationId === args.operationId));
+      assert.equal((await api.logPomodoro(args)).ok, true);
+      assert.equal(st.posts, 1);
+    }
+    // 队列补发成功 → 队列项移除后的清理同样不得清掉
+    {
+      const { st, fetchImpl } = mk();
+      const store = makeLocalStorage();
+      const { api } = loadClickup(store, fetchImpl);
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      breakDone(store);
+      const op = "op-r6-2q-" + mode;
+      store.setItem("lumina-cu-queue-v1", JSON.stringify([{ queueId: "q-r6", operationId: op, title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000, tries: 0, queuedAt: Date.now() }]));
+      await api.flushQueue();
+      assert.equal(st.posts, 1);
+      assert.equal(JSON.parse(store.getItem("lumina-cu-queue-v1") || "[]").length, 0);
+      assert.equal(JSON.parse(store.getItem(PK) || "[]").length, 1, `${mode}：队列项移除后回执未落盘 → 已确认记录保留`);
+      await api.reconcilePendingPomos();
+      assert.equal((await api.logPomodoro({ operationId: op, title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000 })).ok, true);
+      assert.equal(st.posts, 1, `${mode}：之后同 operationId 不得再 POST`);
+    }
+  }
+  ok("审查六② 完成回执须读回确认落盘才释放已确认记录（直接打卡/自动对账/队列移除后清理），否则同 operationId 不再 POST");
+
+  /* ---- 审查六③ 手动重试按 marker 找到任务：与 ensureTask 共用锁与持久了结，映射落盘后才清 pending ---- */
+  for (const failMap of [false, true]) {
+    const OPT = "ptask-r6-3-" + (failMap ? "f" : "o");
+    const st = { taskPosts: 0, entryTids: [] };
+    const task = { id: "task-r6-3", name: "R6 三号", description: "从 Lumina Todo 番茄打卡创建\n[lumina-op:" + OPT + "]", list: { id: "901818920363" }, status: { status: "to do", type: "open" } };
+    const fetchImpl = async (url, o) => {
+      const u = String(url);
+      const method = (o && o.method) || "GET";
+      if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+      if (u.includes("/time_entries") && method === "POST") { st.entryTids.push(JSON.parse(o.body).tid); return reply(200, {}); }
+      if (/\/task\/[^/?]+$/.test(u) && method === "GET") return reply(200, task);
+      // 只看 open 的标题查询还没索引到新任务；含 closed 的 marker 扫描能看到
+      if (u.includes("/task?") && method === "GET") return reply(200, { tasks: u.includes("include_closed=true") ? [task] : [], last_page: true });
+      if (u.includes("/task") && method === "POST") { st.taskPosts++; return reply(200, { id: "task-dup" }); }
+      if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+      return reply(200, {});
+    };
+    const shared = makeLocalStorage();
+    if (failMap) {
+      const rawSet = shared.setItem;
+      shared.setItem = (k, v) => { if (k === "lumina-cu-task-map-v1") throw new Error("quota"); return rawSet(k, v); };
+    }
+    const locks = makeSharedLocks();
+    const t1 = loadClickup(shared, fetchImpl, { navigator: { locks }, rawFetch: true }).api;
+    await t1.setStoredToken(TOKEN_A);
+    await tick(30);
+    shared.setItem("lumina-cu-pending-task-v1", JSON.stringify([{ key: "r6 三号", operationId: OPT, title: "R6 三号", createdAt: Date.now() - 11 * 60 * 1000, needsManual: true }]));
+    await t1.retryPendingPomos();
+    const pt = JSON.parse(shared.getItem("lumina-cu-pending-task-v1") || "[]");
+    if (failMap) {
+      assert.equal(pt.length, 1, "映射写不进去：手动对账不得清 pending");
+      assert.equal(pt[0].taskId, "task-r6-3", "pending 记下已知 taskId");
+    } else {
+      assert.equal(pt.length, 0, "映射落盘后才清 pending");
+    }
+    // 另一页（页内缓存为空）同标题打卡：不得重建，记到找到的任务上
+    const t2 = loadClickup(shared, fetchImpl, { navigator: { locks }, rawFetch: true }).api;
+    await t2.setStoredToken(TOKEN_A);
+    await tick(30);
+    const r = await t2.logPomodoro({ title: "R6 三号", minutes: 25, endedAt: Date.now() - 1000 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(st.taskPosts, 0, `${failMap}：另一页不得重建任务`);
+    assert.deepEqual(st.entryTids, ["task-r6-3"]);
+  }
+  ok("审查六③ 手动重试按 marker 找到任务：共用 task 锁与持久了结，映射写失败保留 pending（带 taskId），另一页不重建");
+
+  /* ---- 审查六④ 复用记住的标题→taskId 前按 id 回查：改名/关闭则作废改按标题查；回查不确定不新建 ---- */
+  {
+    const mkRemote = () => {
+      const st = {
+        tasks: [{ id: "task-A", name: "R6 四号", list: { id: "901818920363" }, status: { status: "to do", type: "open" } }],
+        detailFail: false, taskPosts: 0, entryTids: [],
+      };
+      st.fetch = async (url, o) => {
+        const u = String(url);
+        const method = (o && o.method) || "GET";
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+        if (u.includes("/time_entries") && method === "POST") { st.entryTids.push(JSON.parse(o.body).tid); return reply(200, {}); }
+        const d = /\/task\/([^/?]+)$/.exec(u);
+        if (d && method === "GET") {
+          if (st.detailFail) return reply(503, "unavailable");
+          const t = st.tasks.find((x) => x.id === d[1]);
+          return t ? reply(200, t) : reply(404, { err: "Task not found" });
+        }
+        if (u.includes("/task?") && method === "GET") {
+          const open = !u.includes("include_closed=true");
+          return reply(200, { tasks: st.tasks.filter((t) => !open || t.status.type !== "closed"), last_page: true });
+        }
+        if (u.includes("/task") && method === "POST") {
+          st.taskPosts++;
+          const t = { id: "task-new-" + st.taskPosts, name: JSON.parse(o.body).name, description: JSON.parse(o.body).description, list: { id: "901818920363" }, status: { status: "to do", type: "open" } };
+          st.tasks.push(t);
+          return reply(200, t);
+        }
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        return reply(200, {});
+      };
+      return st;
+    };
+    const setup = async () => {
+      const st = mkRemote();
+      const shared = makeLocalStorage();
+      const locks = makeSharedLocks();
+      const t1 = loadClickup(shared, st.fetch, { navigator: { locks }, rawFetch: true }).api;
+      await t1.setStoredToken(TOKEN_A);
+      await tick(30);
+      assert.equal((await t1.logPomodoro({ title: "R6 四号", minutes: 25, endedAt: Date.now() - 5000 })).ok, true);
+      assert.deepEqual(st.entryTids, ["task-A"]);
+      const t2 = loadClickup(shared, st.fetch, { navigator: { locks }, rawFetch: true }).api;
+      await t2.setStoredToken(TOKEN_A);
+      await tick(30);
+      return { st, t1, t2, shared };
+    };
+    // 改名：A → 「别的名字」，另有 open 任务 B 叫原标题 → 时间记到 B（另一页走持久映射、同页走页内缓存都一样）
+    for (const which of ["t2", "t1"]) {
+      const env = await setup();
+      env.st.tasks[0].name = "别的名字";
+      env.st.tasks.push({ id: "task-B", name: "R6 四号", list: { id: "901818920363" }, status: { status: "to do", type: "open" } });
+      const r = await env[which].logPomodoro({ title: "R6 四号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(env.st.entryTids, ["task-A", "task-B"], `${which}：改名后的 A 不得再接收这个标题的时间`);
+      assert.equal(env.st.taskPosts, 0);
+      const map = JSON.parse(env.shared.getItem("lumina-cu-task-map-v1") || "[]");
+      assert.ok(!map.some((x) => x.taskId === "task-A" && x.kind !== "created"), "A 的标题索引已作废");
+    }
+    // 关闭：A 已关闭且没有同名 open 任务 → 按标题查不到 → 新建
+    {
+      const env = await setup();
+      env.st.tasks[0].status = { status: "complete", type: "closed" };
+      const r = await env.t2.logPomodoro({ title: "R6 四号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.equal(env.st.taskPosts, 1, "已关闭的任务不得复用");
+      assert.deepEqual(env.st.entryTids, ["task-A", "task-new-1"]);
+    }
+    // 移到别的清单：同样作废
+    {
+      const env = await setup();
+      env.st.tasks[0].list = { id: "other-list" };
+      const r = await env.t2.logPomodoro({ title: "R6 四号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, true);
+      assert.notEqual(env.st.entryTids[1], "task-A", "移出清单的任务不得复用");
+    }
+    // 回查不确定（网络/5xx）：不新建、不写时间，返回可重试
+    {
+      const env = await setup();
+      env.st.detailFail = true;
+      const r = await env.t2.logPomodoro({ title: "R6 四号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, false);
+      assert.equal(r.code, "TASK_INDETERMINATE");
+      assert.equal(r.retryable, true);
+      assert.equal(env.st.taskPosts, 0, "回查不确定时不得新建");
+      assert.deepEqual(env.st.entryTids, ["task-A"], "回查不确定时不得写时间");
+    }
+    // 显式 taskId 路径不变：不回查、不列任务
+    {
+      const env = await setup();
+      env.st.tasks[0].name = "别的名字";
+      env.st.detailFail = true;
+      const r = await env.t2.logPomodoro({ title: "R6 四号", taskId: "task-A", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, true);
+      assert.deepEqual(env.st.entryTids, ["task-A", "task-A"]);
+    }
+  }
+  ok("审查六④ 记住的标题→taskId 复用前按 id 回查标题/清单/状态：改名/关闭/移走即作废改按标题查；回查不确定不新建；显式 taskId 不变");
 
   console.log("\n全部通过：", passed);
 }
