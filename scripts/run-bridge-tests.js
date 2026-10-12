@@ -66,8 +66,9 @@ function baseSandbox(store, fetchImpl) {
   return sandbox;
 }
 
-function loadClickup(store, fetchImpl, { timeoutCapMs } = {}) {
+function loadClickup(store, fetchImpl, { timeoutCapMs, navigator } = {}) {
   const sandbox = baseSandbox(store, fetchImpl);
+  if (navigator) sandbox.navigator = navigator;
   if (Number.isFinite(timeoutCapMs) && timeoutCapMs > 0) {
     const nativeSetTimeout = sandbox.setTimeout;
     sandbox.setTimeout = (fn, ms, ...args) => nativeSetTimeout(fn, Math.min(ms, timeoutCapMs), ...args);
@@ -1534,6 +1535,141 @@ async function main() {
   }
   ok("高3 ClickUp 回写后撤销无关操作，保留别页编辑与 taskId");
 
+  /* ---- 审查三②：脏窗口撤销必须是操作级，不得回滚已合入的远端字段 ---- */
+  for (const deliverEvent of [true, false]) {
+    // 评审原始复现：写失败期间合入别页对已有条目的编辑，再撤销一次无关新增
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X 旧正文" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "Y（写失败）" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X 别页新正文" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "W 无关新增" }).ok, true);   // 恢复写前合入远端正文，写仍失败
+    assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id).text, "X 别页新正文", "前置：远端正文已合入内存");
+    assert.equal(A.invoke("undo").ok, true);
+    const m = A.invoke("list_todos", {}).todos;
+    assert.ok(!m.some((t) => t.text === "W 无关新增"), "撤销目标仍要生效");
+    assert.equal(m.find((t) => t.id === x.id).text, "X 别页新正文", "撤销无关新增不得回滚远端正文");
+    storage.failTodoWrites = false;
+    assert.equal(A.invoke("add_todo", { text: "V" }).ok, true);
+    assert.deepEqual(diskTodos(storage).map((t) => t.text).sort(), ["V", "X 别页新正文", "Y（写失败）"].sort(), "恢复写不得把旧正文落盘");
+  }
+  for (const deliverEvent of [true, false]) {
+    // 字段级：本页改了 priority（写失败），别页改了 text；撤销 priority 只还原 priority
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X 旧正文", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);   // op1（写失败）
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X 别页新正文" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "W 无关新增" }).ok, true);              // op2
+    assert.equal(A.invoke("undo").ok, true);   // 撤销 op2
+    assert.equal(A.invoke("undo").ok, true);   // 撤销 op1
+    const m2 = A.invoke("list_todos", {}).todos;
+    assert.ok(!m2.some((t) => t.text === "W 无关新增"));
+    storage.failTodoWrites = false;
+    assert.equal(A.invoke("add_todo", { text: "V" }).ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "X 别页新正文", "字段级撤销只还原本操作改的字段，远端正文保留");
+    assert.equal(dx.priority, "low", "本操作改的 priority 被撤销");
+  }
+  /* 不脏的相邻路径：远端编辑流入后本页又改过同一条（版本标记被销），再撤销更早的无关操作 */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X 旧正文", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(A.invoke("add_todo", { text: "Y 无关新增" }).ok, true);           // op1
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X 别页新正文" }).ok, true);
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true); // op2
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    const d = diskTodos(storage);
+    assert.ok(!d.some((t) => t.text === "Y 无关新增"));
+    const dx = d.find((t) => t.id === x.id);
+    assert.equal(dx.text, "X 别页新正文", "撤销更早的操作不得回滚之后合入的远端正文");
+    assert.equal(dx.priority, "low");
+  }
+  /* 撤销删除 / 撤销排序：远端在之后改过的字段与顺序都保留 */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const p = A.invoke("add_todo", { text: "P" }).todo;
+    const q = A.invoke("add_todo", { text: "Q" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(A.invoke("delete_todo", { id: q.id }).ok, true);
+    assert.equal(B.invoke("update_todo", { id: p.id, text: "P 别页改" }).ok, true);
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    const d = diskTodos(storage).map((t) => t.text);
+    assert.deepEqual(d, ["Q", "P 别页改"], "删除被撤销且按原位插回，远端编辑保留");
+  }
+  /* 撤销步尚未封口（同一事件循环内）就流入的远端编辑/新增：只反做本地操作 */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);   // 本地操作
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X 别页改" }).ok, true);
+    assert.equal(B.invoke("add_todo", { text: "R 别页新增" }).ok, true);
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));                             // 同步投递，无微任务间隙
+    assert.equal(A.invoke("undo").ok, true);
+    const d = diskTodos(storage);
+    assert.deepEqual(d.map((t) => t.text), ["R 别页新增", "X 别页改"], "远端新增与顺序保留");
+    assert.equal(d.find((t) => t.id === x.id).priority, "low", "本地改的 priority 被撤销");
+  }
+  ok("审查三② 撤销为操作/字段级：脏窗口与不脏路径都不回滚已合入的远端编辑");
+
+  /* ---- 审查三③：ClickUp 系统回写不得给旧正文「本地已编辑」优先权 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    let resolvePush;
+    const clickup = {
+      pushTodo: () => new Promise((resolve) => { resolvePush = resolve; }),
+      logPomo: async () => ({ ok: true }),
+    };
+    const A = loadApp({ storage, clickup });
+    const x = A.invoke("add_todo", { text: "X 旧正文" }).todo;
+    const B = loadApp({ storage });
+    const pushing = A.invoke("push_todo_to_clickup", { id: x.id });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "Y（写失败）" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X 别页新正文", priority: "high" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    resolvePush({ ok: true, taskId: "cu-x", url: "https://app.clickup.com/t/cu-x" });
+    assert.equal((await pushing).ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "X 别页新正文", "回写 taskId 不得让旧正文盖掉远端编辑");
+    assert.equal(dx.priority, "high");
+    assert.equal(dx.clickupTaskId, "cu-x", "系统字段仍要合入");
+    assert.ok(diskTodos(storage).some((t) => t.text === "Y（写失败）"), "本页未落盘的新增也要保留");
+  }
+  /* 系统回写不推 updatedAt（用户编辑时间）：软合并不会把旧正文当成新版 */
+  {
+    const storage = sharedStorage();
+    const clickup = { pushTodo: async () => ({ ok: true, taskId: "cu-y", url: "https://app.clickup.com/t/cu-y" }), logPomo: async () => ({ ok: true }) };
+    const A = loadApp({ storage, clickup });
+    const y = A.invoke("add_todo", { text: "Y" }).todo;
+    const before = diskTodos(storage).find((t) => t.id === y.id).updatedAt;
+    A.clock.advance(5000);
+    assert.equal((await A.invoke("push_todo_to_clickup", { id: y.id })).ok, true);
+    const after = diskTodos(storage).find((t) => t.id === y.id);
+    assert.equal(after.clickupTaskId, "cu-y");
+    assert.equal(after.updatedAt, before, "ClickUp 回写不得推进用户编辑时间");
+  }
+  ok("审查三③ ClickUp 回写与用户字段分开合并，远端编辑胜出且关联不丢");
+
   /* ---- 中：Agent 完成/恢复工具在本页状态过期时不得做相反操作 ---- */
   {
     const storage = sharedStorage();
@@ -1929,6 +2065,161 @@ async function main() {
   }
   ok("审查二#2 同一待办并发上传只 POST 一次（同页 single-flight、跨页租约、过期租约可接管）");
 
+  /* ---- 审查三④：跨页租约非原子 → Web Locks 覆盖「查询→创建→确认落盘」全过程 ---- */
+  {
+    // 可控并发存储：租约键的写入对另一页延迟可见（两页都读到空锁、各自写入并读回自己的锁）
+    const shared = new Map();
+    const view = (lagKeys) => {
+      const local = new Map();
+      return {
+        getItem: (k) => (local.has(k) ? local.get(k) : shared.has(k) ? shared.get(k) : null),
+        setItem: (k, v) => {
+          if (lagKeys.some((p) => k.startsWith(p))) {
+            local.set(k, String(v));
+            setTimeout(() => { shared.set(k, String(v)); local.delete(k); }, 5);
+          } else shared.set(k, String(v));
+        },
+        removeItem: (k) => { local.delete(k); shared.delete(k); },
+      };
+    };
+    const makeLocks = () => {
+      const held = new Map();
+      const waiters = new Map();
+      const grant = (name) => {
+        const q = waiters.get(name);
+        if (held.get(name) || !q || !q.length) return;
+        q.shift()();
+      };
+      return {
+        request(name, options, cb) {
+          if (typeof options === "function") { cb = options; options = {}; }
+          if (options.ifAvailable && held.get(name)) return Promise.resolve().then(() => cb(null));
+          return new Promise((resolve, reject) => {
+            const run = () => {
+              held.set(name, true);
+              Promise.resolve().then(() => cb({ name })).then(resolve, reject)
+                .finally(() => { held.set(name, false); grant(name); });
+            };
+            if (!waiters.has(name)) waiters.set(name, []);
+            waiters.get(name).push(run);
+            grant(name);
+          });
+        },
+      };
+    };
+    const runPair = async (navigator) => {
+      shared.clear();
+      const srv = pushServer({ delayMs: 15 });
+      const lag = ["lumina-cu-push-lease-v1:"];
+      const t1 = loadClickup(view(lag), srv.fetch, { navigator }).api;
+      const t2 = loadClickup(view(lag), srv.fetch, { navigator }).api;
+      await t1.setStoredToken(TOKEN_A);
+      await t2.setStoredToken(TOKEN_A);
+      await tick(30);
+      const [a, b] = await Promise.all([
+        t1.pushTodo({ title: "跨页原子", todoId: "r3-lock-1" }),
+        t2.pushTodo({ title: "跨页原子", todoId: "r3-lock-1" }),
+      ]);
+      return { srv, a, b, t2 };
+    };
+    const locked = await runPair({ locks: makeLocks() });
+    assert.equal(locked.srv.posts, 1, "Web Locks 下两页同时上传只允许一次 POST");
+    assert.equal(new Set(locked.srv.remote.map((t) => t.id)).size, 1, "只能产生一个 taskId");
+    const okOne = [locked.a, locked.b].filter((r) => r.ok);
+    assert.equal(okOne.length >= 1, true);
+    assert.ok([locked.a, locked.b].every((r) => r.ok || r.code === "BUSY"));
+    // 锁释放后另一页再传：复用已创建记录，不再 POST
+    const again = await locked.t2.pushTodo({ title: "跨页原子", todoId: "r3-lock-1" });
+    assert.equal(again.ok, true);
+    assert.equal(again.taskId, okOne[0].taskId);
+    assert.equal(locked.srv.posts, 1);
+  }
+  ok("审查三④ 跨页上传用 Web Locks 原子互斥（延迟可见存储下仍只 POST 一次）");
+
+  /* ---- 审查三⑤：POST 已发出后的非超时传输失败（Failed to fetch / 读正文失败 / 非 JSON）保留不确定 ---- */
+  {
+    const failures = {
+      "Failed to fetch": () => { throw new TypeError("Failed to fetch"); },
+      "Load failed": () => { throw new TypeError("Load failed"); },
+      "读正文失败": () => ({ ok: true, status: 200, async text() { throw new TypeError("network connection was lost"); } }),
+      "2xx 非 JSON": () => ({ ok: true, status: 200, async text() { return "<html>proxy</html>"; } }),
+    };
+    for (const [name, fail] of Object.entries(failures)) {
+      // 待办上传：服务端已建（列表查询暂时还看不到），客户端只拿到传输错误
+      let posts = 0;
+      const store = makeLocalStorage();
+      const { api } = loadClickup(store, async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || "GET";
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        if (u.includes("/task") && method === "GET") return reply(200, { tasks: [], last_page: true });
+        if (u.includes("/task") && method === "POST") { posts++; return fail(); }
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+        if (u.includes("/time_entries") && method === "POST") { posts++; return fail(); }
+        return reply(200, {});
+      });
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const r = await api.pushTodo({ title: "已提交的上传", todoId: "r3-transport-" + name });
+      assert.equal(r.code, "INDETERMINATE", `${name}：上传结果未知必须 INDETERMINATE`);
+      assert.equal((await api.status()).pendingPush, 1, `${name}：上传 pending 必须保留`);
+      const again = await api.pushTodo({ title: "已提交的上传", todoId: "r3-transport-" + name });
+      assert.equal(again.ok, false);
+      assert.equal(posts, 1, `${name}：重试上传不得再次 POST`);
+      // 番茄打卡（直接调用）
+      const p = await api.logPomodoro({ title: "已提交的番茄", taskId: "task-known", minutes: 25, endedAt: Date.now(), operationId: "op-r3-" + posts + "-" + name.length });
+      assert.equal(p.code, "INDETERMINATE", `${name}：打卡结果未知必须 INDETERMINATE`);
+      const st = await api.status();
+      assert.equal(st.pendingPomo, 1, `${name}：打卡 pending 必须保留`);
+      assert.equal(st.queue, 0, `${name}：不得转入自动补发队列`);
+      await api.flushQueue();
+      await api.reconcilePendingPomos();
+      assert.equal(posts, 2, `${name}：自动刷新不得重复打卡`);
+    }
+    // 队列补发路径（番茄队列自动刷新）同样不得清除 pending
+    {
+      let posts = 0;
+      const store = makeLocalStorage();
+      store.setItem("lumina-cu-queue-v1", JSON.stringify([{ queueId: "q-r3", operationId: "op-r3-queue", title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000, tries: 0, queuedAt: Date.now() }]));
+      const { api } = loadClickup(store, async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || "GET";
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+        if (u.includes("/time_entries") && method === "POST") { posts++; throw new TypeError("Failed to fetch"); }
+        return reply(200, {});
+      });
+      await api.setStoredToken(TOKEN_A);
+      await tick(40);
+      await api.flushQueue();
+      await api.flushQueue();
+      assert.equal(posts, 1, "队列补发遇到传输错误后不得再次 POST");
+      assert.equal((await api.status()).pendingPomo, 1);
+    }
+    // 明确拒绝（完整 4xx）才清除 pending
+    {
+      const store = makeLocalStorage();
+      const { api } = loadClickup(store, async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || "GET";
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        if (u.includes("/task") && method === "GET") return reply(200, { tasks: [], last_page: true });
+        if (method === "POST") return reply(400, { err: "bad request" });
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+        return reply(200, {});
+      });
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const r = await api.pushTodo({ title: "被拒绝", todoId: "r3-reject" });
+      assert.equal(r.ok, false);
+      assert.notEqual(r.code, "INDETERMINATE");
+      assert.equal((await api.status()).pendingPush, 0, "明确拒绝才允许清除 pending");
+      const p = await api.logPomodoro({ title: "被拒绝", taskId: "task-known", minutes: 25, endedAt: Date.now(), operationId: "op-r3-reject" });
+      assert.equal(p.ok, false);
+      assert.equal((await api.status()).pendingPomo, 0);
+    }
+  }
+  ok("审查三⑤ POST 发出后的传输/读取/解析失败保留不确定，只有明确 4xx 拒绝才清除（待办与番茄）");
+
   /* ---- 中：缺 Token 时离线队列暂停，配置新 Token 后恢复补传 ---- */
   {
     const store = makeLocalStorage();
@@ -2136,6 +2427,112 @@ async function main() {
     assert.match(String(buffered.error), /bad gateway|中途报错/);
   }
   ok("高 SSE 流内错误/异常 EOF 传播为失败并丢弃工具调用");
+
+  /* ---- 审查三①：按完整 SSE 事件解析；多行 error / event:error / 异常载荷一律失败关闭 ---- */
+  {
+    const enc = new TextEncoder();
+    const streamOf = (raw, { chunk = 0 } = {}) => {
+      const bytes = enc.encode(raw);
+      return new ReadableStream({
+        start(c) {
+          if (!chunk) c.enqueue(bytes);
+          else for (let i = 0; i < bytes.length; i += chunk) c.enqueue(bytes.slice(i, i + chunk));
+          c.close();
+        },
+      });
+    };
+    const toolDelta = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"delete_todo","arguments":"{\\"id\\":\\"t1\\"}"}}]},"finish_reason":null}]}\n\n';
+    const finishTools = 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
+    const DONE = "data: [DONE]\n\n";
+    const run = async (fetchRes) => {
+      const { ai } = loadBridge(makeLocalStorage(), async () => fetchRes);
+      await ai.setApiKey("sk-" + "a".repeat(24));
+      let done = null;
+      let error = null;
+      await ai.chat({ messages: [{ role: "user", content: "删掉" }] }, {
+        onDone(d) { done = d; },
+        onError(e) { error = e; },
+      });
+      await tick(60);
+      return { done, error };
+    };
+    const streamed = (raw, opts) => ({ ok: true, status: 200, body: streamOf(raw, opts), async text() { return raw; } });
+    const buffered = (raw, ct) => ({ ok: true, status: 200, body: null, headers: { get: (k) => (/content-type/i.test(k) ? ct || null : null) }, async text() { return raw; } });
+    const failing = [
+      ["多行 data 的 error 对象", toolDelta + 'data: {"error":\ndata: {"message":"upstream exploded","code":500}}\n\n' + DONE],
+      ["多行 error + CRLF", (toolDelta + 'data: {"error":\ndata:  {"message":"crlf boom"}}\n\n' + DONE).replace(/\n/g, "\r\n")],
+      ["event: error + JSON", toolDelta + 'event: error\ndata: {"message":"overloaded"}\n\n' + DONE],
+      ["event: error + 纯文本", toolDelta + "event: error\ndata: upstream died\n\n" + DONE],
+      ["event: error 无 data", toolDelta + "event: error\n\n" + DONE],
+      ["Anthropic 风格 type:error", toolDelta + 'data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n' + DONE],
+      ["finish_reason=error", toolDelta + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}\n\n' + DONE],
+      ["无法解析的 data", toolDelta + "data: {not json\n\n" + finishTools + DONE],
+      ["非对象 data", toolDelta + "data: 42\n\n" + finishTools + DONE],
+      ["结构异常的 tool_calls", toolDelta + 'data: {"choices":[{"index":0,"delta":{"tool_calls":[null]},"finish_reason":null}]}\n\n' + finishTools + DONE],
+      ["[DONE] 之后的 error", toolDelta + finishTools + DONE + 'data: {"error":{"message":"late"}}\n\n'],
+      ["EOF 处无空行的 error", toolDelta + 'data: {"error":\ndata: {"message":"tail"}}'],
+    ];
+    for (const [name, raw] of failing) {
+      for (const chunk of [0, 1, 7]) {
+        const r = await run(streamed(raw, { chunk }));
+        assert.equal(r.done, null, `${name}（chunk=${chunk}）：不得 onDone，更不能执行 delete_todo`);
+        assert.ok(r.error, `${name}（chunk=${chunk}）：必须报错`);
+      }
+      // 原生 HTTP 缓冲整段 SSE（无 reader）走同一套事件解析
+      const b = await run(buffered(raw, "text/event-stream"));
+      assert.equal(b.done, null, `${name}（缓冲 SSE）：不得 onDone`);
+      assert.ok(b.error, `${name}（缓冲 SSE）：必须报错`);
+    }
+    // 正常路径：多行 data 合法 JSON、注释保活、CRLF、逐字节分块都能正确组装
+    const okRaw = ": keep-alive\n\n" + 'data: {"choices":[{"index":0,\ndata: "delta":{"content":"好"},"finish_reason":null}]}\n\n' + toolDelta + finishTools + DONE;
+    for (const raw of [okRaw, okRaw.replace(/\n/g, "\r\n"), okRaw.replace(/\n/g, "\r")]) {
+      for (const chunk of [0, 1, 5]) {
+        const r = await run(streamed(raw, { chunk }));
+        assert.equal(r.error, null, "合法 SSE 不得误判失败：" + r.error);
+        assert.equal(r.done.content, "好");
+        assert.equal(r.done.tool_calls[0].function.name, "delete_todo");
+      }
+      const b = await run(buffered(raw, "text/event-stream"));
+      assert.equal(b.error, null);
+      assert.equal(b.done.tool_calls.length, 1);
+    }
+    // 缓冲但无 content-type、以 data: 开头也识别为 SSE
+    const sniff = await run(buffered(toolDelta + 'data: {"error":\ndata: {"message":"x"}}\n\n' + DONE, null));
+    assert.equal(sniff.done, null);
+    // complete（非流式）：HTTP 200 的 {error} / SSE 错误体都不得当作成功空回复
+    for (const raw of [JSON.stringify({ error: { message: "quota" } }), JSON.stringify({ type: "error", error: { message: "x" } }), "not json", toolDelta + 'event: error\ndata: {"message":"bad"}\n\n' + DONE]) {
+      const { ai } = loadBridge(makeLocalStorage(), async () => buffered(raw, null));
+      await ai.setApiKey("sk-" + "a".repeat(24));
+      const res = await ai.complete({ messages: [{ role: "user", content: "hi" }] });
+      assert.equal(res.ok, false, "complete 不得把错误体当成功：" + raw.slice(0, 40));
+    }
+    // 端到端：agent-loop 在流式轮收到多行 error 时不得执行累计的 delete_todo
+    const { runAgentRounds } = require(path.join(WWW, "agent-loop.js"));
+    const { ai } = loadBridge(makeLocalStorage(), async () => streamed(toolDelta + 'data: {"error":\ndata: {"message":"boom"}}\n\n' + DONE));
+    await ai.setApiKey("sk-" + "a".repeat(24));
+    const ran = [];
+    let loopErr = null;
+    try {
+      await runAgentRounds({
+        messages: [{ role: "system", content: "s" }, { role: "user", content: "u" }],
+        complete: async () => ({ ok: true, message: { content: "", tool_calls: [{ id: "c0", type: "function", function: { name: "list_todos", arguments: "{}" } }] } }),
+        streamRound: (messages) => new Promise((resolve, reject) => {
+          ai.chat({ messages, tools: true }, {
+            onDone: (d) => resolve({ text: d.content, toolCalls: d.tool_calls, aborted: Boolean(d.aborted) }),
+            onError: (e) => reject(new Error(String(e))),
+          });
+        }),
+        runTool: (tc) => { ran.push(tc.function.name); return { ok: true }; },
+        refreshSystemContent: () => "s",
+        onProgress() {},
+      });
+    } catch (err) {
+      loopErr = err;
+    }
+    assert.deepEqual(ran, ["list_todos"], "流内错误后 delete_todo 绝不能执行");
+    assert.ok(loopErr, "流式轮失败要传播给调用方");
+  }
+  ok("审查三① SSE 按事件组装：多行/事件型错误与异常载荷失败关闭，工具不执行（流式/缓冲/complete）");
 
   /* ---- 中：停止 AI 请求立即释放并发名额，迟到响应被隔离 ---- */
   {
