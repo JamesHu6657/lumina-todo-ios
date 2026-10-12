@@ -1402,6 +1402,591 @@ async function main() {
     ok("mobile-clickup 接受显式 team/list 配置");
   }
 
+
+  /* ======================= Linear 审查第一轮回归（app.js，假 DOM 多标签页） ======================= */
+  const { loadApp, makeStorageMap, makeClock } = require("./app-harness");
+  const TODO_KEY = "lumina-todo-v2";
+  const POMO_STORE_KEY = "lumina-pomo";
+  const diskTodos = (storage) => (JSON.parse(storage.getItem(TODO_KEY) || "null") || { todos: [] }).todos;
+  function sharedStorage() {
+    const storage = makeStorageMap();
+    storage.setItem("lumina-todo-seeded", "1");
+    const rawSet = storage.setItem;
+    storage.failTodoWrites = false;
+    storage.setItem = (k, v) => {
+      if (storage.failTodoWrites && k === TODO_KEY) {
+        const err = new Error("quota");
+        err.name = "QuotaExceededError";
+        throw err;
+      }
+      rawSet(k, v);
+    };
+    return storage;
+  }
+
+  /* ---- 高 2：脏窗口恢复写前必须先合并别页写入，不能等下一次操作 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    assert.equal(A.invoke("add_todo", { text: "X" }).ok, true);
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "Y（本页写失败）" }).ok, true);
+    assert.ok(!diskTodos(storage).some((t) => t.text.startsWith("Y")), "写失败时盘上不应有 Y");
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("add_todo", { text: "Z（别页新增）" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    // 本页下一次写成功，随后「立即关闭」：盘上必须已经同时有 Y 和 Z
+    assert.equal(A.invoke("add_todo", { text: "W" }).ok, true);
+    const texts = diskTodos(storage).map((t) => t.text).sort();
+    assert.deepEqual(texts, ["W", "X", "Y（本页写失败）", "Z（别页新增）"].sort());
+  }
+  ok("高2 写失败恢复时先三方合并别页新增，恢复写后立即关闭也不丢");
+
+  /* ---- 高 3：ClickUp 回写不得让「撤销无关操作」回滚别页的编辑 ---- */
+  {
+    const storage = sharedStorage();
+    let resolvePush;
+    const clickup = {
+      pushTodo: () => new Promise((resolve) => { resolvePush = resolve; }),
+      logPomo: async () => ({ ok: true }),
+    };
+    const A = loadApp({ storage, clickup });
+    const a1 = A.invoke("add_todo", { text: "旧正文" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(A.invoke("add_todo", { text: "本页新增 B" }).ok, true);
+    const pushing = A.invoke("push_todo_to_clickup", { id: a1.id });
+    assert.equal(B.invoke("update_todo", { id: a1.id, text: "别页的新正文" }).ok, true);
+    resolvePush({ ok: true, taskId: "cu-a1", url: "https://app.clickup.com/t/cu-a1" });
+    const pushed = await pushing;
+    assert.equal(pushed.ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    const after = diskTodos(storage);
+    const a1After = after.find((t) => t.id === a1.id);
+    assert.equal(a1After.text, "别页的新正文", "远端正文不得被撤销还原");
+    assert.equal(a1After.clickupTaskId, "cu-a1");
+    assert.ok(!after.some((t) => t.text === "本页新增 B"), "撤销的目标操作仍要生效");
+  }
+  ok("高3 ClickUp 回写后撤销无关操作，保留别页编辑与 taskId");
+
+  /* ---- 中：Agent 完成/恢复工具在本页状态过期时不得做相反操作 ---- */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const t = A.invoke("add_todo", { text: "跨页完成" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(B.invoke("complete_todo", { id: t.id }).ok, true);
+    const r1 = A.invoke("complete_todo", { id: t.id });
+    assert.equal(r1.ok, true);
+    assert.equal(diskTodos(storage).find((x) => x.id === t.id).completed, true, "complete 后必须是已完成");
+    assert.equal(B.invoke("uncomplete_todo", { id: t.id }).ok, true);
+    const r2 = A.invoke("uncomplete_todo", { id: t.id });
+    assert.equal(r2.ok, true);
+    assert.equal(diskTodos(storage).find((x) => x.id === t.id).completed, false, "uncomplete 后必须是进行中");
+  }
+  ok("中 complete/uncomplete 工具同步后按显式目标状态写入");
+
+  /* ---- 中：update_todo 的 due_date:null 清除截止日期 ---- */
+  {
+    const A = loadApp({ storage: sharedStorage() });
+    const t = A.invoke("add_todo", { text: "有截止日期", due_date: "2030-01-02" }).todo;
+    assert.equal(t.dueDate, "2030-01-02");
+    const r = A.invoke("update_todo", { id: t.id, due_date: null });
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.todo.dueDate, null);
+  }
+  ok("中 update_todo({due_date:null}) 清除截止日期");
+
+  /* ---- 中：导出用应用内存快照（写失败时盘上是旧数据） ---- */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    A.invoke("add_todo", { text: "已落盘" });
+    storage.failTodoWrites = true;
+    A.invoke("add_todo", { text: "只在内存" });
+    const snap = A.sandbox.__luminaExportSnapshot();
+    assert.ok(snap.todos.some((t) => t.text === "只在内存"));
+    assert.ok(!diskTodos(storage).some((t) => t.text === "只在内存"));
+    const settingsSrc = fs.readFileSync(path.join(WWW, "js/mobile-settings.js"), "utf8");
+    assert.match(settingsSrc, /__luminaExportSnapshot\(\)/);
+  }
+  ok("中 iOS 导出与网页导出共用内存快照");
+
+  /* ---- 低：Agent 正文上限与保存上限一致，超长明确拒绝 ---- */
+  {
+    const A = loadApp({ storage: sharedStorage() });
+    const long = "长".repeat(501);
+    const r = A.invoke("add_todo", { text: long });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "BAD_ARGS");
+    const t = A.invoke("add_todo", { text: "短" }).todo;
+    assert.equal(A.invoke("update_todo", { id: t.id, text: long }).ok, false);
+    assert.equal(A.invoke("add_todo", { text: "满".repeat(500) }).todo.text.length, 500);
+  }
+  ok("低 Agent 正文超过 500 字明确拒绝，不再静默截断");
+
+  /* ---- 中：暂停后切换预设只影响下一段，计时与上传时长一致 ---- */
+  {
+    const MINUTE = 60 * 1000;
+    const logs = [];
+    const clock = makeClock();
+    const storage = sharedStorage();
+    const A = loadApp({
+      storage,
+      clock,
+      clickup: { logPomo: async (p) => { logs.push(p); return { ok: true }; }, pushTodo: async () => ({ ok: false }) },
+    });
+    A.invoke("pomo_start", { mode: "focus" });
+    clock.advance(15 * MINUTE);
+    A.invoke("pomo_pause");
+    const r = A.invoke("pomo_set_preset", { preset: 1 });
+    assert.equal(r.ok, true);
+    A.invoke("pomo_start");
+    const st = A.invoke("pomo_status").pomo;
+    assert.ok(Math.abs(st.remainingMs - 10 * MINUTE) < 2000, "剩余应仍约 10 分钟，实际 " + st.remainingMs);
+    assert.equal(JSON.parse(storage.getItem(POMO_STORE_KEY)).segmentMs, 25 * MINUTE);
+    clock.advance(11 * MINUTE);
+    A.invoke("pomo_pause");
+    A.invoke("pomo_start"); // 停在零点上按继续 → 结算
+    await new Promise((r2) => setTimeout(r2, 20));
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].minutes, 25, "上传时长必须等于实际计时的这一段");
+    // 新的一段才用新预设，计时与 segmentMs 同步锁定
+    A.invoke("pomo_skip");
+    A.invoke("pomo_start", {});
+    const fresh = JSON.parse(storage.getItem(POMO_STORE_KEY));
+    assert.equal(fresh.segmentMs, 50 * MINUTE);
+    assert.ok(Math.abs(fresh.endsAt - clock.Date.now() - 50 * MINUTE) < 2000);
+  }
+  ok("中 暂停后切换预设不改当前段，打卡时长与计时一致");
+
+  /* ---- 中：已上传的待办记番茄时带 ClickUp taskId（长标题不再新建任务） ---- */
+  {
+    const MINUTE = 60 * 1000;
+    const logs = [];
+    const clock = makeClock();
+    const A = loadApp({
+      storage: sharedStorage(),
+      clock,
+      clickup: {
+        logPomo: async (p) => { logs.push(p); return { ok: true }; },
+        pushTodo: async () => ({ ok: true, taskId: "cu-long", url: "https://app.clickup.com/t/cu-long" }),
+      },
+    });
+    const t = A.invoke("add_todo", { text: "长".repeat(300) }).todo;
+    assert.equal((await A.invoke("push_todo_to_clickup", { id: t.id })).ok, true);
+    A.invoke("pomo_focus_task", { id: t.id });
+    clock.advance(26 * MINUTE);
+    A.invoke("pomo_pause");
+    A.invoke("pomo_start");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].taskId, "cu-long");
+    assert.equal(logs[0].title.length, 300);
+  }
+  ok("中 番茄打卡优先使用待办已有的 ClickUp taskId");
+
+
+  /* ======================= Linear 审查第一轮回归（ClickUp / 安全存储 / AI 桥） ======================= */
+  const TOKEN_A = "pk_" + "a".repeat(24);
+  const TOKEN_B = "pk_" + "b".repeat(24);
+  const reply = (status, body) => ({
+    ok: status < 400,
+    status,
+    async text() {
+      return typeof body === "string" ? body : JSON.stringify(body);
+    },
+  });
+  const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+
+  /* ---- 中：原生 POST 忽略 AbortSignal 且不返回时，15s 截止时间覆盖整个请求 ---- */
+  {
+    const store = makeLocalStorage();
+    const hang = () => new Promise(() => {}); // 原生层：既不返回也不理会 signal
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+      if (u.includes("/task") && method === "GET") {
+        return reply(200, { tasks: [{ id: "t-hang", name: "挂起的番茄" }], last_page: true });
+      }
+      if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+      if (method === "POST") return hang();
+      return reply(200, {});
+    }, { timeoutCapMs: 30 });
+    assert.equal((await api.setStoredToken(TOKEN_A)).ok, true);
+    const t0 = Date.now();
+    const pushed = await api.pushTodo({ title: "挂起的上传", todoId: "hang-1" });
+    assert.equal(pushed.code, "INDETERMINATE");
+    const pomo = await api.logPomodoro({ title: "挂起的番茄", minutes: 25, endedAt: Date.now(), operationId: "op-hang-pomo" });
+    assert.equal(pomo.code, "INDETERMINATE");
+    assert.ok(Date.now() - t0 < 2000, "必须在截止时间内收尾");
+    const st = await api.status();
+    assert.equal(st.pendingPush, 1, "不确定的创建保留待核对");
+    assert.equal(st.pendingPomo, 1, "不确定的打卡保留待核对");
+  }
+  ok("中 ClickUp 原生 POST 不返回时整体截止并保留待核对");
+
+  /* ---- 中：更换 Token 后不得沿用旧账号的 assignee ---- */
+  {
+    const store = makeLocalStorage();
+    const assignees = [];
+    let n = 0;
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      const auth = opts && opts.headers && opts.headers.Authorization;
+      if (u.endsWith("/user")) return reply(200, { user: { id: auth === TOKEN_A ? 111 : 222 } });
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [], last_page: true });
+      if (u.includes("/task") && method === "POST") {
+        assignees.push(JSON.parse(opts.body).assignees[0]);
+        n++;
+        return reply(200, { id: "task-" + n });
+      }
+      return reply(200, {});
+    });
+    await api.setStoredToken(TOKEN_A);
+    assert.equal((await api.pushTodo({ title: "A 账号", todoId: "acct-a" })).ok, true);
+    await api.setStoredToken(TOKEN_B);
+    assert.equal((await api.pushTodo({ title: "B 账号", todoId: "acct-b" })).ok, true);
+    assert.deepEqual(assignees, [111, 222]);
+  }
+  ok("中 更换 ClickUp Token 后清除身份缓存");
+
+  /* ---- 中：已成功上传的同一待办，重传复用结果 / 按 marker 找回，不重复创建 ---- */
+  {
+    const store = makeLocalStorage();
+    let posts = 0;
+    let remote = [];
+    const fetchImpl = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.endsWith("/user")) return reply(200, { user: { id: 5 } });
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: remote, last_page: true });
+      if (u.includes("/task") && method === "POST") {
+        posts++;
+        return reply(200, { id: "task-dup-" + posts });
+      }
+      return reply(200, {});
+    };
+    const { api } = loadClickup(store, fetchImpl);
+    await api.setStoredToken(TOKEN_A);
+    const first = await api.pushTodo({ title: "上传一次", todoId: "dup-1" });
+    assert.equal(first.ok, true);
+    // 远端成功但 App 没存下关联：同一 todoId 再传
+    const again = await api.pushTodo({ title: "上传一次", todoId: "dup-1" });
+    assert.equal(again.ok, true);
+    assert.equal(again.taskId, first.taskId);
+    assert.equal(posts, 1, "本机已确认创建过，不得再次 POST");
+    // 从备份恢复（本机没有任何记录），远端已有同 marker 的任务
+    const fresh = makeLocalStorage();
+    remote = [{ id: "task-restored", name: "备份里的", description: "x\n[lumina-op:todo-dup-2]" }];
+    const { api: api2 } = loadClickup(fresh, fetchImpl);
+    await api2.setStoredToken(TOKEN_A);
+    const restored = await api2.pushTodo({ title: "备份里的", todoId: "dup-2" });
+    assert.equal(restored.ok, true);
+    assert.equal(restored.taskId, "task-restored");
+    assert.equal(posts, 1, "远端已有同 marker 任务，不得重复创建");
+  }
+  ok("中 已上传待办重传先查本机确认与远端 marker，不重复创建");
+
+  /* ---- 中：创建超时后查询暂时为空，宽限期内不重建；迟到落库后对账找回 ---- */
+  {
+    const store = makeLocalStorage();
+    let posts = 0;
+    let remote = [];
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.endsWith("/user")) return reply(200, { user: { id: 5 } });
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: remote, last_page: true });
+      if (u.includes("/task") && method === "POST") {
+        posts++;
+        if (posts === 1) {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        return reply(200, { id: "task-late-" + posts });
+      }
+      return reply(200, {});
+    });
+    await api.setStoredToken(TOKEN_A);
+    const r1 = await api.pushTodo({ title: "超时的上传", todoId: "late-1" });
+    assert.equal(r1.code, "INDETERMINATE");
+    const r2 = await api.pushTodo({ title: "超时的上传", todoId: "late-1" });
+    assert.equal(r2.code, "INDETERMINATE");
+    assert.equal(posts, 1, "宽限期内立即重试不得再次 POST");
+    // 首次请求迟到落库：对账找回并记为已创建
+    remote = [{ id: "task-late-landed", name: "超时的上传", description: "[lumina-op:todo-late-1]" }];
+    const rec = await api.reconcilePendingPushes();
+    assert.equal(rec.reconciled, 1);
+    remote = [];
+    const r3 = await api.pushTodo({ title: "超时的上传", todoId: "late-1" });
+    assert.equal(r3.ok, true);
+    assert.equal(r3.taskId, "task-late-landed");
+    assert.equal(posts, 1);
+    // 另一条：宽限期过后仍查无才允许重新创建
+    const r4 = await api.pushTodo({ title: "真的没写上", todoId: "late-2" });
+    assert.equal(r4.ok, true, "第二次 POST 正常返回");
+    assert.equal(posts, 2);
+    const stale = await api.pushTodo({ title: "过期待核对", todoId: "late-3" });
+    assert.equal(stale.ok, true);
+    const pendingKey = "lumina-cu-pending-push-v1";
+    store.setItem(pendingKey, JSON.stringify([{
+      operationId: "todo-late-4", title: "过期待核对2", createdAt: Date.now() - 11 * 60 * 1000, state: "indeterminate",
+    }]));
+    const r5 = await api.pushTodo({ title: "过期待核对2", todoId: "late-4" });
+    assert.equal(r5.ok, true, "宽限期后查无可以重建");
+  }
+  ok("中 创建超时后宽限期内不重建，迟到提交由对账找回");
+
+  /* ---- 中：缺 Token 时离线队列暂停，配置新 Token 后恢复补传 ---- */
+  {
+    const store = makeLocalStorage();
+    store.setItem("lumina-cu-queue-v1", JSON.stringify([{
+      queueId: "q-off", operationId: "op-offline-1", title: "离线番茄", minutes: 25,
+      endedAt: Date.now() - 60000, tries: 0, queuedAt: Date.now(),
+    }]));
+    // 旧版本留下的：缺 token 被误记为永久失败的记录
+    store.setItem("lumina-cu-failed-v1", JSON.stringify([{
+      queueId: "q-legacy", operationId: "op-offline-2", title: "离线番茄2", minutes: 25,
+      endedAt: Date.now() - 120000, failureCode: "NO_TOKEN", failureRetryable: false,
+    }]));
+    const posted = [];
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [{ id: "t-off", name: "离线番茄" }, { id: "t-off2", name: "离线番茄2" }], last_page: true });
+      if (u.includes("/time_entries") && method === "POST") {
+        posted.push(JSON.parse(opts.body).description);
+        return reply(200, {});
+      }
+      return reply(200, {});
+    });
+    const paused = await api.flushQueue();
+    assert.equal(paused.paused, "NO_TOKEN");
+    let st = await api.status();
+    assert.equal(st.queue, 1, "缺 token 时队列原样保留");
+    assert.equal(st.failed, 1);
+    await api.setStoredToken(TOKEN_A);
+    await tick(80);
+    await api.flushQueue();
+    st = await api.status();
+    assert.equal(st.queue, 0);
+    assert.equal(st.failed, 0, "鉴权类失败记录在新 token 下恢复");
+    assert.equal(posted.length, 2);
+  }
+  ok("中 缺凭证时暂停 ClickUp 队列，重新配置后恢复补传");
+
+  /* ---- 中：容量上限不淘汰未同步记录，明确拒绝 ---- */
+  {
+    const store = makeLocalStorage();
+    const full = [];
+    for (let i = 0; i < 200; i++) {
+      full.push({ queueId: "q-" + i, operationId: "op-full-" + i, title: "x", minutes: 25, endedAt: Date.now() - 1000, tries: 0, queuedAt: Date.now() });
+    }
+    store.setItem("lumina-cu-queue-v1", JSON.stringify(full));
+    let posts = 0;
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [{ id: "t-x", name: "x" }, { id: "t-y", name: "第201条" }], last_page: true });
+      if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+      if (method === "POST") {
+        posts++;
+        return reply(429, "rate limited"); // 明确未写入、可重试 → 走离线队列
+      }
+      return reply(200, {});
+    });
+    await api.setStoredToken(TOKEN_A);
+    await tick(80);
+    const r = await api.logPomodoro({ title: "第201条", minutes: 25, endedAt: Date.now() });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "QUEUE_FULL");
+    assert.equal(r.queued, false);
+    const q = JSON.parse(store.getItem("lumina-cu-queue-v1"));
+    assert.equal(q.length, 200);
+    assert.equal(q[0].queueId, "q-0", "最旧的未同步记录不得被挤掉");
+
+    // 待核对记录满 50 条：新打卡不 POST，转入队列（不淘汰旧待核对）
+    const store2 = makeLocalStorage();
+    const pend = [];
+    for (let i = 0; i < 50; i++) pend.push({ operationId: "op-pend-" + i, minutes: 25, start: 1, duration: 1, createdAt: Date.now() });
+    store2.setItem("lumina-cu-pending-pomo-v1", JSON.stringify(pend));
+    const pushPend = [];
+    for (let i = 0; i < 50; i++) pushPend.push({ operationId: "todo-pp-" + i, title: "p", createdAt: Date.now() });
+    store2.setItem("lumina-cu-pending-push-v1", JSON.stringify(pushPend));
+    let posts2 = 0;
+    const { api: api2 } = loadClickup(store2, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.endsWith("/user")) return reply(200, { user: { id: 9 } });
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [{ id: "t-z", name: "第51条" }], last_page: true });
+      if (u.includes("/time_entries") && method === "GET") return reply(503, "lookup down");
+      if (method === "POST") posts2++;
+      return reply(200, { id: "never" });
+    });
+    await api2.setStoredToken(TOKEN_A);
+    const r2 = await api2.logPomodoro({ title: "第51条", minutes: 25, endedAt: Date.now() });
+    assert.equal(r2.code, "PENDING_FULL");
+    assert.equal(r2.queued, true);
+    assert.equal(JSON.parse(store2.getItem("lumina-cu-pending-pomo-v1")).length, 50);
+    assert.equal(JSON.parse(store2.getItem("lumina-cu-pending-pomo-v1"))[0].operationId, "op-pend-0");
+    const r3 = await api2.pushTodo({ title: "第51个上传", todoId: "pp-new" });
+    assert.equal(r3.code, "PENDING_FULL");
+    assert.equal(posts2, 0, "待核对记录满时不得发出无法对账的 POST");
+    assert.equal(JSON.parse(store2.getItem("lumina-cu-pending-push-v1"))[0].operationId, "todo-pp-0");
+  }
+  ok("中 ClickUp 队列/待核对达到上限时明确拒绝，不淘汰未确认记录");
+
+  /* ---- 中：番茄打卡优先用已知 taskId；标题规范与上传一致（>200 字不再新建） ---- */
+  {
+    const store = makeLocalStorage();
+    const longTitle = "长".repeat(300);
+    const calls = [];
+    const { api } = loadClickup(store, async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      calls.push(method + " " + u.replace(/\?.*/, ""));
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [{ id: "cu-by-name", name: longTitle }], last_page: true });
+      if (u.includes("/time_entries") && method === "POST") return reply(200, {});
+      if (method === "POST") return reply(200, { id: "should-not-create" });
+      return reply(200, { data: [] });
+    });
+    await api.setStoredToken(TOKEN_A);
+    await tick(40);
+    calls.length = 0;
+    const r1 = await api.logPomodoro({ title: longTitle, taskId: "cu-known", minutes: 25, endedAt: Date.now() });
+    assert.equal(r1.ok, true);
+    assert.equal(r1.taskId, "cu-known");
+    assert.ok(!calls.some((c) => c.startsWith("GET") && c.includes("/task")), "已知 taskId 不再列任务");
+    const r2 = await api.logPomodoro({ title: longTitle, minutes: 25, endedAt: Date.now() - 3600000 });
+    assert.equal(r2.ok, true);
+    assert.equal(r2.taskId, "cu-by-name", "300 字标题要能按同一规范找到已上传任务");
+    assert.ok(!calls.some((c) => c.startsWith("POST") && c.endsWith("/task")), "不得新建任务");
+  }
+  ok("中 长标题番茄记到已上传的同一任务");
+
+  /* ---- 中：Keychain 迁移与保存/清除串行，不覆盖新密钥、不复活已清除的密钥 ---- */
+  for (const action of ["set", "remove"]) {
+    const store = makeLocalStorage();
+    store.setItem("lumina-cu-token", TOKEN_A); // 旧明文
+    const keychain = new Map();
+    let releaseGet;
+    let gate = new Promise((r) => { releaseGet = r; });
+    const plugin = {
+      async get({ key }) {
+        // 原生读取在发起时取值，结果却很晚才回来（复现「旧读取随后返回空值」）
+        const snapshot = keychain.has(key) ? keychain.get(key) : null;
+        await gate;
+        return { value: snapshot };
+      },
+      async set({ key, value }) { keychain.set(key, value); },
+      async remove({ key }) { keychain.delete(key); },
+    };
+    const sandbox = baseSandbox(store);
+    sandbox.Capacitor = { Plugins: { LuminaSecureStore: plugin } };
+    vm.createContext(sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "js/secure-store.js"), "utf8"), sandbox);
+    vm.runInContext(fs.readFileSync(path.join(WWW, "js/mobile-clickup.js"), "utf8"), sandbox);
+    const api = sandbox.LUMINA_MOBILE_CLICKUP;
+    await tick(5); // 冷启动迁移已发起并卡在 Keychain 读取
+    const saving = api.setStoredToken(action === "set" ? TOKEN_B : "");
+    gate = Promise.resolve();
+    releaseGet();
+    assert.equal((await saving).ok, true);
+    await tick(20);
+    if (action === "set") {
+      assert.equal(keychain.get("lumina-cu-token"), TOKEN_B, "迁移不得用旧明文覆盖新密钥");
+      assert.equal(await api.readToken({ refresh: true }), TOKEN_B);
+    } else {
+      assert.equal(keychain.has("lumina-cu-token"), false, "迁移不得复活已清除的密钥");
+      assert.equal(await api.readToken({ refresh: true }), null);
+    }
+    assert.equal(store.getItem("lumina-cu-token"), null, "明文副本必须清掉");
+  }
+  ok("中 Keychain 迁移与保存/清除按 key 串行并校验代际");
+
+  /* ---- 高：HTTP 200 流中途报错时丢弃已累计的工具调用 ---- */
+  {
+    const sse = (frames, { done = false } = {}) => {
+      const raw = frames.map((f) => `data: ${typeof f === "string" ? f : JSON.stringify(f)}\n\n`).join("") + (done ? "data: [DONE]\n\n" : "");
+      const bytes = new TextEncoder().encode(raw);
+      return new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } });
+    };
+    const toolFrame = {
+      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "delete_todo", arguments: "{\"id\":\"t1\"}" } }] }, finish_reason: null }],
+    };
+    const run = async (body, opts = {}) => {
+      const { ai } = loadBridge(makeLocalStorage(), async () => ({ ok: true, status: 200, body, async text() { return opts.text || ""; } }));
+      await ai.setApiKey("sk-" + "a".repeat(24));
+      let done = null;
+      let error = null;
+      await ai.chat({ messages: [{ role: "user", content: "删掉" }] }, {
+        onDone(d) { done = d; },
+        onError(e) { error = e; },
+      });
+      await tick(60);
+      return { done, error };
+    };
+    const midError = await run(sse([toolFrame, { error: { message: "upstream overloaded", code: 529 } }]));
+    assert.equal(midError.done, null, "流内错误不得 onDone 执行工具");
+    assert.match(String(midError.error), /中途报错|overloaded/);
+    const truncated = await run(sse([toolFrame]));
+    assert.equal(truncated.done, null, "异常 EOF 不得合成为成功");
+    assert.match(String(truncated.error), /意外中断/);
+    const normal = await run(sse([toolFrame, { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }], { done: true }));
+    assert.equal(normal.error, null);
+    assert.equal(normal.done.tool_calls[0].function.name, "delete_todo");
+    const doneOnly = await run(sse([{ choices: [{ index: 0, delta: { content: "好的" }, finish_reason: null }] }], { done: true }));
+    assert.equal(doneOnly.error, null, "[DONE] 正常收尾即使没有 finish_reason 也算成功");
+    assert.equal(doneOnly.done.content, "好的");
+    const buffered = await run(null, { text: JSON.stringify({ error: { message: "bad gateway" } }) });
+    assert.equal(buffered.done, null);
+    assert.match(String(buffered.error), /bad gateway|中途报错/);
+  }
+  ok("高 SSE 流内错误/异常 EOF 传播为失败并丢弃工具调用");
+
+  /* ---- 中：停止 AI 请求立即释放并发名额，迟到响应被隔离 ---- */
+  {
+    const hanging = [];
+    const { ai } = loadBridge(makeLocalStorage(), (_url) => new Promise((resolve) => { hanging.push(resolve); }));
+    await ai.setApiKey("sk-" + "a".repeat(24));
+    const dones = [];
+    for (let i = 0; i < 8; i++) {
+      const started = await ai.chat({ messages: [{ role: "user", content: "hi" }], requestId: "stop-" + i }, {
+        onDone(d) { dones.push(d); },
+      });
+      assert.equal(started.ok, true);
+    }
+    for (let i = 0; i < 8; i++) assert.equal((await ai.abort("stop-" + i)).ok, true);
+    await tick(20);
+    assert.equal(dones.length, 8);
+    assert.ok(dones.every((d) => d.aborted === true));
+    let lateDelta = 0;
+    let reusedDone = null;
+    const ninth = await ai.chat({ messages: [{ role: "user", content: "hi" }], requestId: "stop-0" }, {
+      onDelta() { lateDelta++; },
+      onDone(d) { reusedDone = d; },
+    });
+    assert.equal(ninth.ok, true, "第 9 次请求不应报 TOO_MANY_REQUESTS：" + (ninth.error || ""));
+    // 旧的原生请求此刻才迟到返回：不得把内容推给复用同 requestId 的新会话
+    const lateBody = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"迟到"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+        c.close();
+      },
+    });
+    hanging[0]({ ok: true, status: 200, body: lateBody });
+    await tick(30);
+    assert.equal(lateDelta, 0);
+    assert.equal(reusedDone, null);
+    await ai.abort("stop-0");
+  }
+  ok("中 停止流式请求立即释放并发名额并隔离迟到响应");
+
   console.log("\n全部通过：", passed);
 }
 
