@@ -215,6 +215,31 @@ async function main() {
     assert.match(cu.posts[1].description, /\[lumina-op:op-retry-grace-1\]/);
     console.log("✔ 不确定的队列 POST 在宽限期内不重复发送，过期后按原 operationId 补发");
   }
+
+  // 审查第一轮：待核对记录（上限 50）已满时，新打卡不发无法对账的 POST、不挤掉旧记录，转入队列
+  {
+    const cu = makeClickUp();
+    const full = [];
+    for (let i = 0; i < 50; i++) full.push(pending("op-full-" + i, 60_000));
+    const { api, store } = await load(full, cu);
+    const r = await api.logPomodoro({ title: "focus", minutes: 25, endedAt: Date.now(), operationId: "op-over-cap" });
+    assert.equal(r.code, "PENDING_FULL");
+    assert.equal(r.queued, true);
+    assert.equal(cu.posts.length, 0);
+    const kept = JSON.parse(store.getItem(PENDING_KEY));
+    assert.equal(kept.length, 50);
+    assert.equal(kept[0].operationId, "op-full-0", "最旧的待核对记录不得被淘汰");
+    const q = JSON.parse(store.getItem(QUEUE_KEY) || "[]");
+    assert.equal(q.length, 1);
+    assert.equal(q[0].operationId, "op-over-cap");
+    // 队列补发时待核对仍满：保留队列项，不消耗重试次数
+    await api.flushQueue();
+    assert.equal(cu.posts.length, 0);
+    const q2 = JSON.parse(store.getItem(QUEUE_KEY) || "[]");
+    assert.equal(q2.length, 1);
+    assert.equal(q2[0].tries, 0);
+    console.log("✔ 待核对记录已满时新打卡转入队列，不淘汰旧记录、不盲发");
+  }
 }
 
 main().catch((err) => {
