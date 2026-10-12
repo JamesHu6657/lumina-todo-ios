@@ -79,7 +79,8 @@
         parameters: {
           type: "object",
           properties: {
-            text: { type: "string", minLength: 1, maxLength: 1000, description: "待办正文" },
+            // 与 app.js 的 MAX_TEXT 一致：超长直接拒绝，不能返回成功后再静默截断
+            text: { type: "string", minLength: 1, maxLength: 500, description: "待办正文（最多 500 字）" },
             priority: {
               type: "string",
               enum: ["low", "medium", "high"],
@@ -112,7 +113,7 @@
           properties: {
             id: { type: "string" },
             match_text: MATCH_ACTIVE,
-            text: { type: "string", minLength: 1, maxLength: 1000 },
+            text: { type: "string", minLength: 1, maxLength: 500, description: "新正文（最多 500 字）" },
             priority: { type: "string", enum: ["low", "medium", "high"] },
             category: {
               type: "string",
