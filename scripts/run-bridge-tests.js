@@ -3356,6 +3356,111 @@ async function main() {
   }
   ok("审查六① 撤销删除/批量清除：远端删除后改过 → 恢复远端最新版（与本页改动三方合并）；冲突记录落盘后仍有效");
 
+  /* ---- 审查七① 侧表记录绑定到具体撤销步：重复「删除→撤销」不得复用上一代基线把远端最新编辑改回旧版 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Original" }).todo;
+    const B = loadApp({ storage });
+    // 第一代
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "R1", `${deliverEvent}：第一次撤销恢复 R1`);
+    // 第二代
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R2" }).ok, true);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.ok(dx, `${deliverEvent}：第二次撤销删除后条目回来`);
+    assert.equal(dx.text, "R2", `${deliverEvent}：第二次撤销不得把远端最新 R2 改回 R1`);
+  }
+  {
+    // 批量清除已完成，两代
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Done O" }).todo;
+    assert.equal(A.invoke("complete_todo", { id: x.id }).ok, true);
+    const B = loadApp({ storage });
+    for (const gen of ["R1", "R2", "R3"]) {
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("clear_completed").ok, true);
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: gen }).ok, true);
+      assert.equal(A.invoke("undo").ok, true);
+      const dx = diskTodos(storage).find((t) => t.id === x.id);
+      assert.ok(dx && dx.completed, `批量清除第 ${gen} 代撤销后条目回来且仍已完成`);
+      assert.equal(dx.text, gen, `批量清除第 ${gen} 代撤销取该代远端最新版`);
+    }
+  }
+  {
+    // 同一次删除期间远端改了两次：仍以删除那一代的基线合并（取最新 R2，本页删除前改动保留）
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Base" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R2" }).ok, true);
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "R2");
+    assert.equal(dx.priority, "high", "同一代内保持删除时的基线：本页删除前的改动仍保留");
+  }
+  {
+    // 编辑冲突记录同样绑定到产生它的那一步：撤销后即作废，不能被更早那步（字段值碰巧相同）再次套用
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "P" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);    // Ea: P→L
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "M" }).ok, true);    // Eb: L→M
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);    // Ec: M→L（未落盘）
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);   // 冲突：本页 L 胜出，记下 R1
+    assert.equal(A.invoke("undo").ok, true);                                     // 撤销 Ec → 露出 R1
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "R1");
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "L" }).ok, true);    // 远端又改回 L（远端最新）
+    A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(A.invoke("undo").ok, true);                                     // 撤销 Eb：当前 L≠M，不动
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "L");
+    assert.equal(A.invoke("undo").ok, true);                                     // 撤销 Ea
+    assert.notEqual(diskTodos(storage).find((t) => t.id === x.id).text, "R1", "已消费的冲突记录不得被更早一步复用（R1 是被远端自己替换掉的旧值）");
+  }
+  {
+    // 编辑→撤销→再编辑→撤销 循环：每一代各自的远端值，不串代
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    for (const gen of ["R1", "R2", "R3"]) {
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "L" }).ok, true);
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: gen }).ok, true);
+      assert.equal(A.invoke("undo").ok, true);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, gen, `编辑循环第 ${gen} 代撤销露出该代远端值`);
+    }
+  }
+  ok("审查七① 侧表记录绑定撤销步（删除代/编辑步）：重复删除→撤销（单条/批量）与编辑循环都不复用上一代基线或已消费记录");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
@@ -3574,6 +3679,98 @@ async function main() {
     }
   }
   ok("审查六④ 记住的标题→taskId 复用前按 id 回查标题/清单/状态：改名/关闭/移走即作废改按标题查；回查不确定不新建；显式 taskId 不变");
+
+  /* ---- 审查七② 建任务响应丢失后按 marker 立即找回：回执落盘后仍须回查标题/清单/状态 ---- */
+  {
+    const LIST = "901818920363";
+    const mk = (variant) => {
+      const st = { tasks: [], taskPosts: 0, entryTids: [], detailFail: false };
+      st.fetch = async (url, o) => {
+        const u = String(url);
+        const method = (o && o.method) || "GET";
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+        if (u.includes("/time_entries") && method === "POST") { st.entryTids.push(JSON.parse(o.body).tid); return reply(200, {}); }
+        const d = /\/task\/([^/?]+)$/.exec(u);
+        if (d && method === "GET") {
+          if (st.detailFail) return reply(503, "unavailable");
+          const t = st.tasks.find((x) => x.id === d[1]);
+          return t ? reply(200, t) : reply(404, { err: "Task not found" });
+        }
+        if (u.includes("/task?") && method === "GET") {
+          const open = !u.includes("include_closed=true");
+          return reply(200, { tasks: st.tasks.filter((t) => !open || t.status.type !== "closed"), last_page: true });
+        }
+        if (u.includes("/task") && method === "POST") {
+          st.taskPosts++;
+          const b = JSON.parse(o.body);
+          const t = { id: "task-made-" + st.taskPosts, name: b.name, description: b.description, list: { id: LIST }, status: { status: "to do", type: "open" } };
+          st.tasks.push(t);
+          if (st.taskPosts === 1) {
+            // 第一次创建成功但响应丢失；对账前 A 被改名，另有任务 B 现在叫原标题
+            t.name = "已改名 Y";
+            if (variant === "withB") st.tasks.push({ id: "task-B", name: "R7 二号", list: { id: LIST }, status: { status: "to do", type: "open" } });
+            if (variant === "detailFail") { t.name = "R7 二号"; st.detailFail = true; }
+            throw new TypeError("Failed to fetch");
+          }
+          return reply(200, t);
+        }
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        return reply(200, {});
+      };
+      return st;
+    };
+    // 改名 + 同名 B：时间记到 B，不记到已改名的 A，不重复创建
+    {
+      const st = mk("withB");
+      const shared = makeLocalStorage();
+      const api = loadClickup(shared, st.fetch, { navigator: { locks: makeSharedLocks() }, rawFetch: true }).api;
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const r = await api.logPomodoro({ title: "R7 二号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(st.entryTids, ["task-B"], "marker 找回的 A 已改名：时间不得记到 A");
+      assert.equal(st.taskPosts, 1, "不得重复创建");
+      const map = JSON.parse(shared.getItem("lumina-cu-task-map-v1") || "[]");
+      assert.ok(map.some((x) => x.kind === "created" && x.taskId === "task-made-1"), "建任务完成回执仍落盘（那次创建确已完成）");
+      assert.ok(!map.some((x) => x.kind !== "created" && x.taskId === "task-made-1"), "A 的标题索引作废");
+      assert.equal(JSON.parse(shared.getItem("lumina-cu-pending-task-v1") || "[]").length, 0, "回执落盘后 pending 已了结");
+    }
+    // 改名且没有同名任务：时间同样不记到 A
+    {
+      const st = mk("noB");
+      const shared = makeLocalStorage();
+      const api = loadClickup(shared, st.fetch, { navigator: { locks: makeSharedLocks() }, rawFetch: true }).api;
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      await api.logPomodoro({ title: "R7 二号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.ok(!st.entryTids.includes("task-made-1"), "改名后的 A 不得接收原标题的时间");
+    }
+    // 回查不确定：保留记录、暂停提交时间，返回可重试 TASK_INDETERMINATE，不新建
+    {
+      const st = mk("detailFail");
+      const shared = makeLocalStorage();
+      const api = loadClickup(shared, st.fetch, { navigator: { locks: makeSharedLocks() }, rawFetch: true }).api;
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const r = await api.logPomodoro({ title: "R7 二号", minutes: 25, endedAt: Date.now() - 1000 });
+      assert.equal(r.ok, false, JSON.stringify(r));
+      assert.equal(r.code, "TASK_INDETERMINATE");
+      assert.equal(r.retryable, true);
+      assert.deepEqual(st.entryTids, [], "回查不确定时不提交时间");
+      assert.equal(st.taskPosts, 1, "回查不确定时不新建");
+      const map = JSON.parse(shared.getItem("lumina-cu-task-map-v1") || "[]");
+      const pend = JSON.parse(shared.getItem("lumina-cu-pending-task-v1") || "[]");
+      assert.ok(map.some((x) => x.kind === "created" && x.taskId === "task-made-1") || pend.some((x) => x.taskId === "task-made-1"), "建任务记录保留");
+      // 恢复后重试：回查通过才记时间，且仍不重建
+      st.detailFail = false;
+      await api.flushQueue();
+      const r2 = st.entryTids.length ? { ok: true } : await api.logPomodoro({ title: "R7 二号", minutes: 25, endedAt: Date.now() - 500 });
+      assert.equal(r2.ok, true, JSON.stringify(r2));
+      assert.equal(st.entryTids[0], "task-made-1");
+      assert.equal(st.taskPosts, 1);
+    }
+  }
+  ok("审查七② 建任务响应丢失后 marker 找回：回执落盘后仍回查标题/清单/状态，改名则按标题重查，回查不确定暂停提交且不新建");
 
   console.log("\n全部通过：", passed);
 }
