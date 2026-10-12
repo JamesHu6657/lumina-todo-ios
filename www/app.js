@@ -382,8 +382,15 @@ const remoteIds = new Set();   // 当前版本由远端写入（流入过内存�
 /* 审查五 A：三方合并里「双方都改了同一字段组、本页胜出」时记下远端的值。
    key=`${id}\u0000${组序号}` → { ours: 胜出时本页的值, theirs: 远端值 }。
    撤销一个未落盘的本地操作时，这组若被远端改过，逆操作取远端最新值而不是历史 before——
-   历史 before 写回盘会把别页的编辑盖掉。本页成功落盘后整张清空（落盘即我方版本已覆盖远端） */
+   历史 before 写回盘会把别页的编辑盖掉。
+   审查六①：不再在落盘成功时整张清空——落盘只说明本页版本暂时盖住了远端，撤销时仍应露出远端值；
+   每条带 seq，只对「记录之前就已存在」的撤销步生效，随撤销栈修剪（pruneUndoSideTables） */
 const remoteFieldConflicts = new Map();
+/* 审查六①：本页已删除（落没落盘都算）、但合并时看到远端在删除之后仍改过的条目。
+   id → { base: 首次看到时的合并基线版本, theirs: 远端最新版本, seq }。
+   撤销删除时按 before↔base↔theirs 三方合并恢复，绝不把删除前的历史快照写回盘盖掉远端编辑 */
+const remoteDeletedLatest = new Map();
+let undoSeq = 0;               // 撤销步与远端冲突记录共用的单调序号
 /* 「出身」归因：远端新增的条目。本页改写只销版本标记（remoteIds.delete），
    不动出身——否则撤销更早的快照时，「远端加的、后来被本页碰过的条目」
    会被误判成本页新增，直接被撤掉并广播删除 */
@@ -1334,7 +1341,6 @@ function persist(){
     flashSaved();
     localDirty = false;
     lastAppliedList = todos.map((t) => ({ ...t }));
-    remoteFieldConflicts.clear();
     /* 恢复写已经带上了合并结果：窗口基线和排队快照都用完了 */
     if (wasDirty){ dirtyBase = null; pendingExternal = null; }
     if (mergedRemote){
@@ -1446,16 +1452,36 @@ function rebaseOpenUndo(prev, next){
 }
 function snapshot(label){
   if (openUndoEntry) closeUndoEntry(openUndoEntry);
-  const entry = { label, todos: cloneList(todos), pomoTaskId:pomo.taskId, after:null };
+  const entry = { label, todos: cloneList(todos), pomoTaskId:pomo.taskId, after:null, seq: ++undoSeq };
   undoStack.push(entry);
   openUndoEntry = entry;
   /* 同步 mutator 在本轮内改完内存；没走 persist 的路径由微任务封口 */
   Promise.resolve().then(() => closeUndoEntry(entry));
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
+  pruneUndoSideTables();
   syncUndoBtn();
 }
+/* 冲突/远端最新版记录只为撤销栈服务：栈里已没有任何一步涉及该条目就丢掉，防止无界增长 */
+function pruneUndoSideTables(){
+  const ids = new Set();
+  for (const e of undoStack){
+    for (const t of e.todos) ids.add(t.id);
+    if (e.after) for (const t of e.after) ids.add(t.id);
+  }
+  for (const k of [...remoteFieldConflicts.keys()]){ if (!ids.has(k.split("\u0000")[0])) remoteFieldConflicts.delete(k); }
+  for (const id of [...remoteDeletedLatest.keys()]){ if (!ids.has(id)) remoteDeletedLatest.delete(id); }
+}
+/* 审查六①：远端版本与本页「删除前」版本按字段组三方合并：本页删除前改过（≠基线）的组留本页，
+   其余取远端最新。双方都改过的组以本页为准，但记进 remoteFieldConflicts——
+   之后撤销更早那步本地编辑时露出的是远端值，不是历史 before */
+function restoreDeletedFromRemote(s, rec){
+  const out = mergeThreeWay({ ...s }, rec.base, rec.theirs);
+  return out;
+}
 /* 纯函数：把 entry 描述的操作在 current 上逆向应用，返回新列表 */
-function invertUndoEntry(entry, current, conflicts){
+function invertUndoEntry(entry, current, conflicts, deletedLatest){
+  const seq = entry.seq || 0;
+  const fresh = (rec) => rec && (rec.seq || 0) > seq;   // 只认本步之后才出现的远端记录
   const S = entry.todos;
   const A = entry.after || entry.todos;
   const sMap = new Map(S.map((t) => [t.id, t]));
@@ -1478,7 +1504,7 @@ function invertUndoEntry(entry, current, conflicts){
       /* 审查五 A：这组在本操作之后被远端改过（合并时本页 after 胜出）→ 只撤掉本页的增量，
          露出远端的最新值；绝不把历史 before 写回去盖掉别页的编辑 */
       const c = conflicts && conflicts.get(t.id + "\u0000" + gi);
-      const src = c && groupEq(c.ours, a, g) ? c.theirs : s;
+      const src = fresh(c) && groupEq(c.ours, a, g) ? c.theirs : s;
       if (next === t) next = { ...t };
       for (const f of g) next[f] = src[f];
     });
@@ -1507,7 +1533,10 @@ function invertUndoEntry(entry, current, conflicts){
       const p = out.findIndex((t) => t.id === S[j].id);
       if (p >= 0){ pos = p; break; }
     }
-    out.splice(pos, 0, { ...s });
+    /* 审查六①：删除之后远端又改过这条 → 恢复远端最新版（与本页删除前的改动三方合并），
+       不能把删除前的历史快照写回去盖掉别页的编辑 */
+    const rec = deletedLatest && deletedLatest.get(s.id);
+    out.splice(pos, 0, fresh(rec) ? restoreDeletedFromRemote(s, rec) : { ...s });
     outIds.add(s.id);
   }
   return out;
@@ -1548,12 +1577,13 @@ function undo(){
      pendingExternal，随后的 persist 会按 dirtyBase 三方合并——两种情况下
      撤销都只在「当前内存」上做操作级逆操作，不会整条回滚任何已合入的远端字段 */
   syncTodosFromDisk();
-  const next = invertUndoEntry(snap, todos, remoteFieldConflicts);
+  const next = invertUndoEntry(snap, todos, remoteFieldConflicts, remoteDeletedLatest);
   for (const t of next){
     const prev = todos.find((x) => x.id === t.id);
     if (!prev || !userEq(prev, t)) remoteIds.delete(t.id);   // 撤销写出的版本是本页的
   }
   todos = next;
+  pruneUndoSideTables();
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
   const restorable = (id) => id && todos.some((t) => t.id === id && !t.completed);
@@ -2660,11 +2690,12 @@ function mergeThreeWay(ours, base, theirs){
       if (!groupEq(theirs, base, g)) tookTheirs = true;
       for (const f of g) out[f] = theirs[f];
     } else {
+      /* 本页这组相对基线有改动但远端没动：沿用已有冲突记录；远端又改了 → 下面覆盖为最新 */
       keptOurs = true;
       /* 双方都改了这组、本页胜出：记下远端值，撤销本页这次操作时要还给远端（审查五 A） */
       if (ours.id && !groupEq(theirs, base, g) && !groupEq(theirs, ours, g)){
         const pick = (o) => Object.fromEntries(g.map((f) => [f, o[f]]));
-        remoteFieldConflicts.set(ours.id + "\u0000" + gi, { ours: pick(ours), theirs: pick(theirs) });
+        remoteFieldConflicts.set(ours.id + "\u0000" + gi, { ours: pick(ours), theirs: pick(theirs), seq: ++undoSeq });
       }
     }
   });
@@ -2699,6 +2730,13 @@ function mergeRemoteWindow(parsed, base, followDeletes){
     });
   for (const t of remote){
     if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
+    /* 审查六①：本页已删（基线有、内存无），远端却在基线之后改过它：记下远端最新版。
+       删除仍然成立（本页赢），但撤销删除时必须恢复这份远端最新版而不是历史快照 */
+    const b = baseMap.get(t.id);
+    if (b && !ourIds.has(t.id) && !eq(t, b)){
+      const prev = remoteDeletedLatest.get(t.id);
+      remoteDeletedLatest.set(t.id, { base: prev ? prev.base : { ...b }, theirs: { ...t }, seq: ++undoSeq });
+    }
   }
   markRemoteAdopted(todos, merged);
   todos = merged;
