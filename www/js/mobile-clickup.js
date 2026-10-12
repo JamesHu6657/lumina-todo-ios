@@ -37,6 +37,12 @@
   const CORRUPT_QUEUE_KEY = "lumina-cu-queue-corrupt-v1";
   // 番茄打卡时按标题新建任务的「不确定」记录（审查四⑦）：结果未知的建任务 POST 只对账、不重发
   const PENDING_TASK_KEY = "lumina-cu-pending-task-v1";
+  // 审查五 C：番茄打卡的独立完成回执（按 operationId），成功/无队列项/队列项移除都不清，只按 TTL/容量过期
+  const POMO_DONE_KEY = "lumina-cu-pomo-done-v1";
+  // 审查五 D：按标题建/找到的任务 id（账号 + 清单 + 规范化标题），跨页可见，免得另一页再建一个同名任务
+  const TASK_MAP_KEY = "lumina-cu-task-map-v1";
+  const MAX_POMO_DONE = 500;
+  const MAX_TASK_MAP = 200;
   // 容量上限只用来拒绝新增，绝不淘汰未确认的旧记录
   const MAX_QUEUE = 200;
   const MAX_FAILED = 200;
@@ -59,6 +65,10 @@
     // 超时后服务端可能稍晚才落库。宽限期只决定「多久后提示用户手动处理」：
     // 宽限期过后一次空查询也不能证明原请求不会再提交，绝不自动重建/补发
     pendingRequeueGraceMs: 10 * 60 * 1000,
+    // 完成回执保留 7 天：远远长于 ClickUp 查询的可见延迟，过期后仍有远端 marker 预查兜底
+    pomoDoneTtlMs: 7 * 24 * 60 * 60 * 1000,
+    // 标题→任务 id 映射保留 7 天：远端删任务时 404 会主动作废
+    taskMapTtlMs: 7 * 24 * 60 * 60 * 1000,
   };
 
   let tokenCache = { value: null, at: 0 };
@@ -468,11 +478,59 @@
   }
 
   function forgetTaskId(id) {
-    if (!id) return;
+    if (!id) return Promise.resolve(true);
     const sid = String(id);
     for (const [k, v] of taskCache) {
       if (v && v.id === sid) taskCache.delete(k);
     }
+    // 远端已删的任务：持久映射一并作废，否则另一页/下一次仍会把时间记到不存在的任务上
+    if (!readTaskMap().some((x) => x.taskId === sid)) return Promise.resolve(true);
+    return mutateStore(() => storeSet(TASK_MAP_KEY, JSON.stringify(readTaskMap().filter((x) => x.taskId !== sid))));
+  }
+
+  /* ---------- 审查五 D：持久化的「标题 → 已确认任务 id」映射 ---------- */
+  /** 账号指纹：token 的不可逆短哈希（不落明文）。换 token 即换命名空间，绝不跨账号复用任务 id */
+  function accountFingerprint(token) {
+    const raw = String(token || "");
+    let a = 0x811c9dc5;
+    let b = 0x9e3779b9;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw.charCodeAt(i);
+      a = Math.imul(a ^ c, 0x01000193);
+      b = Math.imul(b ^ (c + i), 0x85ebca6b);
+    }
+    return (a >>> 0).toString(36) + (b >>> 0).toString(36);
+  }
+  function taskMapKey(token, key) {
+    return accountFingerprint(token) + "|" + listId() + "|" + key;
+  }
+  function readTaskMap() {
+    try {
+      const arr = JSON.parse(storeGet(TASK_MAP_KEY) || "[]");
+      if (!Array.isArray(arr)) return [];
+      const now = Date.now();
+      return arr.filter(
+        (x) => x && typeof x.k === "string" && isClickUpTaskId(x.taskId) &&
+          Number.isFinite(x.at) && now - x.at < LIMITS.taskMapTtlMs
+      );
+    } catch {
+      return [];
+    }
+  }
+  function findMappedTask(token, key) {
+    const k = taskMapKey(token, key);
+    const hit = readTaskMap().find((x) => x.k === k);
+    return hit ? hit.taskId : null;
+  }
+  /** 在 store 锁内落盘；返回是否写成功（失败时调用方不得清掉建任务的 pending） */
+  function rememberMappedTask(token, key, taskId) {
+    if (!isClickUpTaskId(taskId)) return Promise.resolve(false);
+    const k = taskMapKey(token, key);
+    return mutateStore(() => {
+      const list = readTaskMap().filter((x) => x.k !== k);
+      list.push({ k, taskId: String(taskId), at: Date.now() });
+      return storeSet(TASK_MAP_KEY, JSON.stringify(list.slice(-MAX_TASK_MAP)));
+    });
   }
 
   function taskDescriptionText(task) {
@@ -568,6 +626,12 @@
     const work = withLock("task:" + key, async () => {
       const again = taskCache.get(key);
       if (again && Date.now() - again.at < LIMITS.taskCacheMs) return again.id;
+      // 审查五 D：别页已确认过的任务（刚建完、列表查询可能还看不到）→ 直接用，不再建
+      const mapped = findMappedTask(token, key);
+      if (mapped) {
+        taskCache.set(key, { id: mapped, at: Date.now() });
+        return mapped;
+      }
 
       const pend = findPendingTask(key);
       if (pend) {
@@ -585,7 +649,8 @@
           throw taskIndeterminate(null, pend.operationId);
         }
         const id = String(found.id);
-        await clearPendingTask(key, pend.operationId);
+        // 先持久化确认结果再清 pending：映射写不进去就留着 pending，下次继续按 marker 对账
+        if (await rememberMappedTask(token, key, id)) await clearPendingTask(key, pend.operationId);
         taskCache.set(key, { id, at: Date.now() });
         return id;
       }
@@ -640,8 +705,10 @@
         }
         if (!made || !made.id) throw taskIndeterminate(new Error("ClickUp 创建任务未返回 id"), operationId);
         id = String(made.id);
-        await clearPendingTask(key, operationId);
+        // 审查五 D：确认结果落盘成功后才清 pending；否则 pending 留着，别页只会按 marker 对账、不会重建
+        if (await rememberMappedTask(token, key, id)) await clearPendingTask(key, operationId);
       }
+      if (found && found.id) await rememberMappedTask(token, key, id);
       taskCache.set(key, { id, at: Date.now() });
       return id;
     });
@@ -981,6 +1048,30 @@
     });
   }
 
+  /* ---------- 审查五 C：番茄打卡的独立完成回执 ---------- */
+  function readPomoDone() {
+    try {
+      const arr = JSON.parse(storeGet(POMO_DONE_KEY) || "[]");
+      if (!Array.isArray(arr)) return [];
+      const now = Date.now();
+      return arr.filter(
+        (x) => x && typeof x.operationId === "string" && Number.isFinite(x.at) && now - x.at < LIMITS.pomoDoneTtlMs
+      );
+    } catch {
+      return [];
+    }
+  }
+  function findPomoDone(operationId) {
+    if (!operationId) return null;
+    return readPomoDone().find((x) => x.operationId === operationId) || null;
+  }
+  /** 同步写（调用方须已持有 store 锁）。容量满时淘汰最旧的（已过远端可见延迟，marker 预查兜底） */
+  function rememberPomoDoneSync(operationId, taskId) {
+    const list = readPomoDone().filter((x) => x.operationId !== operationId);
+    list.push({ operationId, taskId: taskId ? String(taskId) : null, at: Date.now() });
+    return storeSet(POMO_DONE_KEY, JSON.stringify(list.slice(-MAX_POMO_DONE)));
+  }
+
   /* ---------- 审查四⑦：番茄打卡按标题新建任务的不确定记录 ---------- */
   function readPendingTasks() {
     try {
@@ -1179,6 +1270,20 @@
       const list = readPendingPomos();
       const item = list.find((x) => x.operationId === operationId);
       const queued = readQueue().some((x) => x.operationId === operationId);
+      // 审查五 C：先落独立完成回执（成功/无队列项/队列项移除都不清）。写不进去就不清 pending：
+      // 保留「不确定/已确认」记录，任何重试只对账、不会再 POST
+      const doneOk = rememberPomoDoneSync(operationId, taskId);
+      if (!doneOk) {
+        if (!item) return false;
+        if (isConfirmedPomo(item)) return false;
+        item.state = "confirmed";
+        item.confirmedAt = Date.now();
+        if (taskId) item.confirmedTaskId = String(taskId);
+        item.rev = newId("rev-");
+        delete item.needsManual;
+        writePendingPomos(list);
+        return false;
+      }
       if (!queued) {
         if (!item) return true;
         return writePendingPomos(list.filter((x) => x !== item));
@@ -1334,6 +1439,22 @@
       operationId,
     });
 
+    {
+      // 审查五 C：独立完成回执（锁内先查）→ 这条已经写进 ClickUp，绝不再 POST
+      const done = findPomoDone(operationId);
+      if (done) {
+        if (!noQueue && hasPendingPomo(operationId)) await confirmPomo(operationId, done.taskId);
+        return {
+          ok: true,
+          taskId: done.taskId || knownTaskId,
+          name,
+          minutes: mins,
+          deduped: true,
+          localReceipt: true,
+          operationId,
+        };
+      }
+    }
     if (callerOpId) {
       // 审查四⑥：本机已有「已确认」回执 → 远端肯定有这条，直接判成功，不依赖远端立即可见
       const receipt = currentPendingPomo(operationId);
@@ -1435,7 +1556,7 @@
       } catch (err) {
         if (isDefiniteRejection(err) && err.status === 404) {
           // 已知任务在远端被删了：退回按标题查找/新建
-          forgetTaskId(tid);
+          await forgetTaskId(tid);
           taskCache.delete(normTitle(name));
           const tid2 = await ensureTask(token, name, endedAt);
           try {
