@@ -10,6 +10,8 @@
 
   const DEFAULT_MAX_ROUNDS = 6;
   const TOOL_RESULT_MAX = 6000;
+  /** 允许执行工具调用的结束原因 */
+  const TOOL_SAFE_FINISH = new Set(["tool_calls", "function_call", "stop"]);
   const LIMIT_REACHED_TEXT =
     "已达 Agent 轮数上限，部分操作可能尚未完成。请再发一条继续。";
 
@@ -99,6 +101,24 @@
       return toolCalls;
     }
 
+    /**
+     * 审查四②：执行工具前再做一次结束状态闸门（桥接层之外的第二道防线）。
+     * 只有正常结束（tool_calls / function_call / stop，或桥接未提供）才执行；
+     * 截断（length）、过滤（content_filter）、未知或非字符串的结束原因一律不执行任何工具。
+     */
+    function assertTerminalAllowsTools(finishReason, toolCalls) {
+      if (!toolCalls.length) return;
+      if (finishReason == null) return;
+      if (typeof finishReason === "string" && TOOL_SAFE_FINISH.has(finishReason)) return;
+      const err = new Error(
+        "模型回复未正常结束（finish_reason=" +
+          (typeof finishReason === "string" ? finishReason.slice(0, 32) : typeof finishReason) +
+          "），未执行任何工具调用"
+      );
+      err.code = "UNSAFE_FINISH_REASON";
+      throw err;
+    }
+
     async function pushToolResults(toolCalls) {
       for (const tc of toolCalls) {
         if (isAborted()) break;
@@ -148,6 +168,7 @@
         const toolCalls = validateToolCalls(
           Array.isArray(streamed.toolCalls) ? streamed.toolCalls : []
         );
+        assertTerminalAllowsTools(streamed.finishReason ?? streamed.finish_reason, toolCalls);
 
         if (toolCalls.length && !isAborted()) {
           messages.push({
@@ -180,8 +201,9 @@
 
       const msg = res.message || {};
       const toolCalls = validateToolCalls(
-      Array.isArray(msg.tool_calls) ? msg.tool_calls : []
-    );
+        Array.isArray(msg.tool_calls) ? msg.tool_calls : []
+      );
+      assertTerminalAllowsTools(res.finish_reason, toolCalls);
       const content = (msg.content || "").trim();
 
       if (toolCalls.length) {
