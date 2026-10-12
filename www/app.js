@@ -384,11 +384,15 @@ const remoteIds = new Set();   // 当前版本由远端写入（流入过内存�
    撤销一个未落盘的本地操作时，这组若被远端改过，逆操作取远端最新值而不是历史 before——
    历史 before 写回盘会把别页的编辑盖掉。
    审查六①：不再在落盘成功时整张清空——落盘只说明本页版本暂时盖住了远端，撤销时仍应露出远端值；
-   每条带 seq，只对「记录之前就已存在」的撤销步生效，随撤销栈修剪（pruneUndoSideTables） */
+   每条带 seq，只对「记录之前就已存在」的撤销步生效，随撤销栈修剪（pruneUndoSideTables）
+   审查七①：每条再绑定 owner=产生本页胜出值的那一个撤销步的 seq（ownerStepForGroup）。
+   只有撤销那一步时才套用；撤销后即消费删除，绝不被更早/更晚的步复用 */
 const remoteFieldConflicts = new Map();
 /* 审查六①：本页已删除（落没落盘都算）、但合并时看到远端在删除之后仍改过的条目。
-   id → { base: 首次看到时的合并基线版本, theirs: 远端最新版本, seq }。
-   撤销删除时按 before↔base↔theirs 三方合并恢复，绝不把删除前的历史快照写回盘盖掉远端编辑 */
+   id → { base: 本删除代首次看到时的合并基线版本, theirs: 远端最新版本, owner, seq }。
+   撤销删除时按 before↔base↔theirs 三方合并恢复，绝不把删除前的历史快照写回盘盖掉远端编辑。
+   审查七①：按「删除代」绑定——owner=删掉它的那个撤销步的 seq。同一代内基线保持首次所见；
+   新的一次删除（owner 不同）从当时的合并基线重建；撤销那一步后记录即消费删除，跨代绝不复用 */
 const remoteDeletedLatest = new Map();
 let undoSeq = 0;               // 撤销步与远端冲突记录共用的单调序号
 /* 「出身」归因：远端新增的条目。本页改写只销版本标记（remoteIds.delete），
@@ -1461,15 +1465,41 @@ function snapshot(label){
   pruneUndoSideTables();
   syncUndoBtn();
 }
-/* 冲突/远端最新版记录只为撤销栈服务：栈里已没有任何一步涉及该条目就丢掉，防止无界增长 */
+/* 冲突/远端最新版记录只为撤销栈服务：所属撤销步已不在栈里（已撤销、被挤出）就丢掉，防止无界增长与跨代复用 */
 function pruneUndoSideTables(){
-  const ids = new Set();
-  for (const e of undoStack){
-    for (const t of e.todos) ids.add(t.id);
-    if (e.after) for (const t of e.after) ids.add(t.id);
+  const live = new Set(undoStack.map((e) => e.seq));
+  for (const [k, rec] of [...remoteFieldConflicts]){ if (!live.has(rec.owner)) remoteFieldConflicts.delete(k); }
+  for (const [id, rec] of [...remoteDeletedLatest]){ if (!live.has(rec.owner)) remoteDeletedLatest.delete(id); }
+}
+/* 撤销某一步后消费掉绑定在它身上的侧表记录 */
+function consumeUndoSideTables(seq){
+  for (const [k, rec] of [...remoteFieldConflicts]){ if (rec.owner === seq) remoteFieldConflicts.delete(k); }
+  for (const [id, rec] of [...remoteDeletedLatest]){ if (rec.owner === seq) remoteDeletedLatest.delete(id); }
+}
+/* 审查七①：条目 id 的字段组 g 当前值（cur）是哪一个撤销步产生的——从栈顶往下找第一个改过这组的步；
+   那一步的结果必须正是 cur，否则（之后有非撤销步的改动）返回 0=无主，不套用。
+   未封口的步 after 取 cur 本身 */
+function ownerStepForGroup(id, g, cur){
+  for (let i = undoStack.length - 1; i >= 0; i--){
+    const e = undoStack[i];
+    const s = e.todos.find((t) => t.id === id);
+    const a = e.after ? e.after.find((t) => t.id === id) : cur;
+    if (!a) continue;
+    if (!s || !groupEq(s, a, g)) return groupEq(a, cur, g) ? e.seq : 0;
   }
-  for (const k of [...remoteFieldConflicts.keys()]){ if (!ids.has(k.split("\u0000")[0])) remoteFieldConflicts.delete(k); }
-  for (const id of [...remoteDeletedLatest.keys()]){ if (!ids.has(id)) remoteDeletedLatest.delete(id); }
+  return 0;
+}
+/* 审查七①：当前已不在内存里的条目 id 是哪一个撤销步删掉的（栈顶往下第一个 before 有、after 无的步）。
+   中途遇到 after 里仍有它的步 → 是非撤销路径删的，返回 0 */
+function ownerStepForDelete(id){
+  for (let i = undoStack.length - 1; i >= 0; i--){
+    const e = undoStack[i];
+    const s = e.todos.some((t) => t.id === id);
+    const a = (e.after || todos).some((t) => t.id === id);
+    if (a) return 0;
+    if (s) return e.seq;
+  }
+  return 0;
 }
 /* 审查六①：远端版本与本页「删除前」版本按字段组三方合并：本页删除前改过（≠基线）的组留本页，
    其余取远端最新。双方都改过的组以本页为准，但记进 remoteFieldConflicts——
@@ -1481,7 +1511,8 @@ function restoreDeletedFromRemote(s, rec){
 /* 纯函数：把 entry 描述的操作在 current 上逆向应用，返回新列表 */
 function invertUndoEntry(entry, current, conflicts, deletedLatest){
   const seq = entry.seq || 0;
-  const fresh = (rec) => rec && (rec.seq || 0) > seq;   // 只认本步之后才出现的远端记录
+  /* 只认绑定在本步上的远端记录（审查七①：不再按「seq 更大」放行，防止跨步/跨代复用） */
+  const mine = (rec) => !!rec && seq > 0 && rec.owner === seq && (rec.seq || 0) > seq;
   const S = entry.todos;
   const A = entry.after || entry.todos;
   const sMap = new Map(S.map((t) => [t.id, t]));
@@ -1504,7 +1535,7 @@ function invertUndoEntry(entry, current, conflicts, deletedLatest){
       /* 审查五 A：这组在本操作之后被远端改过（合并时本页 after 胜出）→ 只撤掉本页的增量，
          露出远端的最新值；绝不把历史 before 写回去盖掉别页的编辑 */
       const c = conflicts && conflicts.get(t.id + "\u0000" + gi);
-      const src = fresh(c) && groupEq(c.ours, a, g) ? c.theirs : s;
+      const src = mine(c) && groupEq(c.ours, a, g) ? c.theirs : s;
       if (next === t) next = { ...t };
       for (const f of g) next[f] = src[f];
     });
@@ -1536,7 +1567,7 @@ function invertUndoEntry(entry, current, conflicts, deletedLatest){
     /* 审查六①：删除之后远端又改过这条 → 恢复远端最新版（与本页删除前的改动三方合并），
        不能把删除前的历史快照写回去盖掉别页的编辑 */
     const rec = deletedLatest && deletedLatest.get(s.id);
-    out.splice(pos, 0, fresh(rec) ? restoreDeletedFromRemote(s, rec) : { ...s });
+    out.splice(pos, 0, mine(rec) ? restoreDeletedFromRemote(s, rec) : { ...s });
     outIds.add(s.id);
   }
   return out;
@@ -1583,6 +1614,7 @@ function undo(){
     if (!prev || !userEq(prev, t)) remoteIds.delete(t.id);   // 撤销写出的版本是本页的
   }
   todos = next;
+  consumeUndoSideTables(snap.seq);   // 审查七①：本步的记录用过即作废
   pruneUndoSideTables();
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
@@ -2695,7 +2727,10 @@ function mergeThreeWay(ours, base, theirs){
       /* 双方都改了这组、本页胜出：记下远端值，撤销本页这次操作时要还给远端（审查五 A） */
       if (ours.id && !groupEq(theirs, base, g) && !groupEq(theirs, ours, g)){
         const pick = (o) => Object.fromEntries(g.map((f) => [f, o[f]]));
-        remoteFieldConflicts.set(ours.id + "\u0000" + gi, { ours: pick(ours), theirs: pick(theirs), seq: ++undoSeq });
+        const owner = ownerStepForGroup(ours.id, g, ours);
+        const k = ours.id + "\u0000" + gi;
+        if (owner) remoteFieldConflicts.set(k, { ours: pick(ours), theirs: pick(theirs), owner, seq: ++undoSeq });
+        else remoteFieldConflicts.delete(k);   // 本页值不是任何撤销步产生的：无步可套用
       }
     }
   });
@@ -2734,8 +2769,11 @@ function mergeRemoteWindow(parsed, base, followDeletes){
        删除仍然成立（本页赢），但撤销删除时必须恢复这份远端最新版而不是历史快照 */
     const b = baseMap.get(t.id);
     if (b && !ourIds.has(t.id) && !eq(t, b)){
+      /* 审查七①：同一删除代（同一 owner）保留首次所见基线；新的一次删除从当前基线重建 */
+      const owner = ownerStepForDelete(t.id);
       const prev = remoteDeletedLatest.get(t.id);
-      remoteDeletedLatest.set(t.id, { base: prev ? prev.base : { ...b }, theirs: { ...t }, seq: ++undoSeq });
+      if (!owner) remoteDeletedLatest.delete(t.id);
+      else remoteDeletedLatest.set(t.id, { base: prev && prev.owner === owner ? prev.base : { ...b }, theirs: { ...t }, owner, seq: ++undoSeq });
     }
   }
   markRemoteAdopted(todos, merged);
