@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, renderPrompt } from "./factory-relay.mjs";
 
@@ -164,6 +166,22 @@ async function within(promise, ms = 2000) {
   }
 }
 
+await test("default model must belong to the explicit allow list", () => {
+  assert.throws(() => loadConfig({
+    FACTORY_API_KEY: "test",
+    RELAY_TOKEN: token,
+    DROID_MODEL: "expensive-default",
+    ALLOWED_MODELS: "cheap-model",
+  }), /DROID_MODEL must be listed in ALLOWED_MODELS/);
+  assert.throws(() => loadConfig({
+    FACTORY_API_KEY: "test", RELAY_TOKEN: token, ALLOWED_MODELS: "",
+  }), /DROID_MODEL must be listed in ALLOWED_MODELS/);
+  const config = loadConfig({
+    FACTORY_API_KEY: "test", RELAY_TOKEN: token, DROID_MODEL: "a", ALLOWED_MODELS: "b,a",
+  });
+  assert.deepEqual(config.allowedModels, ["b", "a"]);
+});
+
 await test("configuration requires Factory and relay credentials", () => {
   assert.throws(() => loadConfig({ RELAY_TOKEN: token }), /FACTORY_API_KEY is required/);
   assert.throws(() => loadConfig({ FACTORY_API_KEY: "test", RELAY_TOKEN: "short" }), /RELAY_TOKEN/);
@@ -197,10 +215,47 @@ await withRelay({}, async (relay) => {
   await test("authenticated model list contains allowed models", async () => {
     const response = await request(relay, "/v1/models");
     assert.equal(response.status, 200);
-    assert.deepEqual((await response.json()).data, [
+    const listed = await response.json();
+    assert.deepEqual(listed.data, [
       { id: "deepseek-v4.1-flash", object: "model", owned_by: "factory" },
       { id: "custom-model", object: "model", owned_by: "factory" },
     ]);
+    assert.ok(listed.unsupported_params.includes("max_tokens"));
+    assert.ok(listed.unsupported_params.includes("temperature"));
+  });
+
+  await test("unknown models fall back to the allowed default", async () => {
+    const response = await request(relay, "/v1/chat/completions", {
+      method: "POST",
+      body: { model: "not-allowed-model", messages: [{ role: "user", content: "STUB:CAPTURE" }] },
+    });
+    assert.equal(response.status, 200);
+    const parsed = await response.json();
+    assert.equal(parsed.model, "deepseek-v4.1-flash");
+    const captured = JSON.parse(parsed.choices[0].message.content);
+    assert.equal(captured.args[captured.args.indexOf("-m") + 1], "deepseek-v4.1-flash");
+  });
+
+  await test("generation params are validated and declared as ignored", async () => {
+    const ok = await request(relay, "/v1/chat/completions", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "STUB:PLAIN" }], max_tokens: 2048, temperature: 0.4 },
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get("x-relay-ignored-params"), "max_tokens,temperature");
+    const plain = await request(relay, "/v1/chat/completions", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "STUB:PLAIN" }] },
+    });
+    assert.equal(plain.headers.get("x-relay-ignored-params"), null);
+    for (const bad of [{ max_tokens: 0 }, { max_tokens: 1.5 }, { temperature: 5 }, { temperature: "hot" }, { n: 2 }]) {
+      const response = await request(relay, "/v1/chat/completions", {
+        method: "POST",
+        body: { messages: [{ role: "user", content: "STUB:PLAIN" }], ...bad },
+      });
+      assert.equal(response.status, 400, JSON.stringify(bad));
+      assert.equal((await response.json()).error.type, "invalid_request_error");
+    }
   });
 
   await test("prompt rendering preserves tools and the full tagged transcript", async () => {
@@ -613,6 +668,44 @@ await withRelay({ MAX_CONCURRENCY: "1", BODY_TIMEOUT_MS: "300" }, async (relay) 
     assert.equal(relay.child.exitCode, null);
   });
 });
+
+{
+  const spawnDir = await fs.mkdtemp(path.join(os.tmpdir(), "relay-spawn-test-"));
+  await withRelay({ MAX_CONCURRENCY: "1", TMPDIR: spawnDir }, async (relay) => {
+    await test("client disconnect during prompt preparation does not start droid", async () => {
+      const url = new URL(relay.address);
+      for (let i = 0; i < 5; i++) {
+        const socket = net.connect(Number(url.port), url.hostname);
+        socket.on("error", () => {});
+        await new Promise((resolve, reject) => {
+          socket.once("connect", resolve);
+          socket.once("error", reject);
+        });
+        const body = JSON.stringify({ messages: [{ role: "user", content: "STUB:SPAWNLOG" }] });
+        // 完整请求体到达后立刻断开：此时中转正在准备临时目录/prompt
+        socket.end([
+          "POST /v1/chat/completions HTTP/1.1",
+          "Host: relay.test",
+          `Authorization: Bearer ${token}`,
+          "Content-Type: application/json",
+          `Content-Length: ${Buffer.byteLength(body)}`,
+          "",
+          body,
+        ].join("\r\n"));
+        socket.destroy();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const spawned = (await fs.readdir(spawnDir)).filter((name) => name.startsWith("stub-spawned-"));
+      assert.deepEqual(spawned, [], "断开的请求不得启动 droid");
+      const next = await request(relay, "/v1/chat/completions", {
+        method: "POST",
+        body: { messages: [{ role: "user", content: "STUB:PLAIN" }] },
+      });
+      assert.equal(next.status, 200, "并发槽必须已释放");
+    });
+  });
+  await fs.rm(spawnDir, { recursive: true, force: true });
+}
 
 if (failures.length) {
   process.stderr.write(`\n${failures.length} relay test(s) failed.\n`);
