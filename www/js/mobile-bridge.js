@@ -39,6 +39,9 @@
       // 中转要等 droid exec 整轮跑完才回包（服务端默认最多 90s），CapacitorHttp 又会缓冲整个响应，
       // 流式请求沿用 30s 连接超时会把正常的慢回复全部掐断。须小于 STREAM_IDLE_TIMEOUT_MS（120s）。
       requestTimeoutMs: 105_000,
+      // droid exec 没有采样参数：中转会忽略 temperature / max_tokens（并在 X-Relay-Ignored-Params 声明）。
+      // 不再发送，避免「设置了却静默不生效」。
+      samplingParams: false,
     },
   };
   const DEFAULT_PROVIDER = "opencode";
@@ -735,14 +738,16 @@
       model: provider.model,
       messages: clipped,
       stream: Boolean(stream),
-      temperature: clampNumber(temperature, 0, 2, 0.4),
-      max_tokens: clampNumber(
+    };
+    if (provider.samplingParams !== false) {
+      body.temperature = clampNumber(temperature, 0, 2, 0.4);
+      body.max_tokens = clampNumber(
         max_tokens,
         LIMITS.maxTokens.min,
         LIMITS.maxTokens.max,
         LIMITS.maxTokens.default
-      ),
-    };
+      );
+    }
     if (tools?.length) {
       body.tools = tools;
       body.tool_choice = tool_choice || "auto";
@@ -1262,6 +1267,8 @@
           keyHint: p.keyHint,
           baseStore: Boolean(p.baseStore),
           base: providerBase(p),
+          // false：该服务商不支持 temperature / max_tokens，App 不会发送
+          samplingParams: p.samplingParams !== false,
         })),
       };
     },
@@ -1562,8 +1569,10 @@
   function notifyPomoResult(result) {
     const message =
       result?.code === "INDETERMINATE"
-        ? "番茄已记录，但 ClickUp 上传结果未确认；稍后会自动核对，确认没写入会补发"
-        : result?.ok === false && result?.queued === true
+        ? "番茄已记录，但 ClickUp 上传结果未确认；稍后会自动核对，不会重复提交"
+        : result?.code === "NEEDS_MANUAL_RETRY"
+          ? "有番茄打卡长时间未确认，已停止自动补发；可在设置 › ClickUp「重试待核对」"
+          : result?.ok === false && result?.queued === true
           ? "ClickUp 暂时连不上，番茄已加入待同步，联网后自动补传"
           : "";
     if (!message) return;
@@ -1621,6 +1630,21 @@
         dueDate: typeof src.dueDate === "string" ? src.dueDate : null,
         todoId: typeof src.todoId === "string" ? src.todoId : undefined,
         operationId: typeof src.operationId === "string" ? src.operationId : undefined,
+        // 仅用户在「长时间未确认」提示上点了重新上传时为 true
+        manualRetry: src.manualRetry === true,
+      });
+    },
+    retryPending() {
+      const cu = globalThis.LUMINA_MOBILE_CLICKUP;
+      if (!cu?.retryPendingPomos) return Promise.resolve({ ok: false, error: "ClickUp 模块未加载" });
+      return Promise.resolve(cu.retryPendingPomos()).then(async (pomo) => {
+        let push = null;
+        try {
+          push = await cu.reconcilePendingPushes();
+        } catch {
+          push = null;
+        }
+        return { ok: Boolean(pomo?.ok), pomo, push };
       });
     },
     setToken(token) {
