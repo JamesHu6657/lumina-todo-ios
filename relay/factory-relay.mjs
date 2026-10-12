@@ -46,6 +46,10 @@ export function loadConfig(env = process.env) {
   const allowedModels = env.ALLOWED_MODELS == null
     ? [droidModel]
     : String(env.ALLOWED_MODELS).split(",").map((model) => model.trim()).filter(Boolean);
+  // 默认模型是请求省略/给错模型时的回退目标，必须在显式允许列表里，否则允许列表形同虚设
+  if (!allowedModels.includes(droidModel)) {
+    throw new Error("DROID_MODEL must be listed in ALLOWED_MODELS");
+  }
   return {
     factoryApiKey,
     relayToken,
@@ -186,6 +190,7 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Expose-Headers", "X-Relay-Ignored-Params");
 }
 
 function sendJson(res, status, value) {
@@ -261,6 +266,45 @@ function validateChatBody(body) {
       throw new RelayError(400, "messages contains an unsupported role");
     }
   }
+}
+
+// droid exec 没有 temperature / max_tokens 之类的采样参数（只有 -m 与 -r），
+// 这些字段无法传给上游。合法值照常受理，但在响应头和 /v1/models 里如实声明「已忽略」；
+// 非法值直接 400，别让调用方以为参数生效了。
+const UNSUPPORTED_GENERATION_PARAMS = [
+  "max_tokens",
+  "max_completion_tokens",
+  "temperature",
+  "top_p",
+  "stop",
+  "presence_penalty",
+  "frequency_penalty",
+  "seed",
+];
+
+function checkGenerationParams(body) {
+  const numberIn = (name, min, max) => {
+    const value = body[name];
+    if (value == null) return;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+      throw new RelayError(400, `${name} must be a number between ${min} and ${max}`);
+    }
+  };
+  for (const name of ["max_tokens", "max_completion_tokens"]) {
+    const value = body[name];
+    if (value == null) continue;
+    if (!Number.isInteger(value) || value < 1) {
+      throw new RelayError(400, `${name} must be a positive integer`);
+    }
+  }
+  numberIn("temperature", 0, 2);
+  numberIn("top_p", 0, 1);
+  numberIn("presence_penalty", -2, 2);
+  numberIn("frequency_penalty", -2, 2);
+  if (body.n != null && body.n !== 1) {
+    throw new RelayError(400, "n must be 1");
+  }
+  return UNSUPPORTED_GENERATION_PARAMS.filter((name) => body[name] != null);
 }
 
 function lastResultLine(stdout) {
@@ -349,7 +393,10 @@ function writeChunk(res, id, created, model, delta, finishReason = null) {
   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
-function sendCompletion(res, body, model, text, calls, droidResult) {
+function sendCompletion(res, body, model, text, calls, droidResult, ignoredParams = []) {
+  if (ignoredParams.length && !res.headersSent) {
+    res.setHeader("X-Relay-Ignored-Params", ignoredParams.join(","));
+  }
   const id = openAiId();
   const created = Math.floor(Date.now() / 1000);
   const finishReason = calls ? "tool_calls" : "stop";
@@ -418,11 +465,14 @@ function childEnvironment(factoryApiKey) {
   return env;
 }
 
-async function runDroid(config, sandboxDir, prompt, model, req, res) {
+async function runDroid(config, sandboxDir, prompt, model, req, res, clientGone = () => false) {
+  // 准备临时目录/写 prompt 期间客户端可能已断开：此时不能再启动生成
+  if (clientGone()) return { disconnected: true };
   const promptDir = await fs.mkdtemp(path.join(os.tmpdir(), "factory-relay-prompt-"));
   const promptFile = path.join(promptDir, "prompt.txt");
   try {
     await fs.writeFile(promptFile, prompt, { mode: 0o600 });
+    if (clientGone()) return { disconnected: true };
     const args = [
       "exec",
       "-m",
@@ -473,6 +523,12 @@ async function runDroid(config, sandboxDir, prompt, model, req, res) {
       req.once("aborted", onAbort);
       res.once("close", onClose);
       listeners.push([req, "aborted", onAbort], [res, "close", onClose]);
+      // 监听装上之前那一刻断开的也要拦住
+      if (clientGone()) {
+        disconnected = true;
+        finish(null, { code: null, signal: null });
+        return;
+      }
       try {
         child = spawn(config.droidBin, args, {
           stdio: ["ignore", "pipe", "ignore"],
@@ -549,6 +605,8 @@ export function createRelayServer(config = loadConfig()) {
         sendJson(res, 200, {
           object: "list",
           data: config.allowedModels.map((id) => ({ id, object: "model", owned_by: "factory" })),
+          // 能力差异声明：这些采样参数 droid exec 不支持，中转受理但不会生效
+          unsupported_params: UNSUPPORTED_GENERATION_PARAMS,
         });
         return;
       }
@@ -569,9 +627,18 @@ export function createRelayServer(config = loadConfig()) {
         return;
       }
       active++;
+      // 一占到名额就开始监听断连：读请求体、准备 prompt 期间断开的请求不得再启动 droid
+      let gone = false;
+      const markGone = () => { gone = true; };
+      const onResClose = () => { if (!res.writableEnded) gone = true; };
+      req.once("aborted", markGone);
+      res.once("close", onResClose);
+      const clientGone = () => gone || req.destroyed && !req.complete || res.destroyed;
       try {
         const body = await readJson(req, config.maxBodyBytes, config.bodyTimeoutMs);
         validateChatBody(body);
+        const ignoredParams = checkGenerationParams(body);
+        // 省略或不在允许列表里的模型回退到默认模型（启动时已校验默认模型在列表内）
         const model = config.allowedModels.includes(body.model)
           ? body.model
           : config.droidModel;
@@ -581,7 +648,9 @@ export function createRelayServer(config = loadConfig()) {
           tools,
           tool_choice: body.tool_choice,
         });
-        const droid = await runDroid(config, await sandboxDir, prompt, model, req, res);
+        const sandbox = await sandboxDir;
+        if (clientGone()) return;
+        const droid = await runDroid(config, sandbox, prompt, model, req, res, clientGone);
         if (droid.disconnected || res.destroyed) return;
         if (droid.timedOut) {
           sendError(res, 504, "Droid execution timed out");
@@ -606,13 +675,15 @@ export function createRelayServer(config = loadConfig()) {
         }
         const text = String(result.result ?? "");
         const calls = parseToolCalls(text, tools, body.tool_choice);
-        sendCompletion(res, body, model, text, calls, result);
+        sendCompletion(res, body, model, text, calls, result, ignoredParams);
       } catch (err) {
         if (res.destroyed || res.writableEnded) return;
         const status = err instanceof RelayError ? err.status : 502;
         if (status === 408 || status === 413) res.setHeader("Connection", "close");
         sendError(res, status, err instanceof RelayError ? err.message : "Droid execution failed");
       } finally {
+        req.removeListener("aborted", markGone);
+        res.removeListener("close", onResClose);
         active--;
       }
     })().catch(() => {
