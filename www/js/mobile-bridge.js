@@ -743,16 +743,89 @@
       .sort((a, b) => a - b)
       .map((i) => {
         const tc = toolMap[i];
+        // 审查四③：有 id/参数却没有工具名的槽位不是“可忽略的空槽”，而是残缺调用——整轮失败
+        if (!tc.function?.name) throw streamProtocolError("工具调用缺少名称");
         return {
           id: tc.id || "",
           type: tc.type || "function",
           function: {
-            name: tc.function?.name || "",
+            name: tc.function.name,
             arguments: tc.function?.arguments || "",
           },
         };
-      })
-      .filter((tc) => tc.function.name);
+      });
+  }
+
+  /**
+   * 审查四②：finish_reason 统一校验。
+   *   - null/undefined/"" → 尚未结束（返回 null）；
+   *   - 非字符串（对象、数字…）→ 协议异常，整轮失败；
+   *   - 字符串原样返回，由 assertFinishAllowsTools 判断能否执行工具。
+   */
+  function normalizeFinishReason(raw) {
+    if (raw == null || raw === "") return null;
+    if (typeof raw !== "string") throw streamProtocolError("finish_reason 结构异常");
+    if (raw.length > 64) throw streamProtocolError("finish_reason 结构异常");
+    return raw;
+  }
+
+  /** 只有正常结束（tool_calls / function_call / stop）的回复里的工具调用才可执行 */
+  const TOOL_SAFE_FINISH = new Set(["tool_calls", "function_call", "stop"]);
+
+  /**
+   * 回复被截断（length / max_tokens）、被过滤（content_filter）或给了未知结束原因时，
+   * 累计的工具调用可能残缺或被篡改：失败关闭，一条都不交给 agent-loop。
+   * 纯文本回复不受影响（截断的文本没有副作用，照常返回并带上 finish_reason）。
+   */
+  function assertFinishAllowsTools(finishReason, toolCalls) {
+    if (!toolCalls || !toolCalls.length) return;
+    if (finishReason == null || TOOL_SAFE_FINISH.has(finishReason)) return;
+    const why =
+      finishReason === "length" || finishReason === "max_tokens"
+        ? "回复被截断"
+        : finishReason === "content_filter"
+          ? "回复被内容过滤"
+          : "回复结束状态异常";
+    const err = new Error(
+      `AI ${why}（finish_reason=${String(finishReason).slice(0, 32)}），工具调用未执行，本轮结果已丢弃`
+    );
+    err.code = "STREAM_TRUNCATED";
+    throw err;
+  }
+
+  /**
+   * 非流式整条 tool_call 校验：id/name/type 类型必须正确。arguments 允许字符串或对象
+   * （部分兼容服务在非流式响应里直接给对象，这是整条而非分片，不存在“旧参数被沿用”的问题）。
+   */
+  function validateBufferedToolCall(tc) {
+    if (!tc || typeof tc !== "object" || Array.isArray(tc)) throw streamProtocolError("tool_call 结构异常");
+    if (tc.id != null && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
+    if (tc.type != null && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
+    const fn = tc.function;
+    if (!fn || typeof fn !== "object" || Array.isArray(fn)) throw streamProtocolError("tool_call function 结构异常");
+    if (typeof fn.name !== "string" || !fn.name) throw streamProtocolError("工具名类型异常");
+    const a = fn.arguments;
+    if (a != null && typeof a !== "string" && (typeof a !== "object" || Array.isArray(a))) {
+      throw streamProtocolError("工具参数类型异常");
+    }
+  }
+
+  /** 审查四③：单条 tool delta 严格校验——index/id/type/name/arguments 类型都必须正确 */
+  function validateToolDelta(tc) {
+    if (!tc || typeof tc !== "object" || Array.isArray(tc)) throw streamProtocolError("tool_call 结构异常");
+    if (tc.index != null && !(Number.isSafeInteger(tc.index) && tc.index >= 0 && tc.index < 1024)) {
+      throw streamProtocolError("tool_call index 异常");
+    }
+    if (tc.id != null && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
+    if (tc.type != null && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
+    const fn = tc.function;
+    if (fn != null) {
+      if (typeof fn !== "object" || Array.isArray(fn)) throw streamProtocolError("tool_call function 结构异常");
+      if (fn.name != null && typeof fn.name !== "string") throw streamProtocolError("工具名类型异常");
+      if (fn.arguments != null && typeof fn.arguments !== "string") {
+        throw streamProtocolError("工具参数片段不是字符串");
+      }
+    }
   }
 
   /* ----------------------------- active requests ----------------------------- */
@@ -1006,7 +1079,8 @@
     };
 
     const applyDelta = (delta, choiceFinish) => {
-      if (choiceFinish) finishReason = choiceFinish;
+      const fin = normalizeFinishReason(choiceFinish);
+      if (fin) finishReason = fin;
       if (typeof delta.content === "string" && delta.content) {
         ensureAppendFits(content, delta.content, LIMITS.maxResponseContentChars, "回复正文");
         consumeChars(delta.content.length);
@@ -1026,7 +1100,8 @@
       }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
-          const idx = typeof tc.index === "number" ? tc.index : 0;
+          validateToolDelta(tc);
+          const idx = tc.index == null ? 0 : tc.index;
           if (!toolMap[idx]) {
             if (Object.keys(toolMap).length >= LIMITS.maxToolCallsPerResponse) {
               const err = new Error("工具调用数量超过上限");
@@ -1036,7 +1111,11 @@
             toolMap[idx] = { function: { name: "", arguments: "" } };
           }
           const slot = toolMap[idx];
-          if (tc.id) slot.id = tc.id;
+          if (tc.id) {
+            // 同一 index 中途换 id：说明分片错乱，不能把两次调用的参数拼在一起执行
+            if (slot.id && slot.id !== tc.id) throw streamProtocolError("同一工具调用的 id 前后不一致");
+            slot.id = tc.id;
+          }
           if (tc.type) slot.type = tc.type;
           if (typeof slot.id === "string" && slot.id.length > LIMITS.maxToolCallIdChars) {
             const err = new Error("工具调用 ID 过长");
@@ -1116,7 +1195,7 @@
         throw streamProtocolError("tool_calls 结构异常");
       }
       try {
-        applyDelta(delta, choice.finish_reason || null);
+        applyDelta(delta, choice.finish_reason);
       } catch (err) {
         throw normalizeStreamError(err);
       }
@@ -1144,6 +1223,7 @@
           throw err;
         }
         const tool_calls = finalizeToolCalls(toolMap);
+        assertFinishAllowsTools(finishReason, tool_calls);
         if (!finishReason) finishReason = tool_calls.length ? "tool_calls" : "stop";
         return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut };
       }
@@ -1160,7 +1240,10 @@
       }
       const choice = data?.choices?.[0];
       const msg = choice?.message || {};
-      finishReason = choice?.finish_reason || null;
+      if (choice != null && (typeof choice !== "object" || Array.isArray(choice))) {
+        throw streamProtocolError("choice 结构异常");
+      }
+      finishReason = normalizeFinishReason(choice?.finish_reason);
       if (msg.content) {
         if (String(msg.content).length > LIMITS.maxResponseContentChars) {
           const err = new Error("回复正文超过安全上限");
@@ -1187,6 +1270,7 @@
         }
         for (let i = 0; i < msg.tool_calls.length; i++) {
           const tc = msg.tool_calls[i];
+          validateBufferedToolCall(tc);
           const id = String(tc?.id || "");
           const name = String(tc?.function?.name || "");
           const args =
@@ -1255,6 +1339,8 @@
     }
 
     const tool_calls = finalizeToolCalls(toolMap);
+    // 用户停止/超时的流本来就不会执行工具（agent-loop 硬闸门）；其余一律校验结束状态
+    if (!aborted) assertFinishAllowsTools(finishReason, tool_calls);
     if (!finishReason && !aborted) {
       finishReason = tool_calls.length ? "tool_calls" : "stop";
     }
@@ -1552,8 +1638,21 @@
             if (!data || typeof data !== "object" || Array.isArray(data)) {
               throw streamProtocolError("响应体不是对象");
             }
+            if (data.choices != null && !Array.isArray(data.choices)) {
+              throw streamProtocolError("choices 结构异常");
+            }
             const choice = data?.choices?.[0] || {};
+            if (typeof choice !== "object" || Array.isArray(choice)) throw streamProtocolError("choice 结构异常");
             const msg = choice.message || {};
+            if (typeof msg !== "object" || Array.isArray(msg)) throw streamProtocolError("message 结构异常");
+            // 审查四②：complete 与流式同一套 finish_reason / tool_calls 校验
+            const finish = normalizeFinishReason(choice.finish_reason);
+            if (msg.tool_calls != null && !Array.isArray(msg.tool_calls)) {
+              throw streamProtocolError("tool_calls 结构异常");
+            }
+            const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+            for (const tc of calls) validateBufferedToolCall(tc);
+            assertFinishAllowsTools(finish, calls);
             return {
               ok: true,
               requestId,
@@ -1562,9 +1661,9 @@
                 role: "assistant",
                 content: msg.content || "",
                 reasoning_content: msg.reasoning_content || "",
-                tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
+                tool_calls: calls,
               },
-              finish_reason: choice.finish_reason || null,
+              finish_reason: finish,
             };
           } finally {
             // 即使原生请求在停止后才返回，也必须清理它自己的监听器。
@@ -1749,7 +1848,10 @@
           });
           logRequestFailure("chat stream", err, { url: endpoint, status: err?.status });
           // 流内错误/断流保留具体原因（含上游给的错误信息），别被 HTTP 状态分类盖掉
-          const streamFailed = err?.code === "STREAM_ERROR" || err?.code === "STREAM_INCOMPLETE";
+          const streamFailed =
+            err?.code === "STREAM_ERROR" ||
+            err?.code === "STREAM_INCOMPLETE" ||
+            err?.code === "STREAM_TRUNCATED";
           emitError(requestId, streamFailed ? err.message : classified.message);
         } finally {
           finished = true;
@@ -1874,7 +1976,7 @@
     clearFailed() {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
       if (!cu?.clearFailedQueue) return Promise.resolve({ ok: false, error: "ClickUp 模块未加载" });
-      return Promise.resolve({ ok: cu.clearFailedQueue() });
+      return Promise.resolve(cu.clearFailedQueue()).then((ok) => ({ ok: ok === true }));
     },
     status() {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
