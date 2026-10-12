@@ -827,6 +827,8 @@ function logPomoToClickUp(endedAt, segmentMs){
     Promise.resolve(
       bridge.logPomo({
         title: task ? task.text : "",
+        // 已传过 ClickUp 的待办直接记到那个任务上，别按（可能被截断的）标题再找/新建
+        taskId: task && task.clickupTaskId ? task.clickupTaskId : undefined,
         minutes,
         endedAt: at,
         operationId,
@@ -911,7 +913,7 @@ function finishSegment(silentCatchUp, endedAtOverride){
     if (!dup && pomo.taskId){
       const t = todos.find((x) => x.id === pomo.taskId);
       if (t){
-        remoteIds.delete(t.id);    // 本页记账改写，当前版本不再是远端写的
+        /* 番茄入账是系统字段回写：不动 remoteIds，免得撤销无关操作时把别页的编辑回滚掉 */
         t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); t.updatedAt = Date.now(); persist();
       }
     }
@@ -955,8 +957,10 @@ function toggleRun(){
     if (pomo.leftMs != null && pomo.leftMs <= 0){ finishSegment(false); return; }
     const fresh = pomo.leftMs == null;
     const left = fresh ? durationOf(pomo.mode) : pomo.leftMs;
-    if (!(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
-      pomo.segmentMs = durationOf(pomo.mode);
+    /* 新的一段：计时和打卡时长必须来自同一个预设，一起锁定。
+       续跑：沿用本段开始时锁定的 segmentMs（缺失时才补当前预设） */
+    if (fresh || !(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
+      pomo.segmentMs = fresh ? left : durationOf(pomo.mode);
     }
     pomo.running = true;
     pomo.endsAt = Date.now() + left;
@@ -1032,8 +1036,11 @@ function focusOnTask(id){
 function setPomoPreset(idx){
   if (!PRESETS[idx]) return null;
   pomo.presetIdx = idx;
-  if (!pomo.running){
-    pomo.leftMs = null;
+  /* 新预设只影响下一段：跑着或暂停着的当前段，剩余时间与锁定的 segmentMs 都不动，
+     否则「暂停→换预设→继续」会让倒计时按新时长重来，而打卡还按旧时长上传 */
+  const segmentInProgress = pomo.running || pomo.leftMs != null;
+  if (!segmentInProgress){
+    pomo.segmentMs = null;
     // 专注刚结束的 900ms 过渡中，要按照新预设重新决定短休息/长休息。
     if (segmentTransitionTimer){
       pomo.mode = pomo.round % preset().per === 0 ? "long" : "short";
@@ -1275,23 +1282,53 @@ function loadState(){
 }
 
 /* ---------------------------------------------------------------- 写入 */
+/* 脏窗口的恢复写之前：先把窗口期间别页写进盘的内容按 dirtyBase 三方合并进内存。
+   否则这次写会直接盖掉别页的新增/编辑，而合并要等到下一次操作——
+   用户写完立刻关页或刷新，远端改动就永久丢了。
+   远端来源取「盘上的远端写」（最新）或攒着的 pendingExternal 快照。
+   返回内存是否因合并改变。 */
+function mergeRemoteBeforeRecoveryWrite(){
+  if (!localDirty || !Array.isArray(dirtyBase)) return false;
+  let remoteSrc = null;
+  try {
+    const disk = JSON.parse(store.get(STORAGE_KEY) || "null");
+    if (disk && !Array.isArray(disk) && disk.writer && disk.writer !== TAB_ID
+        && Array.isArray(disk.todos)) remoteSrc = disk;
+  } catch { /* 读不出盘就只用排队快照 */ }
+  if (!remoteSrc && pendingExternal) remoteSrc = pendingExternal;
+  if (!remoteSrc) return false;
+  const before = JSON.stringify(todos);
+  mergeRemoteWindow(remoteSrc, dirtyBase, true);
+  pendingExternal = null;
+  return JSON.stringify(todos) !== before;
+}
+
 function persist(){
-  const savedAt = Date.now();
-  /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
-     比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
-  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, settledSegs:pomo.settledSegs, todos });
   if (!storageWritable){
     setPersistState("unavailable");
     if (!localDirty) dirtyBase = lastAppliedList;
     localDirty = true;
     return false;
   }
+  const wasDirty = localDirty;
+  const mergedRemote = mergeRemoteBeforeRecoveryWrite();
+  const savedAt = Date.now();
+  /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
+     比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
+  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, settledSegs:pomo.settledSegs, todos });
   try {
     store.set(STORAGE_KEY, payload);
     setPersistState("ok");
     flashSaved();
     localDirty = false;
     lastAppliedList = todos.map((t) => ({ ...t }));
+    /* 恢复写已经带上了合并结果：窗口基线和排队快照都用完了 */
+    if (wasDirty){ dirtyBase = null; pendingExternal = null; }
+    if (mergedRemote){
+      reconcilePomoTask();
+      /* 调用方通常已 render 过旧内存：合进来的远端条目要补一次上屏 */
+      setTimeout(() => { try { render(); } catch { /* ignore */ } }, 0);
+    }
     return true;
   } catch (err) {
     const quota = err && (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED" || err.code === 22);
@@ -1304,6 +1341,14 @@ function persist(){
 }
 
 /* ---------------------------------------------------------------- 撤销 */
+/* 用户可编辑的字段（撤销归因只看这些）；系统回写字段：pomodoros、clickupTaskId、clickupUrl、updatedAt */
+function userFields(t){
+  if (!t) return null;
+  return {
+    id: t.id, text: t.text, completed: t.completed, completedAt: t.completedAt,
+    priority: t.priority, category: t.category, dueDate: t.dueDate, createdAt: t.createdAt,
+  };
+}
 function snapshot(label){
   undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId });
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
@@ -1348,6 +1393,10 @@ function undo(){
     const M = new Map(todos.map((t) => [t.id, t]));
     const diskIds = new Set(diskList.map((t) => t.id));
     const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    /* 字段级归因：pomodoros/ClickUp 关联/updatedAt 是系统回写，不是用户编辑。
+       一条待办自快照以来只有系统字段变了，就说明这次撤销跟它无关——
+       不管它的版本是谁写的，都按盘上原样保留，绝不能借机回滚别页的编辑 */
+    const eqUser = (a, b) => eq(userFields(a), userFields(b));
     let merged = [];
     for (const d of diskList){
       const s = S.get(d.id), m = M.get(d.id);
@@ -1365,7 +1414,7 @@ function undo(){
       }
       /* 三方共有：盘≠内存说明远端版较新（远端赢）；盘==内存且≠快照时，
          登记过的是远端流入（远端赢），没登记的是我方改动（回滚到快照） */
-      if (!m || !eq(d, m) || eq(m, s) || remoteIds.has(d.id)) merged.push(d);
+      if (!m || !eq(d, m) || eqUser(m, s) || remoteIds.has(d.id)) merged.push(d);
       else merged.push(s);
     }
     /* 快照有而盘没有：登记过的是远端删的（不复活），没登记的是我们删的
@@ -1386,7 +1435,7 @@ function undo(){
        合并结果与快照同集合、同内容时，按快照顺序排回 */
     const byId = new Map(merged.map((t) => [t.id, t]));
     if (merged.length === snap.todos.length
-        && snap.todos.every((t) => { const g = byId.get(t.id); return g && eq(g, t); })){
+        && snap.todos.every((t) => { const g = byId.get(t.id); return g && eqUser(g, t); })){
       merged = snap.todos.map((t) => byId.get(t.id));
     }
     todos = merged.map(restore);
@@ -2169,7 +2218,8 @@ async function pushTodoToClickUp(id, btnEl){
       console.warn("[clickup] pushTodo 回包 id 非法：", r);
       return { ok:false, code:"BAD_RESPONSE", error: msg, message: msg };
     }
-    remoteIds.delete(id);        // 本页回写 taskId，当前版本不再是远端写的
+    /* 系统字段回写不改编辑归因：不动 remoteIds。若这条刚流入了别页的编辑，
+       它仍算远端版本，撤销本页无关操作时不会被回滚成旧正文 */
     live.clickupTaskId = taskId;
     live.clickupUrl = safeUrl || ("https://app.clickup.com/t/" + taskId);
     live.updatedAt = Date.now();
@@ -2209,7 +2259,23 @@ function toggleTodo(id, checkEl){
   syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return;
-  const willComplete = !t.completed;
+  applyCompleted(t, !t.completed, rect);
+}
+
+/* 显式设置完成状态（Agent 工具用）：先同步再按目标值写，绝不 toggle——
+   别页刚改过状态而本页还没收到事件时，toggle 会做成相反的操作。
+   返回 null=找不到，"unchanged"=已是目标状态，"changed"=已改 */
+function setCompleted(id, completed){
+  syncTodosFromDisk();
+  const t = todos.find((x) => x.id === id);
+  if (!t) return null;
+  if (t.completed === Boolean(completed)) return "unchanged";
+  applyCompleted(t, Boolean(completed), null);
+  return "changed";
+}
+
+function applyCompleted(t, willComplete, rect){
+  const id = t.id;
   if (willComplete && rect) burst(rect.left + rect.width / 2, rect.top + rect.height / 2);
   snapshot(willComplete ? "标记完成" : "取消完成");
   remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
@@ -2360,8 +2426,13 @@ function attachDrag(node, id){
 }
 
 /* ----------------------------------------------------------- 导入/导出 */
+/* 导出永远取应用内存：写盘失败时内存才是最新的（盘上可能是旧版本）。
+   网页导出和 iOS 分享导出（mobile-settings.js）共用这一份快照 */
+function exportSnapshot(){
+  return { v:SCHEMA_VERSION, exportedAt:new Date().toISOString(), todos: todos.map((t) => ({ ...t })) };
+}
 function exportJSON(){
-  const blob = new Blob([JSON.stringify({ v:SCHEMA_VERSION, exportedAt:new Date().toISOString(), todos }, null, 2)], { type:"application/json" });
+  const blob = new Blob([JSON.stringify(exportSnapshot(), null, 2)], { type:"application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = `todo-${todayStr()}.json`; a.click();
@@ -2920,7 +2991,10 @@ function bindEvents(){
   pomoReset.addEventListener("click", resetSegment);
   pomoPreset.addEventListener("click", () => {
     const next = setPomoPreset((pomo.presetIdx + 1) % PRESETS.length);
-    if (next) toast(`时长已改为 ${next.label} 分钟`);
+    if (next){
+      const midSegment = pomo.running || pomo.leftMs != null;
+      toast(midSegment ? `时长已改为 ${next.label} 分钟（当前这段不变，下一段生效）` : `时长已改为 ${next.label} 分钟`);
+    }
   });
   pomoBell.addEventListener("click", async () => {
     if (!pomo.sound){
@@ -3229,7 +3303,8 @@ function agentInvoke(name, rawArgs){
         if (PRIORITIES.includes(args.priority)) patch.priority = args.priority;
         if (CATEGORIES.includes(args.category)) patch.category = args.category;
         if ("due_date" in args || "dueDate" in args){
-          let due = args.due_date ?? args.dueDate;
+          /* 按字段是否存在取值：显式 null 是「清除截止日期」，不能被 ?? 换成 undefined */
+          const due = "due_date" in args ? args.due_date : args.dueDate;
           if (due === null || due === "" || due === "null") patch.dueDate = null;
           else if (isISODate(due)) patch.dueDate = due;
           else return { ok:false, error:`日期无效：${due}` };
@@ -3242,6 +3317,7 @@ function agentInvoke(name, rawArgs){
         return { ok:true, todo: serializeTodo(next), message:`已更新：${next.text}` };
       }
       case "complete_todo": {
+        syncTodosFromDisk();   // 先灌盘上最新状态再匹配，别按过期的完成状态挑目标
         const found = findTodoByArgs(args, { scope: "active" });
         if (!found?.todo){
           return {
@@ -3251,12 +3327,15 @@ function agentInvoke(name, rawArgs){
             candidates: found?.candidates,
           };
         }
-        const t = found.todo;
-        if (t.completed) return { ok:true, todo: serializeTodo(t), message:"已经是完成状态" };
-        toggleTodo(t.id);
-        return { ok:true, todo: serializeTodo(todos.find((x) => x.id === t.id)), message:`已完成：${t.text}` };
+        const id = found.todo.id;
+        const r = setCompleted(id, true);
+        const now = todos.find((x) => x.id === id);
+        if (!r || !now) return { ok:false, error:"待办已被删除", code:"NOT_FOUND" };
+        if (r === "unchanged") return { ok:true, todo: serializeTodo(now), message:"已经是完成状态" };
+        return { ok:true, todo: serializeTodo(now), message:`已完成：${now.text}` };
       }
       case "uncomplete_todo": {
+        syncTodosFromDisk();   // 先灌盘上最新状态再匹配，别按过期的完成状态挑目标
         const found = findTodoByArgs(args, { scope: "completed" });
         if (!found?.todo){
           return {
@@ -3266,10 +3345,12 @@ function agentInvoke(name, rawArgs){
             candidates: found?.candidates,
           };
         }
-        const t = found.todo;
-        if (!t.completed) return { ok:true, todo: serializeTodo(t), message:"已经是进行中" };
-        toggleTodo(t.id);
-        return { ok:true, todo: serializeTodo(todos.find((x) => x.id === t.id)), message:`已恢复：${t.text}` };
+        const id = found.todo.id;
+        const r = setCompleted(id, false);
+        const now = todos.find((x) => x.id === id);
+        if (!r || !now) return { ok:false, error:"待办已被删除", code:"NOT_FOUND" };
+        if (r === "unchanged") return { ok:true, todo: serializeTodo(now), message:"已经是进行中" };
+        return { ok:true, todo: serializeTodo(now), message:`已恢复：${now.text}` };
       }
       case "delete_todo": {
         const found = findTodoByArgs(args, { scope: "any" });
@@ -3356,7 +3437,12 @@ function agentInvoke(name, rawArgs){
         const idx = Number(args.preset);
         const next = setPomoPreset(idx);
         if (!next) return { ok:false, error:"preset 只能是 0/1/2" };
-        return { ok:true, message:`预设已切换为 ${next.label}`, preset: next };
+        const midSegment = pomo.running || pomo.leftMs != null;
+        return {
+          ok:true,
+          message: midSegment ? `预设已切换为 ${next.label}（当前这段不变，下一段生效）` : `预设已切换为 ${next.label}`,
+          preset: next,
+        };
       }
       case "set_theme": {
         if (!THEME_IDS.includes(args.theme)) return { ok:false, error:"主题只能是 kanna/sakura/cafe" };
@@ -3414,6 +3500,7 @@ const TOOL_LABELS = {
 
 function installChatBridge(){
   window.__luminaGetChatContext = () => buildChatContext();
+  window.__luminaExportSnapshot = () => exportSnapshot();
   window.__luminaGetThemeInfo = () => {
     const th = THEMES[currentTheme] || THEMES.kanna;
     return { id: currentTheme, charName: th.charName, brand: th.brand, name: th.name };
