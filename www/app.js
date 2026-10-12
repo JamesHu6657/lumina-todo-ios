@@ -386,8 +386,44 @@ const remoteIds = new Set();   // 当前版本由远端写入（流入过内存�
    审查六①：不再在落盘成功时整张清空——落盘只说明本页版本暂时盖住了远端，撤销时仍应露出远端值；
    每条带 seq，只对「记录之前就已存在」的撤销步生效，随撤销栈修剪（pruneUndoSideTables）
    审查七①：每条再绑定 owner=产生本页胜出值的那一个撤销步的 seq（ownerStepForGroup）。
-   只有撤销那一步时才套用；撤销后即消费删除，绝不被更早/更晚的步复用 */
+   只有撤销那一步时才套用；撤销后即消费删除，绝不被更早/更晚的步复用
+   审查八①：key=`${id}\u0000${组序号}\u0000${owner}`，每个撤销步各一条（一条新冲突不再顶掉更早步的记录）；
+   不变式——记录的 theirs 始终是「自该步以来最近一次观察到的远端值」：任何合并路径
+   （三方合并、storage 事件采纳、落盘时软合并、脏窗口恢复）只要看到远端在合并基线之后改过这组（或编辑过这条），
+   就刷新同一 id+组 的全部记录，即便远端值恰好等于本页值（refreshRemoteConflicts） */
 const remoteFieldConflicts = new Map();
+function conflictKey(id, gi, owner){ return id + "\u0000" + gi + "\u0000" + owner; }
+function pickGroup(o, g){ return Object.fromEntries(g.map((f) => [f, o?.[f]])); }
+/* 审查八①：观察到远端条目 theirs 的字段组 gi → 刷新该 id+组 所有冲突记录的远端基准（theirs 与归因 seq）。
+   不删记录（删了撤销会写回历史 before，同样盖掉远端最新）。
+   刷新条件：这组相对合并基线变过，或远端在基线之后编辑过这条（updatedAt 只随用户编辑前进）。
+   两者都没有时不动——那只是远端原样回显本页已落盘的值，记录里保留的仍是最近一次独立的远端值。
+   拿不准时偏向刷新：刷新错了最多让撤销变成不动，不刷新错了会把陈旧值写回盖掉远端最新 */
+function refreshRemoteConflictGroup(id, gi, theirs){
+  if (!id || !theirs) return;
+  const g = USER_FIELD_GROUPS[gi];
+  for (const [k, rec] of remoteFieldConflicts){
+    if (rec.id !== id || rec.gi !== gi) continue;
+    remoteFieldConflicts.set(k, { ...rec, theirs: pickGroup(theirs, g), seq: ++undoSeq });
+  }
+}
+function refreshRemoteConflicts(id, base, theirs){
+  if (!id || !theirs || !remoteFieldConflicts.size) return;
+  const touched = !base || !sameField(theirs.updatedAt, base.updatedAt);
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    if (!touched && groupEq(theirs, base, g)) return;   // 远端相对基线没动这组、也没编辑过这条
+    refreshRemoteConflictGroup(id, gi, theirs);
+  });
+}
+/* 非脏窗口整份采纳远端写（storage 事件 / mutator 入口读盘）：以采纳前已知的盘形态为基线逐条刷新 */
+function refreshConflictsFromAdopted(baseList, remoteList){
+  if (!remoteFieldConflicts.size) return;
+  const baseMap = new Map((baseList || []).map((t) => [t.id, t]));
+  for (const r of remoteList){
+    const b = baseMap.get(r.id);
+    if (b) refreshRemoteConflicts(r.id, b, r);
+  }
+}
 /* 审查六①：本页已删除（落没落盘都算）、但合并时看到远端在删除之后仍改过的条目。
    id → { base: 本删除代首次看到时的合并基线版本, theirs: 远端最新版本, owner, seq }。
    撤销删除时按 before↔base↔theirs 三方合并恢复，绝不把删除前的历史快照写回盘盖掉远端编辑。
@@ -1534,7 +1570,7 @@ function invertUndoEntry(entry, current, conflicts, deletedLatest){
       if (groupEq(s, a, g) || !groupEq(t, a, g)) return;
       /* 审查五 A：这组在本操作之后被远端改过（合并时本页 after 胜出）→ 只撤掉本页的增量，
          露出远端的最新值；绝不把历史 before 写回去盖掉别页的编辑 */
-      const c = conflicts && conflicts.get(t.id + "\u0000" + gi);
+      const c = conflicts && conflicts.get(conflictKey(t.id, gi, seq));
       const src = mine(c) && groupEq(c.ours, a, g) ? c.theirs : s;
       if (next === t) next = { ...t };
       for (const f of g) next[f] = src[f];
@@ -2683,6 +2719,8 @@ function syncTodosFromDisk(){
      「别页结算+persist」的本地写入会把盘上标记抹掉，给重复记账开窗。
      并集采纳：标记只增，旧写入无法让集合回退 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  /* 审查八①：盘上是别页写 → 相对上次已知盘形态改过的组刷新冲突基准（脏窗口合并刚前移过基线时为空操作） */
+  if (parsed && !Array.isArray(parsed) && parsed.writer && parsed.writer !== TAB_ID) refreshConflictsFromAdopted(lastAppliedList, clean);
   lastAppliedList = clean.map((t) => ({ ...t }));   // 盘上内容的最后已知形态：恢复/软合并的基线
   const same = JSON.stringify(clean) === JSON.stringify(todos);
   if (!same){ markRemoteAdopted(todos, clean); todos = clean; }   // 外部内容流进内存：undo 归因要登记
@@ -2726,14 +2764,15 @@ function mergeThreeWay(ours, base, theirs){
       keptOurs = true;
       /* 双方都改了这组、本页胜出：记下远端值，撤销本页这次操作时要还给远端（审查五 A） */
       if (ours.id && !groupEq(theirs, base, g) && !groupEq(theirs, ours, g)){
-        const pick = (o) => Object.fromEntries(g.map((f) => [f, o[f]]));
         const owner = ownerStepForGroup(ours.id, g, ours);
-        const k = ours.id + "\u0000" + gi;
-        if (owner) remoteFieldConflicts.set(k, { ours: pick(ours), theirs: pick(theirs), owner, seq: ++undoSeq });
-        else remoteFieldConflicts.delete(k);   // 本页值不是任何撤销步产生的：无步可套用
+        /* 本页值不是任何撤销步产生的：无步可套用，不建新记录（已有记录仍在下面刷新） */
+        if (owner) remoteFieldConflicts.set(conflictKey(ours.id, gi, owner),
+          { id: ours.id, gi, ours: pickGroup(ours, g), theirs: pickGroup(theirs, g), owner, seq: ++undoSeq });
       }
     }
   });
+  /* 审查八①：远端相对基线改过的组（含改成与本页相同的值）→ 已有记录一律刷新为最新远端值 */
+  if (ours.id) refreshRemoteConflicts(ours.id, base, theirs);
   Object.assign(out, mergeSystemFields(ours, theirs));
   const ou = ours.updatedAt || 0, tu = theirs.updatedAt || 0;
   out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
@@ -2759,7 +2798,7 @@ function mergeRemoteWindow(parsed, base, followDeletes){
     .map((t) => {
       const b = baseMap.get(t.id), r = remoteMap.get(t.id);
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
-      if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版
+      if (eq(t, b)){ refreshRemoteConflicts(t.id, b, r); return { ...r }; }   // 我们没碰过 → 远端版（审查八①：照样刷新冲突基准）
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
       return mergeThreeWay(t, b, r);
     });
@@ -2797,6 +2836,9 @@ function mergeSoftRemote(parsed){
     /* 用户字段按用户编辑时间（updatedAt，系统回写不推它）整体取较新一方；
        系统字段独立合并——ClickUp 回写/番茄入账不能让旧正文显得「更新」 */
     const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
+    /* 审查八①：被覆盖的远端快照也是一次远端观察。没有可靠基线（盘上已是本页写），
+       以本页值为基线：与本页不同的组刷新；快照在本页值之后被远端编辑过（updatedAt 不同）则相同的组也刷新 */
+    refreshRemoteConflicts(t.id, t, r);
     return { ...t, ...userFields(w), updatedAt: w.updatedAt, ...mergeSystemFields(t, r) };
   });
   for (const t of remote){
@@ -2814,7 +2856,9 @@ function applyExternal(parsed){
   const list = Array.isArray(parsed) ? parsed : parsed && parsed.todos;
   const clean = sanitizeList(Array.isArray(list) ? list : []).todos;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
-  if (JSON.stringify(clean) === JSON.stringify(todos)) return;   // 内容与内存一致：套了也白套
+  /* 审查八①：即便内容与内存一致也算一次远端观察（远端可能独立改成了与本页相同的值） */
+  refreshConflictsFromAdopted(lastAppliedList, clean);
+  if (JSON.stringify(clean) === JSON.stringify(todos)){ lastAppliedList = clean.map((t) => ({ ...t })); return; }   // 内容与内存一致：套了也白套
   markRemoteAdopted(todos, clean);
   todos = clean;
   lastAppliedList = clean.map((t) => ({ ...t }));
