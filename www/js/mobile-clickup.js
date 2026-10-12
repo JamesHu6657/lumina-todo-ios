@@ -707,6 +707,24 @@
   }
 
   /**
+   * 审查七②：恢复出的「自建任务 id」（pending 里已知的、建任务回执、POST 结果丢失后按 marker 找回的）
+   * 统一走这里：先持久了结（回执+标题索引读回确认后才清 pending），再 validateTaskForKey 回查。
+   *   "ok"      → 可以把时间记到它上面
+   *   "invalid" → 已改名/关闭/移走：标题索引已作废，调用方按标题重新查找（回执保留，不会重建同一 operation）
+   * 回查不确定 → 抛可重试 TASK_INDETERMINATE（记录保留、暂停提交时间）；
+   * 已作废但了结没能落盘 → 同样抛出（pending 带 taskId 留着，绝不在此情况下往下新建）。
+   */
+  async function settleRecoveredTask(token, key, operationId, id) {
+    const settled = await finalizeCreatedTask(token, key, operationId, id);
+    const v = await validateTaskForKey(token, key, id);
+    if (v === "ok") return "ok";
+    taskCache.delete(key);
+    await dropMappedTitle(token, key, id);
+    if (!settled) throw taskValidateIndeterminate(new Error("建任务结果未能落盘"));
+    return "invalid";
+  }
+
+  /**
    * 按标题找任务，找不到才新建（番茄打卡用）。
    * 审查四⑦：新建任务的 POST 带稳定 marker，发出前先落盘「不确定」记录；
    * 结果未知（传输失败、5xx、读正文失败、2xx 无 id）时记录保留，之后只按 marker 对账，
@@ -721,6 +739,7 @@
 
     // 同名建任务跨页串行：后到者在锁内能看到先到者的不确定记录或结果
     const work = withLock("task:" + key, async () => {
+      const excluded = new Set();   // 本次已判定不能用（改名/关闭/移走）的任务 id
       const pend = findPendingTask(key);
       if (pend) {
         // 已知结果（本页/别页上次 POST 成功但了结没落盘、或完成回执已在）→ 直接了结，不扫描、不重建
@@ -741,86 +760,93 @@
           }
           id = String(found.id);
         }
-        // 先持久化确认结果再清 pending：写不进去就留着 pending（带上已知 taskId）
-        const settled = await finalizeCreatedTask(token, key, pend.operationId, id);
-        const v = await validateTaskForKey(token, key, id);
-        if (v === "ok") return id;
-        // 自己建的任务已被改名/关闭/删除：pending 未了结时不能往下走（下面可能新建），先保留重试
-        await dropMappedTitle(token, key, id);
-        if (!settled) throw taskValidateIndeterminate(new Error("建任务结果未能落盘"));
+        // 先持久化确认结果再清 pending：写不进去就留着 pending（带上已知 taskId）；再回查标题/清单/状态
+        if ((await settleRecoveredTask(token, key, pend.operationId, id)) === "ok") return id;
+        excluded.add(id);
       }
 
-      // 页内缓存 / 持久标题索引：复用前回查远端
-      const cached = taskCache.get(key);
-      const candidates = [];
-      if (cached && Date.now() - cached.at < LIMITS.taskCacheMs) candidates.push(cached.id);
-      const mapped = findMappedTask(token, key);
-      if (mapped && !candidates.includes(mapped)) candidates.push(mapped);
-      for (const cand of candidates) {
-        const v = await validateTaskForKey(token, key, cand);   // 不确定 → 抛出，不新建
-        if (v === "ok") {
-          taskCache.set(key, { id: cand, at: Date.now() });
-          return cand;
+      // 审查七②：最多两轮——第二轮只在「刚恢复出的自建任务已被改名/关闭」时发生，按标题重新查找
+      for (let pass = 0; pass < 2; pass++) {
+        // 页内缓存 / 持久标题索引：复用前回查远端
+        const cached = taskCache.get(key);
+        const candidates = [];
+        if (cached && Date.now() - cached.at < LIMITS.taskCacheMs && !excluded.has(cached.id)) candidates.push(cached.id);
+        const mapped = findMappedTask(token, key);
+        if (mapped && !candidates.includes(mapped) && !excluded.has(mapped)) candidates.push(mapped);
+        for (const cand of candidates) {
+          const v = await validateTaskForKey(token, key, cand);   // 不确定 → 抛出，不新建
+          if (v === "ok") {
+            taskCache.set(key, { id: cand, at: Date.now() });
+            return cand;
+          }
+          excluded.add(cand);
+          await dropMappedTitle(token, key, cand);
         }
-        await dropMappedTitle(token, key, cand);
-      }
 
-      const { tasks, exhausted } = await listTasksPages(token, {
-        includeClosed: false,
-        maxPages: MAX_LIST_PAGES,
-      });
-      const found = tasks.find((t) => normTitle(t.name) === key && !candidates.includes(String(t.id)));
-      if (!found && !exhausted) {
-        const err = new Error("清单过大，无法确认同名任务是否已存在");
-        err.retryable = false;
-        err.inconclusive = true;
-        throw err;
-      }
-      let id;
-      if (found && found.id) {
-        id = String(found.id);
-        await rememberMappedTask(token, key, id);
-        taskCache.set(key, { id, at: Date.now() });
-        return id;
-      }
-      const operationId = newId("ptask-");
-      const body = {
-        name: title,
-        description: "从 Lumina Todo 番茄打卡创建\n" + opMarker(operationId),
-      };
-      if (Number.isFinite(dueTs) && dueTs > 0) {
-        body.due_date = dueTs;
-        body.due_date_time = false;
-      }
-      if (!(await upsertPendingTask({ key, operationId, title, createdAt: Date.now() }))) {
-        const err = new Error("无法保存新建任务的核对记录，已取消提交以避免重复创建");
-        err.code = "PENDING_WRITE_FAILED";
-        err.retryable = true;
-        throw err;
-      }
-      let made;
-      try {
-        made = await cu(token, "POST", "/list/" + listId() + "/task", body);
-      } catch (err) {
-        if (isDefiniteRejection(err)) {
-          await clearPendingTask(key, operationId);
+        const { tasks, exhausted } = await listTasksPages(token, {
+          includeClosed: false,
+          maxPages: MAX_LIST_PAGES,
+        });
+        const found = tasks.find((t) => normTitle(t.name) === key && !excluded.has(String(t.id)));
+        if (!found && !exhausted) {
+          const err = new Error("清单过大，无法确认同名任务是否已存在");
+          err.retryable = false;
+          err.inconclusive = true;
           throw err;
         }
-        // 结果未知：立刻按 marker 查一次，查到就用；查不到/查询失败都保留记录，不重发
-        let late = null;
-        try {
-          late = await findTaskByOpMarker(token, operationId);
-        } catch {
-          late = null;
+        let id;
+        if (found && found.id) {
+          id = String(found.id);
+          await rememberMappedTask(token, key, id);
+          taskCache.set(key, { id, at: Date.now() });
+          return id;
         }
-        if (!late || !late.id) throw taskIndeterminate(err, operationId);
-        made = late;
+        const operationId = newId("ptask-");
+        const body = {
+          name: title,
+          description: "从 Lumina Todo 番茄打卡创建\n" + opMarker(operationId),
+        };
+        if (Number.isFinite(dueTs) && dueTs > 0) {
+          body.due_date = dueTs;
+          body.due_date_time = false;
+        }
+        if (!(await upsertPendingTask({ key, operationId, title, createdAt: Date.now() }))) {
+          const err = new Error("无法保存新建任务的核对记录，已取消提交以避免重复创建");
+          err.code = "PENDING_WRITE_FAILED";
+          err.retryable = true;
+          throw err;
+        }
+        let made;
+        try {
+          made = await cu(token, "POST", "/list/" + listId() + "/task", body);
+        } catch (err) {
+          if (isDefiniteRejection(err)) {
+            await clearPendingTask(key, operationId);
+            throw err;
+          }
+          // 结果未知：立刻按 marker 查一次，查到就用；查不到/查询失败都保留记录，不重发
+          let late = null;
+          try {
+            late = await findTaskByOpMarker(token, operationId);
+          } catch {
+            late = null;
+          }
+          if (!late || !late.id) throw taskIndeterminate(err, operationId);
+          /* 审查七②：marker 找回的是「我们建的那个任务」，但对账前它可能已被改名/关闭/移走——
+             与 pending 了结路径一样：回执落盘后仍要回查标题/清单/状态才可把时间记上去 */
+          id = String(late.id);
+          if ((await settleRecoveredTask(token, key, operationId, id)) === "ok") return id;
+          excluded.add(id);
+          if (pass > 0) throw taskValidateIndeterminate(new Error("自建任务已被改名或关闭"));
+          continue;   // 回执已落盘、标题索引已作废：按标题重新查找（查询不确定会抛出，不新建）
+        }
+        if (!made || !made.id) throw taskIndeterminate(new Error("ClickUp 创建任务未返回 id"), operationId);
+        id = String(made.id);
+        // 审查五 D / 六③：完成回执读回确认后才清 pending；否则 pending 带着 taskId 留着，别页只了结、不重建
+        await finalizeCreatedTask(token, key, operationId, id);
+        return id;
       }
-      if (!made || !made.id) throw taskIndeterminate(new Error("ClickUp 创建任务未返回 id"), operationId);
-      id = String(made.id);
-      // 审查五 D / 六③：完成回执读回确认后才清 pending；否则 pending 带着 taskId 留着，别页只了结、不重建
-      await finalizeCreatedTask(token, key, operationId, id);
-      return id;
+      throw taskValidateIndeterminate(new Error("无法确认同名任务"));
     });
 
     ensureInflight.set(key, work);
