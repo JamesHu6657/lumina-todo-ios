@@ -576,8 +576,14 @@ async function main() {
     const pendingPomos = JSON.parse(store.getItem("lumina-cu-pending-pomo-v1"));
     pendingPomos[0].createdAt = Date.now() - 11 * 60 * 1000;
     store.setItem("lumina-cu-pending-pomo-v1", JSON.stringify(pendingPomos));
-    await api.flushQueue();
-    assert.equal(postCount, 2, "释放后下一次 flush 必须能继续执行");
+    // 宽限期过后的空查询不再自动补发（审查第二轮 #3）：下一次 flush 仍须能执行完，
+    // 把这条交给待核对记录等用户手动重试；手动重试才再 POST
+    const second = await api.flushQueue();
+    assert.equal(second.left, 0, "释放后下一次 flush 必须能继续执行");
+    assert.equal(postCount, 1, "过了宽限期也不得自动重 POST");
+    assert.equal((await api.status()).pendingManual, 1);
+    await api.retryPendingPomos();
+    assert.equal(postCount, 2, "手动重试后按原 operationId 补发一次");
     ok("ClickUp body 超时释放 flush 单飞锁");
   }
 
@@ -1443,6 +1449,65 @@ async function main() {
   }
   ok("高2 写失败恢复时先三方合并别页新增，恢复写后立即关闭也不丢");
 
+  /* ---- 审查第二轮 #4：合并→恢复写再次失败→删除刚合入的远端条目 R→恢复成功：R 必须保持删除 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    assert.equal(A.invoke("add_todo", { text: "X" }).ok, true);
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "Y（本页写失败）" }).ok, true);
+    storage.failTodoWrites = false;
+    const r = B.invoke("add_todo", { text: "R（别页新增）" }).todo;
+    assert.ok(r && r.id);
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    // 恢复写前合入 R，但这次写又失败
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("add_todo", { text: "W" }).ok, true);
+    const mem1 = A.invoke("list_todos", {}).todos.map((t) => t.text);
+    assert.ok(mem1.includes("R（别页新增）"), "合并后内存应含 R");
+    // 用户删掉刚合入的 R（写仍失败）
+    assert.equal(A.invoke("delete_todo", { id: r.id }).ok, true);
+    assert.ok(!A.invoke("list_todos", {}).todos.some((t) => t.id === r.id), "删除后 R 不得被立即合回");
+    // 恢复写成功
+    storage.failTodoWrites = false;
+    assert.equal(A.invoke("add_todo", { text: "V" }).ok, true);
+    const disk = diskTodos(storage).map((t) => t.text).sort();
+    assert.deepEqual(disk, ["V", "W", "X", "Y（本页写失败）"].sort(), "恢复写成功后 R 必须保持删除");
+    assert.ok(!A.invoke("list_todos", {}).todos.some((t) => t.id === r.id));
+  }
+  ok("审查二#4 合并→再次写失败→删除 R→恢复成功：R 保持删除");
+
+  /* ---- 审查二#3：长时间未确认的上传交给用户：toast 提供「重新上传」，点了才带 manualRetry ---- */
+  {
+    const storage = sharedStorage();
+    const calls = [];
+    const clickup = {
+      pushTodo: async (p) => {
+        calls.push(p);
+        if (!p.manualRetry) return { ok: false, code: "NEEDS_MANUAL_RETRY", error: "上次上传长时间未确认", retryable: false };
+        return { ok: true, taskId: "cu-manual-1", url: "https://app.clickup.com/t/cu-manual-1" };
+      },
+      logPomo: async () => ({ ok: true }),
+    };
+    const A = loadApp({ storage, clickup, confirm: true });
+    const t = A.invoke("add_todo", { text: "要手动重传" }).todo;
+    const r = await A.invoke("push_todo_to_clickup", { id: t.id });
+    assert.equal(r.ok, false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].manualRetry, undefined, "自动路径不得带 manualRetry");
+    const action = A.sandbox.document.querySelector("#toastAction");
+    assert.equal(action.hidden, false, "应提供「重新上传」操作");
+    assert.equal(action.textContent, "重新上传");
+    action.onclick();
+    await new Promise((res) => setTimeout(res, 10));
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].manualRetry, true);
+    const live = A.invoke("list_todos", {}).todos.find((x) => x.id === t.id);
+    assert.equal(live.clickupTaskId, "cu-manual-1");
+  }
+  ok("审查二#3 长时间未确认的上传：toast 提供「重新上传」，用户确认后才带 manualRetry");
+
   /* ---- 高 3：ClickUp 回写不得让「撤销无关操作」回滚别页的编辑 ---- */
   {
     const storage = sharedStorage();
@@ -1736,10 +1801,133 @@ async function main() {
     store.setItem(pendingKey, JSON.stringify([{
       operationId: "todo-late-4", title: "过期待核对2", createdAt: Date.now() - 11 * 60 * 1000, state: "indeterminate",
     }]));
+    // 审查第二轮 #3：宽限期过后一次空查询也不自动重建，标记为需手动处理
+    const postsBefore = posts;
     const r5 = await api.pushTodo({ title: "过期待核对2", todoId: "late-4" });
-    assert.equal(r5.ok, true, "宽限期后查无可以重建");
+    assert.equal(r5.code, "NEEDS_MANUAL_RETRY", "宽限期后查无也不得自动重建");
+    assert.equal(posts, postsBefore);
+    assert.equal((await api.status()).pendingManual, 1);
+    // 对账继续按 marker 查：仍查无就保持需手动；用户手动重试才再 POST
+    await api.reconcilePendingPushes();
+    assert.equal(posts, postsBefore);
+    const r6 = await api.pushTodo({ title: "过期待核对2", todoId: "late-4", manualRetry: true });
+    assert.equal(r6.ok, true, "用户手动重试且查无时才重建");
+    assert.equal(posts, postsBefore + 1);
+    assert.equal((await api.status()).pendingManual, 0);
   }
   ok("中 创建超时后宽限期内不重建，迟到提交由对账找回");
+
+  /* ======================= Linear 审查第二轮回归（ClickUp 上传幂等） ======================= */
+  const PUSHED_KEY = "lumina-cu-pushed-v1";
+  const PENDING_PUSH_KEY = "lumina-cu-pending-push-v1";
+  function pushServer({ lookup = "empty", delayMs = 0 } = {}) {
+    const st = { posts: 0, lookup, remote: [] };
+    st.fetch = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+      if (u.includes("/task") && method === "GET") {
+        if (st.lookup === "fail") return reply(503, "unavailable");
+        return reply(200, { tasks: st.remote, last_page: true });
+      }
+      if (u.includes("/task") && method === "POST") {
+        st.posts++;
+        if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+        const body = JSON.parse(opts.body);
+        const id = "task-r2-" + st.posts;
+        st.remote.push({ id, name: body.name, description: body.description });
+        return reply(200, { id, url: "https://app.clickup.com/t/" + id });
+      }
+      return reply(200, {});
+    };
+    return st;
+  }
+
+  /* ---- 二#1：远端创建成功、确认记录写失败：pending 保留 taskId，查询失败也绝不重建 ---- */
+  {
+    const store = makeLocalStorage();
+    const rawSet = store.setItem;
+    let failPushed = true;
+    store.setItem = (k, v) => {
+      if (failPushed && k === PUSHED_KEY) throw new Error("quota");
+      return rawSet(k, v);
+    };
+    const srv = pushServer();
+    const { api } = loadClickup(store, srv.fetch);
+    await api.setStoredToken(TOKEN_A);
+    const first = await api.pushTodo({ title: "确认记录写失败", todoId: "r2-durable-1" });
+    assert.equal(first.ok, true);
+    assert.equal(srv.posts, 1);
+    const pend = JSON.parse(store.getItem(PENDING_PUSH_KEY) || "[]");
+    assert.equal(pend.length, 1, "确认记录没落盘时不得清除 pending");
+    assert.equal(pend[0].taskId, first.taskId, "pending 里必须留下已知 taskId");
+    // App 关联也没存下；重试时 marker 查询失败：直接复用 pending 里的 taskId，不 POST
+    srv.lookup = "fail";
+    const again = await api.pushTodo({ title: "确认记录写失败", todoId: "r2-durable-1" });
+    assert.equal(again.ok, true);
+    assert.equal(again.taskId, first.taskId);
+    assert.equal(srv.posts, 1, "已知 taskId 时绝不重复创建");
+    // 存储恢复后对账：确认记录落盘，pending 才清除
+    failPushed = false;
+    await api.reconcilePendingPushes();
+    assert.equal(JSON.parse(store.getItem(PENDING_PUSH_KEY) || "[]").length, 0);
+    assert.ok(JSON.parse(store.getItem(PUSHED_KEY)).some((x) => x.taskId === first.taskId));
+    // 本地记录全丢（恢复旧备份）且 marker 查询失败：不确定就不创建
+    const fresh = makeLocalStorage();
+    const { api: api2 } = loadClickup(fresh, srv.fetch);
+    await api2.setStoredToken(TOKEN_A);
+    const blind = await api2.pushTodo({ title: "确认记录写失败", todoId: "r2-durable-1" });
+    assert.equal(blind.ok, false);
+    assert.equal(blind.code, "LOOKUP_FAILED");
+    assert.equal(srv.posts, 1, "marker 查询不确定时不得创建");
+    srv.lookup = "empty";
+    const found = await api2.pushTodo({ title: "确认记录写失败", todoId: "r2-durable-1" });
+    assert.equal(found.ok, true);
+    assert.equal(found.taskId, first.taskId);
+    assert.equal(srv.posts, 1);
+  }
+  ok("审查二#1 确认记录写失败时 pending 保留 taskId，查询不确定时绝不重建");
+
+  /* ---- 二#2：同一待办并发上传只 POST 一次（同页 single-flight + 跨页租约） ---- */
+  {
+    const store = makeLocalStorage();
+    const srv = pushServer({ delayMs: 15 });
+    const { api } = loadClickup(store, srv.fetch);
+    await api.setStoredToken(TOKEN_A);
+    const [a, b] = await Promise.all([
+      api.pushTodo({ title: "并发上传", todoId: "r2-conc-1" }),
+      api.pushTodo({ title: "并发上传", todoId: "r2-conc-1" }),
+    ]);
+    assert.equal(srv.posts, 1, "同页并发只允许一次 POST");
+    assert.equal(a.ok && b.ok, true);
+    assert.equal(a.taskId, b.taskId);
+
+    // 两个标签页共享 localStorage
+    const shared = makeLocalStorage();
+    const srv2 = pushServer({ delayMs: 15 });
+    const tab1 = loadClickup(shared, srv2.fetch).api;
+    const tab2 = loadClickup(shared, srv2.fetch).api;
+    await tab1.setStoredToken(TOKEN_A);
+    await tab2.setStoredToken(TOKEN_A);
+    const [x, y] = await Promise.all([
+      tab1.pushTodo({ title: "跨页并发", todoId: "r2-conc-2" }),
+      tab2.pushTodo({ title: "跨页并发", todoId: "r2-conc-2" }),
+    ]);
+    assert.equal(srv2.posts, 1, "跨页并发只允许一次 POST");
+    assert.equal(x.ok, true);
+    assert.equal(y.ok ? y.taskId : y.code, y.ok ? x.taskId : "BUSY");
+    // 租约已释放：之后另一页再传直接复用已创建记录
+    const z = await tab2.pushTodo({ title: "跨页并发", todoId: "r2-conc-2" });
+    assert.equal(z.ok, true);
+    assert.equal(z.taskId, x.taskId);
+    assert.equal(srv2.posts, 1);
+    // 崩溃页面留下的过期租约不挡路
+    shared.setItem("lumina-cu-push-lease-v1:todo-r2-conc-3", JSON.stringify({ owner: "dead", token: "t", exp: Date.now() - 1 }));
+    const w = await tab1.pushTodo({ title: "过期租约", todoId: "r2-conc-3" });
+    assert.equal(w.ok, true);
+    assert.equal(srv2.posts, 2);
+  }
+  ok("审查二#2 同一待办并发上传只 POST 一次（同页 single-flight、跨页租约、过期租约可接管）");
 
   /* ---- 中：缺 Token 时离线队列暂停，配置新 Token 后恢复补传 ---- */
   {
