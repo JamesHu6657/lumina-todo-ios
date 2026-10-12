@@ -227,6 +227,26 @@ async function main() {
     console.log("✔ Factory 不再发送被中转忽略的 max_tokens/temperature，其他服务商不受影响");
   }
 
+  // 审查三①：CapacitorHttp 缓冲整段中转 SSE（无 reader）同样按完整事件解析、失败关闭
+  {
+    const tool = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"delete_todo","arguments":"{}"}}]},"finish_reason":null}]}\n\n';
+    const buffered = (raw) => async () => ({ ok: true, status: 200, body: null, text: async () => raw });
+    for (const raw of [
+      tool + 'data: {"error":\ndata: {"message":"droid crashed"}}\n\n' + "data: [DONE]\n\n",
+      tool + 'event: error\ndata: {"message":"relay overloaded"}\n\n' + "data: [DONE]\n\n",
+      tool + "data: {broken\n\n" + "data: [DONE]\n\n",
+    ]) {
+      const r = await runChat(loadBridge(store, buffered(raw)));
+      assert.equal(r.done, undefined, "Factory 缓冲 SSE 的错误事件不得 onDone（工具不得执行）");
+      assert.ok(r.error);
+    }
+    const okRaw = 'data: {"choices":[{"index":0,\ndata: "delta":{"content":"中转好"},"finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n';
+    const good = await runChat(loadBridge(store, buffered(okRaw)));
+    assert.equal(good.error, undefined, String(good.error));
+    assert.equal(good.done.content, "中转好");
+    console.log("✔ Factory 缓冲 SSE：多行/事件型错误失败关闭，合法多行 data 正常组装");
+  }
+
   for (const stop of [true, false]) {
     const text = deferred();
     const bodyStarted = deferred();
