@@ -797,32 +797,41 @@
    * 非流式整条 tool_call 校验：id/name/type 类型必须正确。arguments 允许字符串或对象
    * （部分兼容服务在非流式响应里直接给对象，这是整条而非分片，不存在“旧参数被沿用”的问题）。
    */
+  function hasOwn(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
   function validateBufferedToolCall(tc) {
     if (!tc || typeof tc !== "object" || Array.isArray(tc)) throw streamProtocolError("tool_call 结构异常");
-    if (tc.id != null && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
-    if (tc.type != null && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
+    // 审查五 B：键存在就必须类型正确——显式 null 不等于缺省
+    if (hasOwn(tc, "id") && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
+    if (hasOwn(tc, "type") && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
     const fn = tc.function;
     if (!fn || typeof fn !== "object" || Array.isArray(fn)) throw streamProtocolError("tool_call function 结构异常");
     if (typeof fn.name !== "string" || !fn.name) throw streamProtocolError("工具名类型异常");
-    const a = fn.arguments;
-    if (a != null && typeof a !== "string" && (typeof a !== "object" || Array.isArray(a))) {
-      throw streamProtocolError("工具参数类型异常");
+    if (hasOwn(fn, "arguments")) {
+      const a = fn.arguments;
+      if (typeof a !== "string" && (a === null || typeof a !== "object" || Array.isArray(a))) {
+        throw streamProtocolError("工具参数类型异常");
+      }
     }
   }
 
-  /** 审查四③：单条 tool delta 严格校验——index/id/type/name/arguments 类型都必须正确 */
+  /** 审查四③ / 五 B：单条 tool delta 严格校验——index/id/type/function/name/arguments
+   *  只要键出现就必须类型正确；显式 null（如 function:null、arguments:null）判协议异常，
+   *  绝不当成「本片没带」而沿用之前累积的参数去执行 */
   function validateToolDelta(tc) {
     if (!tc || typeof tc !== "object" || Array.isArray(tc)) throw streamProtocolError("tool_call 结构异常");
-    if (tc.index != null && !(Number.isSafeInteger(tc.index) && tc.index >= 0 && tc.index < 1024)) {
+    if (hasOwn(tc, "index") && !(Number.isSafeInteger(tc.index) && tc.index >= 0 && tc.index < 1024)) {
       throw streamProtocolError("tool_call index 异常");
     }
-    if (tc.id != null && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
-    if (tc.type != null && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
-    const fn = tc.function;
-    if (fn != null) {
-      if (typeof fn !== "object" || Array.isArray(fn)) throw streamProtocolError("tool_call function 结构异常");
-      if (fn.name != null && typeof fn.name !== "string") throw streamProtocolError("工具名类型异常");
-      if (fn.arguments != null && typeof fn.arguments !== "string") {
+    if (hasOwn(tc, "id") && typeof tc.id !== "string") throw streamProtocolError("tool_call id 异常");
+    if (hasOwn(tc, "type") && tc.type !== "function") throw streamProtocolError("tool_call type 异常");
+    if (hasOwn(tc, "function")) {
+      const fn = tc.function;
+      if (!fn || typeof fn !== "object" || Array.isArray(fn)) throw streamProtocolError("tool_call function 结构异常");
+      if (hasOwn(fn, "name") && typeof fn.name !== "string") throw streamProtocolError("工具名类型异常");
+      if (hasOwn(fn, "arguments") && typeof fn.arguments !== "string") {
         throw streamProtocolError("工具参数片段不是字符串");
       }
     }
