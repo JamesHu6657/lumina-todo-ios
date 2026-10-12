@@ -581,45 +581,160 @@
   }
 
   /* ----------------------------- SSE ----------------------------- */
-  class SseLineBuffer {
+  /**
+   * 按 SSE 规范组装完整事件（WHATWG EventSource 解析规则）：
+   *   - 行结束符可为 \n / \r\n / \r；
+   *   - 空行才派发一个事件；同一事件内所有 `data:` 行以 "\n" 拼接后再交给上层解析；
+   *   - `:` 开头为注释（保活）；`event:` 记录事件类型（如 `event: error`）。
+   * 逐行 JSON.parse 会把多行 data（例如多行 error 对象）当作“非 JSON 保活”丢掉，
+   * 进而把带错误的流当成功收尾并执行已累计的工具调用——这里统一按事件处理。
+   */
+  class SseEventParser {
     constructor() {
       this.buf = "";
+      this.dataLines = [];
+      this.dataChars = 0;
+      this.eventType = "";
+      this.sawCR = false;
+      this.started = false;
       // 收到 [DONE] 才算服务端正常收尾；没有它的 EOF 是断流，不能当成功
       this.done = false;
     }
+    _tooLarge() {
+      const err = new Error("SSE 事件过长");
+      err.code = "RESPONSE_TOO_LARGE";
+      return err;
+    }
+    _line(line, out) {
+      if (line === "") {
+        this._dispatch(out);
+        return;
+      }
+      if (line.charCodeAt(0) === 58 /* ":" */) return; // 注释 / 保活
+      const colon = line.indexOf(":");
+      let field;
+      let value;
+      if (colon < 0) {
+        field = line;
+        value = "";
+      } else {
+        field = line.slice(0, colon);
+        value = line.slice(colon + 1);
+        if (value.charCodeAt(0) === 32) value = value.slice(1);
+      }
+      if (field === "data") {
+        this.dataChars += value.length + 1;
+        if (this.dataChars > LIMITS.maxSseLineChars) throw this._tooLarge();
+        this.dataLines.push(value);
+      } else if (field === "event") {
+        this.eventType = value;
+      }
+      // id / retry / 未知字段：与本客户端无关，按规范忽略
+    }
+    _dispatch(out) {
+      const type = this.eventType;
+      const hasData = this.dataLines.length > 0;
+      const data = this.dataLines.join("\n");
+      this.dataLines = [];
+      this.dataChars = 0;
+      this.eventType = "";
+      // 规范：无 data 的事件不派发；但 `event: error` 即使没有 data 也必须让本轮失败
+      if (!hasData && type !== "error") return;
+      out.push({ type: type || "message", data });
+    }
     push(chunk) {
-      this.buf += chunk;
-      if (this.buf.length > LIMITS.maxSseLineChars) {
-        const err = new Error("SSE 行过长");
-        err.code = "RESPONSE_TOO_LARGE";
-        throw err;
-      }
       const out = [];
-      while (true) {
-        const idx = this.buf.indexOf("\n");
-        if (idx < 0) break;
-        let line = this.buf.slice(0, idx);
-        this.buf = this.buf.slice(idx + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-        if (line.startsWith("data:")) {
-          const payload = line.slice(5).trim();
-          if (payload === "[DONE]") this.done = true;
-          else if (payload) out.push(payload);
-        }
+      let text = String(chunk || "");
+      if (!this.started && text) {
+        this.started = true;
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
       }
+      if (this.sawCR && text.charCodeAt(0) === 10) text = text.slice(1); // 跨块的 \r\n
+      this.sawCR = false;
+      this.buf += text;
+      while (true) {
+        const m = /\r\n|\r|\n/.exec(this.buf);
+        if (!m) break;
+        // 块尾的孤立 \r 可能是 \r\n 的前半，留待下一块确认
+        if (m[0] === "\r" && m.index === this.buf.length - 1) {
+          const line = this.buf.slice(0, m.index);
+          this.buf = "";
+          this.sawCR = true;
+          this._line(line, out);
+          break;
+        }
+        const line = this.buf.slice(0, m.index);
+        this.buf = this.buf.slice(m.index + m[0].length);
+        this._line(line, out);
+      }
+      if (this.buf.length + this.dataChars > LIMITS.maxSseLineChars) throw this._tooLarge();
       return out;
     }
+    /** EOF：残留的未完结行 / 事件也要交给上层（错误必须被看见；[DONE] 末尾可能缺空行） */
     flush() {
-      if (!this.buf) return [];
-      const line = this.buf;
-      this.buf = "";
-      if (line.startsWith("data:")) {
-        const payload = line.slice(5).trim();
-        if (payload === "[DONE]") this.done = true;
-        else if (payload) return [payload];
+      const out = [];
+      if (this.buf) {
+        const line = this.buf;
+        this.buf = "";
+        this._line(line, out);
       }
-      return [];
+      this._dispatch(out);
+      return out;
     }
+  }
+
+  /**
+   * 从一个完整 SSE 事件里识别“本轮失败”。任何错误形态都返回 Error：
+   *   - `event: error`（无论 data 是否 JSON）；
+   *   - JSON 顶层 `error` 字段（OpenAI 兼容）或 `type: "error"`（Anthropic 风格）；
+   *   - 任一 choice 的 finish_reason 为 "error"。
+   */
+  function sseEventError(evt, json) {
+    if (evt && evt.type === "error") {
+      const fromJson = json && typeof json === "object" ? streamPayloadError(json) : null;
+      if (fromJson) return fromJson;
+      let detail = "";
+      if (json && typeof json === "object" && typeof json.message === "string") detail = json.message;
+      else if (json == null && evt.data) detail = String(evt.data);
+      const err = new Error(
+        "AI 服务在回复中途报错" + (detail ? "：" + redactSecrets(detail).slice(0, 200) : "")
+      );
+      err.code = "STREAM_ERROR";
+      return err;
+    }
+    if (!json || typeof json !== "object") return null;
+    const direct = streamPayloadError(json);
+    if (direct) return direct;
+    if (json.type === "error") {
+      const inner = json.error && typeof json.error === "object" ? json.error : json;
+      return streamPayloadError({ error: inner }) || streamPayloadError({ error: "error" });
+    }
+    if (Array.isArray(json.choices)) {
+      for (const c of json.choices) {
+        if (c && c.finish_reason === "error") {
+          return streamPayloadError({ error: c.error || "finish_reason=error" });
+        }
+      }
+    }
+    return null;
+  }
+
+  function streamProtocolError(message) {
+    const err = new Error("AI 回复格式异常（" + message + "），本轮结果已丢弃");
+    err.code = "STREAM_ERROR";
+    return err;
+  }
+
+  /** 响应体看起来是 SSE 文本（原生 HTTP 缓冲全文 / 服务端无视 stream:false 时） */
+  function looksLikeSse(text, res) {
+    let ct = "";
+    try {
+      ct = String(res?.headers?.get?.("content-type") || "");
+    } catch {
+      /* ignore */
+    }
+    if (/text\/event-stream/i.test(ct)) return true;
+    return /^\uFEFF?\s*(data|event|id|retry)\s*:|^\uFEFF?\s*:/.test(String(text || "").slice(0, 64));
   }
 
   function finalizeToolCalls(toolMap) {
@@ -952,6 +1067,61 @@
       }
     };
 
+    /** 内部断言失败（字段类型异常导致的 TypeError 等）一律视为协议异常、失败关闭 */
+    const normalizeStreamError = (err) => {
+      if (isAbortLike(err)) return err;
+      if (err && typeof err.code === "string" && err.code) return err;
+      return streamProtocolError(err?.message ? String(err.message).slice(0, 80) : "未知");
+    };
+
+    /**
+     * 处理一个完整 SSE 事件。失败关闭：错误事件 / 无法解析 / 结构异常都会 throw，
+     * 上层据此整轮判失败，已累计的 tool_calls 一条也不会交给 agent-loop 执行。
+     */
+    const applyEvent = (evt, parser) => {
+      const raw = String(evt?.data ?? "");
+      const trimmed = raw.trim();
+      if (evt.type !== "error") {
+        if (trimmed === "[DONE]") {
+          parser.done = true;
+          return;
+        }
+        if (!trimmed) return; // 空 data 保活
+      }
+      let json = null;
+      let parsed = false;
+      if (trimmed) {
+        try {
+          json = JSON.parse(raw);
+          parsed = true;
+        } catch {
+          parsed = false;
+        }
+      }
+      const evtErr = sseEventError(evt, parsed ? json : null);
+      if (evtErr) throw evtErr;
+      if (!parsed) throw streamProtocolError("无法解析的数据事件");
+      if (!json || typeof json !== "object" || Array.isArray(json)) {
+        throw streamProtocolError("数据事件不是对象");
+      }
+      if (parser.done) return; // [DONE] 之后的普通数据不再计入（错误事件已在上面拦截）
+      if (json.choices == null) return; // usage 等无 choices 的块
+      if (!Array.isArray(json.choices)) throw streamProtocolError("choices 结构异常");
+      const choice = json.choices[0];
+      if (choice == null) return;
+      if (typeof choice !== "object") throw streamProtocolError("choice 结构异常");
+      const delta = choice.delta == null ? {} : choice.delta;
+      if (typeof delta !== "object" || Array.isArray(delta)) throw streamProtocolError("delta 结构异常");
+      if (delta.tool_calls != null && !Array.isArray(delta.tool_calls)) {
+        throw streamProtocolError("tool_calls 结构异常");
+      }
+      try {
+        applyDelta(delta, choice.finish_reason || null);
+      } catch (err) {
+        throw normalizeStreamError(err);
+      }
+    };
+
     if (!reader) {
       const text = await res.text();
       if (text.length > LIMITS.maxStreamResponseChars) {
@@ -959,9 +1129,35 @@
         err.code = "RESPONSE_TOO_LARGE";
         throw err;
       }
-      const data = JSON.parse(text);
-      const payloadErr = streamPayloadError(data);
+      if (looksLikeSse(text, res)) {
+        // 原生 HTTP（CapacitorHttp）缓冲了整段 SSE：同样按完整事件解析，规则与流式一致
+        const parser = new SseEventParser();
+        try {
+          for (const evt of parser.push(text)) applyEvent(evt, parser);
+          for (const evt of parser.flush()) applyEvent(evt, parser);
+        } catch (err) {
+          throw normalizeStreamError(err);
+        }
+        if (!finishReason && !parser.done) {
+          const err = new Error("AI 回复意外中断（流未正常结束），本轮结果已丢弃");
+          err.code = "STREAM_INCOMPLETE";
+          throw err;
+        }
+        const tool_calls = finalizeToolCalls(toolMap);
+        if (!finishReason) finishReason = tool_calls.length ? "tool_calls" : "stop";
+        return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut };
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw streamProtocolError("无法解析的响应体");
+      }
+      const payloadErr = sseEventError(null, data);
       if (payloadErr) throw payloadErr;
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        throw streamProtocolError("响应体不是对象");
+      }
       const choice = data?.choices?.[0];
       const msg = choice?.message || {};
       finishReason = choice?.finish_reason || null;
@@ -1018,27 +1214,11 @@
       }
     } else {
       const decoder = new TextDecoder();
-      const lines = new SseLineBuffer();
+      const parser = new SseEventParser();
       let idleTimer = null;
       const armIdle = () => {
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => onStall?.(), LIMITS.streamIdleTimeoutMs);
-      };
-      const applyPayload = (payload) => {
-        let json;
-        try {
-          json = JSON.parse(payload);
-        } catch {
-          return; // 非 JSON 的保活/注释行忽略
-        }
-        const payloadErr = streamPayloadError(json);
-        if (payloadErr) throw payloadErr;
-        const choice = json?.choices?.[0];
-        try {
-          applyDelta(choice?.delta || {}, choice?.finish_reason || null);
-        } catch (err) {
-          if (err?.code === "RESPONSE_TOO_LARGE") throw err;
-        }
       };
       try {
         armIdle();
@@ -1047,14 +1227,14 @@
           const { done, value } = await reader.read();
           if (done) break;
           armIdle();
-          for (const payload of lines.push(decoder.decode(value, { stream: true }))) {
-            applyPayload(payload);
+          for (const evt of parser.push(decoder.decode(value, { stream: true }))) {
+            applyEvent(evt, parser);
           }
         }
-        for (const payload of lines.push(decoder.decode())) applyPayload(payload);
-        for (const payload of lines.flush()) applyPayload(payload);
+        for (const evt of parser.push(decoder.decode())) applyEvent(evt, parser);
+        for (const evt of parser.flush()) applyEvent(evt, parser);
       } catch (err) {
-        if (!isAbortLike(err)) throw err;
+        if (!isAbortLike(err)) throw normalizeStreamError(err);
         aborted = true;
         timedOut = err?.name === "TimeoutError";
       } finally {
@@ -1067,7 +1247,7 @@
       }
       // 既没有 finish_reason 也没有 [DONE] 就 EOF：连接被截断，结果不完整。
       // 不能合成为成功，尤其不能执行半截流里累计的工具调用。
-      if (!aborted && !finishReason && !lines.done) {
+      if (!aborted && !finishReason && !parser.done) {
         const err = new Error("AI 回复意外中断（流未正常结束），本轮结果已丢弃");
         err.code = "STREAM_INCOMPLETE";
         throw err;
@@ -1340,7 +1520,38 @@
             if (text.length > LIMITS.maxCompleteResponseChars) {
               return { ok: false, requestId, error: "回复过大", code: "RESPONSE_TOO_LARGE" };
             }
-            const data = JSON.parse(text);
+            if (looksLikeSse(text, call.res)) {
+              // 服务端无视 stream:false 回了 SSE：按完整事件组装，错误/异常同样失败关闭
+              const r = await consumeStream(
+                { body: null, headers: call.res.headers, text: async () => text },
+                null,
+                {}
+              );
+              return {
+                ok: true,
+                requestId,
+                model: provider.model,
+                message: {
+                  role: "assistant",
+                  content: r.content || "",
+                  reasoning_content: r.reasoning || "",
+                  tool_calls: r.tool_calls || [],
+                },
+                finish_reason: r.finish_reason || null,
+              };
+            }
+            let data;
+            try {
+              data = JSON.parse(text);
+            } catch {
+              throw streamProtocolError("无法解析的响应体");
+            }
+            // HTTP 200 里的 {"error": …} / {"type":"error"} 不是成功回复，不能当成“空回复”放行
+            const bodyErr = sseEventError(null, data);
+            if (bodyErr) throw bodyErr;
+            if (!data || typeof data !== "object" || Array.isArray(data)) {
+              throw streamProtocolError("响应体不是对象");
+            }
             const choice = data?.choices?.[0] || {};
             const msg = choice.message || {};
             return {
@@ -1598,6 +1809,7 @@
     }
     console.warn("[ClickUp]", message);
   }
+  let retryPendingRun = null;
   window.luminaClickUp = {
     logPomo(payload) {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
@@ -1637,7 +1849,9 @@
     retryPending() {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
       if (!cu?.retryPendingPomos) return Promise.resolve({ ok: false, error: "ClickUp 模块未加载" });
-      return Promise.resolve(cu.retryPendingPomos()).then(async (pomo) => {
+      // single-flight：重叠的手动重试共享同一次执行（mobile-clickup 内部另有锁与版本校验）
+      if (retryPendingRun) return retryPendingRun;
+      const run = Promise.resolve(cu.retryPendingPomos()).then(async (pomo) => {
         let push = null;
         try {
           push = await cu.reconcilePendingPushes();
@@ -1646,6 +1860,11 @@
         }
         return { ok: Boolean(pomo?.ok), pomo, push };
       });
+      retryPendingRun = run;
+      run.finally(() => {
+        if (retryPendingRun === run) retryPendingRun = null;
+      }).catch(() => {});
+      return run;
     },
     setToken(token) {
       const cu = globalThis.LUMINA_MOBILE_CLICKUP;
