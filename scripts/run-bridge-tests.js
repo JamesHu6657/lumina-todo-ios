@@ -3026,6 +3026,247 @@ async function main() {
   }
   ok("审查四⑧ 查询响应缺 tasks/data 数组判为查询失败：不补发、不创建、不清 pending");
 
+  /* ======================= Linear 复审第五轮回归 ======================= */
+
+  /* ---- 审查五 A：撤销未落盘的本地编辑不得用历史 before 盖掉远端同字段编辑 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X original" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "X local" }).ok, true);      // 写盘失败 → 脏窗口
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "X remote" }).ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "X remote");
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    A.invoke("undo");
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.notEqual(dx.text, "X original", `${deliverEvent}：撤销绝不能把历史 before 写回盘覆盖远端编辑`);
+    assert.equal(dx.text, "X remote", `${deliverEvent}：冲突字段撤销后取远端最新值`);
+    assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id).text, "X remote");
+  }
+  {
+    // 无冲突字段照常撤销：本地脏窗口里改正文，远端改优先级 → 撤销恢复正文、保留远端优先级
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Y original" }).todo;
+    const B = loadApp({ storage });
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "Y local" }).ok, true);
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "Y original", "无冲突字段照常撤销");
+    assert.equal(dx.priority, "high", "远端其它字段编辑保留");
+  }
+  {
+    // 已成功落盘的本地编辑再撤销：没有远端冲突 → 恢复 before（行为不变）
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "Z original" }).todo;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "Z local" }).ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "Z original");
+  }
+  ok("审查五 A 撤销未落盘编辑：冲突字段取远端最新值、不写回历史 before；无冲突字段照常撤销");
+
+  /* ---- 审查五 B：显式 null 的 tool delta / 整条 tool_call 字段不得绕过校验去执行旧参数 ---- */
+  {
+    const enc = new TextEncoder();
+    const streamOf = (raw) => new ReadableStream({ start(c) { c.enqueue(enc.encode(raw)); c.close(); } });
+    const ev = (o) => "data: " + JSON.stringify(o) + "\n\n";
+    const DONE = "data: [DONE]\n\n";
+    const toolDelta = ev({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "delete_todo", arguments: "{\"id\":\"t1\"}" } }] }, finish_reason: null }] });
+    const fin = (f) => ev({ choices: [{ index: 0, delta: {}, finish_reason: f }] });
+    const runChat = async (fetchRes) => {
+      const { ai } = loadBridge(makeLocalStorage(), async () => fetchRes);
+      await ai.setApiKey("sk-" + "a".repeat(24));
+      let done = null;
+      let error = null;
+      await ai.chat({ messages: [{ role: "user", content: "删掉" }] }, { onDone(d) { done = d; }, onError(e) { error = e; } });
+      await tick(60);
+      return { done, error };
+    };
+    const streamed = (raw) => ({ ok: true, status: 200, body: streamOf(raw), async text() { return raw; } });
+    const buffered = (raw, ct) => ({ ok: true, status: 200, body: null, headers: { get: (k) => (/content-type/i.test(k) ? ct || null : null) }, async text() { return raw; } });
+    const runComplete = async (raw) => {
+      const { ai } = loadBridge(makeLocalStorage(), async () => buffered(raw, null));
+      await ai.setApiKey("sk-" + "a".repeat(24));
+      return ai.complete({ messages: [{ role: "user", content: "hi" }] });
+    };
+    const nullDeltas = [
+      ["function.arguments:null", { index: 0, function: { arguments: null } }],
+      ["function:null", { index: 0, function: null }],
+      ["function.name:null", { index: 0, function: { name: null } }],
+      ["id:null", { index: 0, id: null }],
+      ["type:null", { index: 0, type: null }],
+      ["index:null", { index: null, function: { arguments: "" } }],
+    ];
+    for (const [name, tc] of nullDeltas) {
+      const raw = toolDelta + ev({ choices: [{ index: 0, delta: { tool_calls: [tc] }, finish_reason: null }] }) + fin("tool_calls") + DONE;
+      const a = await runChat(streamed(raw));
+      assert.equal(a.done, null, `五B ${name}（流式）：不得执行旧参数`);
+      assert.ok(a.error, `五B ${name}（流式）：必须报错`);
+      const b = await runChat(buffered(raw, "text/event-stream"));
+      assert.equal(b.done, null, `五B ${name}（缓冲 SSE）：不得 onDone`);
+      assert.ok(b.error, `五B ${name}（缓冲 SSE）：必须报错`);
+      const c = await runComplete(raw);
+      assert.equal(c.ok, false, `五B ${name}（complete SSE）：不得返回工具调用`);
+    }
+    // 整条 tool_call（complete JSON / 流式缓冲 JSON）：键存在但为 null 同样失败
+    const wholeBad = [
+      ["arguments:null", { id: "c1", type: "function", function: { name: "delete_todo", arguments: null } }],
+      ["function:null", { id: "c1", type: "function", function: null }],
+      ["id:null", { id: null, type: "function", function: { name: "delete_todo", arguments: "{}" } }],
+      ["type:null", { id: "c1", type: null, function: { name: "delete_todo", arguments: "{}" } }],
+    ];
+    for (const [name, tc] of wholeBad) {
+      const body = JSON.stringify({ choices: [{ message: { content: "", tool_calls: [tc] }, finish_reason: "tool_calls" }] });
+      const c = await runComplete(body);
+      assert.equal(c.ok, false, `五B complete JSON ${name}：必须失败`);
+      const d = await runChat(buffered(body, "application/json"));
+      assert.equal(d.done, null, `五B 流式缓冲 JSON ${name}：不得 onDone`);
+    }
+    // 合法：缺省键（没带 arguments / id 只在首片）仍正常
+    const okRaw = toolDelta + ev({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "" } }] }, finish_reason: null }] }) + fin("tool_calls") + DONE;
+    const okRun = await runChat(streamed(okRaw));
+    assert.equal(okRun.error, null, String(okRun.error));
+    assert.equal(okRun.done.tool_calls[0].function.arguments, "{\"id\":\"t1\"}");
+    // agent-loop 第二道防线：桥实现交出 function:null / arguments:null 时整轮不执行
+    const { runAgentRounds } = require(path.join(WWW, "agent-loop.js"));
+    for (const bad of [
+      { id: "c0", type: "function", function: { name: "delete_todo", arguments: null } },
+      { id: "c0", type: "function", name: "delete_todo", function: null },
+      { id: "c0", type: "function", function: { name: "delete_todo", arguments: 7 } },
+    ]) {
+      for (const via of ["complete", "stream"]) {
+        const ran = [];
+        let err = null;
+        try {
+          await runAgentRounds({
+            messages: [{ role: "system", content: "s" }, { role: "user", content: "u" }],
+            complete: async () => via === "complete"
+              ? ({ ok: true, finish_reason: "tool_calls", message: { content: "", tool_calls: [bad] } })
+              : ({ ok: true, finish_reason: "tool_calls", message: { content: "", tool_calls: [{ id: "cl", type: "function", function: { name: "list_todos", arguments: "{}" } }] } }),
+            streamRound: async () => ({ text: "", toolCalls: [bad], finishReason: "tool_calls", aborted: false }),
+            runTool: (tc) => { ran.push(tc.function && tc.function.name); return { ok: true }; },
+            refreshSystemContent: () => "s",
+          });
+        } catch (e) { err = e; }
+        assert.ok(!ran.includes("delete_todo"), `五B agent-loop ${via}：null 字段的调用不得执行`);
+        assert.ok(err, `五B agent-loop ${via}：必须报错`);
+      }
+    }
+  }
+  ok("审查五 B 显式 null 的 tool delta / 整条 tool_call 字段失败关闭（流式/缓冲 SSE/complete/agent-loop）");
+
+  /* ---- 审查五 C：正常成功也保留独立完成回执，同一 operationId 不得 POST 两次 ---- */
+  {
+    const mk = (opts = {}) => {
+      const st = { posts: 0 };
+      const fetchImpl = async (url, o) => {
+        const u = String(url);
+        const method = (o && o.method) || "GET";
+        if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });   // 远端暂不可见
+        if (u.includes("/time_entries") && method === "POST") { st.posts++; await tick(5); return reply(200, { id: "te" }); }
+        if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+        return reply(200, {});
+      };
+      return { st, fetchImpl, ...opts };
+    };
+    // 同页连续重试
+    {
+      const { st, fetchImpl } = mk();
+      const store = makeLocalStorage();
+      const { api } = loadClickup(store, fetchImpl);
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const args = { operationId: "op-r5-c-same", title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000 };
+      assert.equal((await api.logPomodoro(args)).ok, true);
+      assert.equal(st.posts, 1);
+      assert.equal(JSON.parse(store.getItem("lumina-cu-pending-pomo-v1") || "[]").length, 0, "成功后待核对清空");
+      const again = await api.logPomodoro(args);
+      assert.equal(again.ok, true, "同 operationId 再次调用直接判成功");
+      assert.equal(st.posts, 1, "同页连续重试不得再次 POST");
+    }
+    // 两个标签页同一 operationId 并发：先到者成功，后到者在锁内看到完成回执
+    {
+      const { st, fetchImpl } = mk();
+      const shared = makeLocalStorage();
+      const locks = makeSharedLocks();
+      const t1 = loadClickup(shared, fetchImpl, { navigator: { locks } }).api;
+      const t2 = loadClickup(shared, fetchImpl, { navigator: { locks } }).api;
+      await t1.setStoredToken(TOKEN_A);
+      await t2.setStoredToken(TOKEN_A);
+      await tick(30);
+      const args = { operationId: "op-r5-c-tabs", title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000 };
+      const [a, b] = await Promise.all([t1.logPomodoro(args), t2.logPomodoro(args)]);
+      assert.equal(a.ok && b.ok, true, JSON.stringify([a, b]));
+      assert.equal(st.posts, 1, "两页同一 operationId 只能 POST 一次");
+      assert.equal((await t2.logPomodoro(args)).ok, true);
+      assert.equal(st.posts, 1);
+    }
+    // 完成回执写不进去：保留待核对（不确定/已确认）状态，重试不 POST
+    {
+      const { st, fetchImpl } = mk();
+      const store = makeLocalStorage();
+      const rawSet = store.setItem;
+      store.setItem = (k, v) => { if (k === "lumina-cu-pomo-done-v1") throw new Error("quota"); return rawSet(k, v); };
+      const { api } = loadClickup(store, fetchImpl);
+      await api.setStoredToken(TOKEN_A);
+      await tick(30);
+      const args = { operationId: "op-r5-c-fail", title: "x", taskId: "task-known", minutes: 25, endedAt: Date.now() - 1000 };
+      await api.logPomodoro(args);
+      assert.equal(st.posts, 1);
+      assert.equal(JSON.parse(store.getItem("lumina-cu-pending-pomo-v1") || "[]").length, 1, "回执写失败时不得清掉待核对");
+      await api.logPomodoro(args);
+      assert.equal(st.posts, 1, "回执写失败后重试也不得再 POST");
+    }
+  }
+  ok("审查五 C 番茄打卡独立完成回执：同页连续重试/两页并发都只 POST 一次；回执写失败保留待核对");
+
+  /* ---- 审查五 D：按标题建任务的结果持久化，另一页不得再建同名任务 ---- */
+  for (const failMap of [false, true]) {
+    const st = { taskPosts: 0, entryPosts: 0, entryTids: [] };
+    const fetchImpl = async (url, o) => {
+      const u = String(url);
+      const method = (o && o.method) || "GET";
+      if (u.includes("/time_entries") && method === "GET") return reply(200, { data: [] });
+      if (u.includes("/time_entries") && method === "POST") { st.entryPosts++; st.entryTids.push(JSON.parse(o.body).tid); return reply(200, {}); }
+      if (u.includes("/task") && method === "GET") return reply(200, { tasks: [], last_page: true });   // 新建任务暂不可见
+      if (u.includes("/task") && method === "POST") { st.taskPosts++; await tick(5); return reply(200, { id: "task-d-" + st.taskPosts }); }
+      if (u.endsWith("/user")) return reply(200, { user: { id: 7 } });
+      return reply(200, {});
+    };
+    const shared = makeLocalStorage();
+    if (failMap) {
+      const rawSet = shared.setItem;
+      shared.setItem = (k, v) => { if (k === "lumina-cu-task-map-v1") throw new Error("quota"); return rawSet(k, v); };
+    }
+    const locks = makeSharedLocks();
+    const t1 = loadClickup(shared, fetchImpl, { navigator: { locks } }).api;
+    const t2 = loadClickup(shared, fetchImpl, { navigator: { locks } }).api;
+    await t1.setStoredToken(TOKEN_A);
+    await t2.setStoredToken(TOKEN_A);
+    await tick(30);
+    const r1 = await t1.logPomodoro({ title: "新任务 D", minutes: 25, endedAt: Date.now() - 1000 });
+    assert.equal(r1.ok, true);
+    assert.equal(st.taskPosts, 1);
+    const r2 = await t2.logPomodoro({ title: "新任务 D", minutes: 25, endedAt: Date.now() - 500 });
+    assert.equal(st.taskPosts, 1, `${failMap}：另一页不得重建同名任务`);
+    if (!failMap) {
+      assert.equal(r2.ok, true);
+      assert.deepEqual(st.entryTids, ["task-d-1", "task-d-1"], "第二页记到同一个任务上");
+      assert.equal((await t2.status()).pendingTask, 0);
+    } else {
+      assert.equal((await t1.status()).pendingTask, 1, "映射写不进去：建任务的 pending 必须保留");
+      assert.equal(r2.ok, false, "映射缺失 + pending 在：只对账，不建");
+    }
+  }
+  ok("审查五 D 按标题建任务的 taskId 持久化（账号+清单+标题）；映射落盘后才清 pending，另一页不重建");
+
   console.log("\n全部通过：", passed);
 }
 
