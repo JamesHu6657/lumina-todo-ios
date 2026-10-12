@@ -586,6 +586,8 @@ function adoptSettledSegs(raw){
    undo 的三方合并靠它区分「我们改的」和「远端改了流进来的」——
    两者盘==内存且≠快照，全局标志分不清 */
 function markRemoteAdopted(prev, next){
+  /* 撤销步还没封口时流入的远端内容属于「操作前」：并进 before，免得被当成本地操作反做 */
+  rebaseOpenUndo(prev, next);
   const prevMap = new Map(prev.map((t) => [t.id, t]));
   const nextIds = new Set(next.map((t) => t.id));
   for (const t of next){
@@ -914,7 +916,7 @@ function finishSegment(silentCatchUp, endedAtOverride){
       const t = todos.find((x) => x.id === pomo.taskId);
       if (t){
         /* 番茄入账是系统字段回写：不动 remoteIds，免得撤销无关操作时把别页的编辑回滚掉 */
-        t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); t.updatedAt = Date.now(); persist();
+        t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); persist();   // 系统回写不推 updatedAt
       }
     }
     /* 别页已结算的段不重复打卡（operationId 幂等兜底，但能省则省） */
@@ -1346,7 +1348,8 @@ function persist(){
 }
 
 /* ---------------------------------------------------------------- 撤销 */
-/* 用户可编辑的字段（撤销归因只看这些）；系统回写字段：pomodoros、clickupTaskId、clickupUrl、updatedAt */
+/* 用户可编辑的字段（撤销归因只看这些）；系统回写字段：pomodoros、clickupTaskId、clickupUrl。
+   updatedAt 只随用户编辑前进（系统回写不再推它），是软合并判新旧的依据 */
 function userFields(t){
   if (!t) return null;
   return {
@@ -1354,115 +1357,167 @@ function userFields(t){
     priority: t.priority, category: t.category, dueDate: t.dueDate, createdAt: t.createdAt,
   };
 }
+/* 字段组：同组字段语义上一起变（完成状态与完成时间），合并/撤销按组判定 */
+const USER_FIELD_GROUPS = [["text"], ["completed", "completedAt"], ["priority"], ["category"], ["dueDate"], ["createdAt"]];
+function sameField(a, b){
+  return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+}
+function groupEq(a, b, g){ return g.every((f) => sameField(a?.[f], b?.[f])); }
+function userEq(a, b){ return USER_FIELD_GROUPS.every((g) => groupEq(a, b, g)); }
+/* 系统字段独立合并：番茄计数单调取大；ClickUp 关联哪边有留哪边（taskId 一旦写入不会改） */
+function mergeSystemFields(ours, theirs){
+  const link = ours.clickupTaskId ? ours : (theirs.clickupTaskId ? theirs : ours);
+  return {
+    pomodoros: Math.max(ours.pomodoros || 0, theirs.pomodoros || 0),
+    clickupTaskId: link.clickupTaskId || null,
+    clickupUrl: link.clickupTaskId ? (link.clickupUrl || null) : (ours.clickupUrl || theirs.clickupUrl || null),
+  };
+}
+
+/* 撤销 = 操作级逆操作，不是整条快照回滚。
+   每个撤销步记下操作前（before）与操作刚完成时（after）两份内存：
+   二者之差就是「这次操作本身改了什么」。撤销时只把这些改动在当前内存上
+   逐字段反做，并且只反做「自 after 以来没人再动过」的字段——之后合并
+   进来的远端编辑、系统回写（番茄/ClickUp 关联）一律原样保留。
+   before 在 snapshot 时拍；after 在当轮微任务、下一次 snapshot 或 undo 时封口。
+   封口前流进内存的任何远端内容（mutator 内部的 syncTodosFromDisk、persist 里的
+   恢复合并、同步投递的 storage 事件）都由 rebaseOpenUndo 按字段组并进 before，
+   保证差值里只有本地操作。 */
+let openUndoEntry = null;
+function cloneList(list){ return list.map((t) => ({ ...t })); }
+function closeUndoEntry(entry){
+  if (!entry) return;
+  if (!entry.after) entry.after = cloneList(todos);
+  if (openUndoEntry === entry) openUndoEntry = null;
+}
+/* 撤销步封口前有远端内容流进内存（storage 事件、mutator 内的 syncTodosFromDisk、
+   persist 里的恢复合并）：把远端那部分按字段组并进 before，使 before→after 的差值
+   只剩本地操作本身。远端没改的字段组保持 before 原值（本地操作可能已改过它）。 */
+function rebaseOpenUndo(prev, next){
+  const e = openUndoEntry;
+  if (!e || e.after) return;
+  const prevMap = new Map(prev.map((t) => [t.id, t]));
+  const nextMap = new Map(next.map((t) => [t.id, t]));
+  const sIds = new Set(e.todos.map((t) => t.id));
+  let base = [];
+  for (const s of e.todos){
+    const p = prevMap.get(s.id), n = nextMap.get(s.id);
+    if (p && !n) continue;                       // 远端删了
+    if (!p || !n){ base.push(s); continue; }     // 本地操作已删掉的条目：留在 before 里
+    const out = { ...s };
+    for (const g of USER_FIELD_GROUPS){
+      if (groupEq(p, n, g)) continue;            // 远端没动这组
+      for (const f of g) out[f] = n[f];
+    }
+    for (const f of ["pomodoros", "clickupTaskId", "clickupUrl"]) out[f] = n[f];
+    if (!sameField(p.updatedAt, n.updatedAt)) out.updatedAt = n.updatedAt;
+    base.push(out);
+  }
+  for (const n of next){
+    if (!prevMap.has(n.id) && !sIds.has(n.id)) base.push({ ...n });   // 远端新增
+  }
+  /* 顺序：本地操作还没改过相对顺序时，before 跟随远端的新顺序 */
+  const commonPrev = prev.filter((t) => sIds.has(t.id)).map((t) => t.id).join("\u0000");
+  const commonS = e.todos.filter((t) => prevMap.has(t.id)).map((t) => t.id).join("\u0000");
+  if (commonPrev === commonS){
+    const byId = new Map(base.map((t) => [t.id, t]));
+    const ordered = next.filter((t) => byId.has(t.id)).map((t) => byId.get(t.id));
+    const placed = new Set(ordered.map((t) => t.id));
+    for (let i = 0; i < base.length; i++){
+      const t = base[i];
+      if (placed.has(t.id)) continue;
+      let pos = 0;
+      for (let j = i - 1; j >= 0; j--){
+        const k = ordered.findIndex((x) => x.id === base[j].id);
+        if (k >= 0){ pos = k + 1; break; }
+      }
+      ordered.splice(pos, 0, t);
+      placed.add(t.id);
+    }
+    base = ordered;
+  }
+  e.todos = base;
+}
 function snapshot(label){
-  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId });
+  if (openUndoEntry) closeUndoEntry(openUndoEntry);
+  const entry = { label, todos: cloneList(todos), pomoTaskId:pomo.taskId, after:null };
+  undoStack.push(entry);
+  openUndoEntry = entry;
+  /* 同步 mutator 在本轮内改完内存；没走 persist 的路径由微任务封口 */
+  Promise.resolve().then(() => closeUndoEntry(entry));
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
   syncUndoBtn();
+}
+/* 纯函数：把 entry 描述的操作在 current 上逆向应用，返回新列表 */
+function invertUndoEntry(entry, current){
+  const S = entry.todos;
+  const A = entry.after || entry.todos;
+  const sMap = new Map(S.map((t) => [t.id, t]));
+  const aMap = new Map(A.map((t) => [t.id, t]));
+  let out = current.map((t) => ({ ...t }));
+  /* ① 本操作新增的（after 有、before 无）：自 after 以来用户字段没人动过才移除；
+     别页已在上面继续编辑过的，保留别人的工作 */
+  out = out.filter((t) => {
+    const a = aMap.get(t.id);
+    if (!a || sMap.has(t.id)) return true;
+    return !userEq(t, a);
+  });
+  /* ② 本操作改过的字段：只反做 after 之后没再变过的那几组；系统字段从不碰 */
+  out = out.map((t) => {
+    const s = sMap.get(t.id), a = aMap.get(t.id);
+    if (!s || !a) return t;
+    let next = t;
+    for (const g of USER_FIELD_GROUPS){
+      if (groupEq(s, a, g) || !groupEq(t, a, g)) continue;
+      if (next === t) next = { ...t };
+      for (const f of g) next[f] = s[f];
+    }
+    if (next !== t) next.updatedAt = Math.max(t.updatedAt || 0, Date.now());
+    return next;
+  });
+  /* ③ 顺序：本操作改了共同条目的相对顺序、且之后没人再排过，才按 before 的顺序排回 */
+  const common = (list) => list.filter((t) => sMap.has(t.id) && aMap.has(t.id)).map((t) => t.id);
+  const sOrder = common(S), aOrder = common(A), cur = out.filter((t) => sMap.has(t.id) && aMap.has(t.id));
+  const curIds = new Set(cur.map((t) => t.id));
+  const proj = (ids) => ids.filter((id) => curIds.has(id)).join("\u0000");
+  const curOrder = cur.map((t) => t.id).join("\u0000");
+  if (proj(sOrder) !== proj(aOrder) && curOrder === proj(aOrder)){
+    const byId = new Map(cur.map((t) => [t.id, t]));
+    const wanted = sOrder.filter((id) => curIds.has(id)).map((id) => byId.get(id));
+    let k = 0;
+    out = out.map((t) => (curIds.has(t.id) ? wanted[k++] : t));
+  }
+  /* ④ 本操作删掉的（before 有、after 无）：现在仍不在就按原位插回（快照里的下一个幸存邻居之前） */
+  const outIds = new Set(out.map((t) => t.id));
+  for (let i = 0; i < S.length; i++){
+    const s = S[i];
+    if (aMap.has(s.id) || outIds.has(s.id)) continue;
+    let pos = out.length;
+    for (let j = i + 1; j < S.length; j++){
+      const p = out.findIndex((t) => t.id === S[j].id);
+      if (p >= 0){ pos = p; break; }
+    }
+    out.splice(pos, 0, { ...s });
+    outIds.add(s.id);
+  }
+  return out;
 }
 function undo(){
   const snap = undoStack.pop();
   syncUndoBtn();
   if (!snap){ toast("没有可以撤销的操作了"); return; }
-  /* 与其它 mutator 一样先灌盘上最新内容：远端写可能还排在 storage 事件
-     队列里没投递，不先采纳的话 remoteIds 对它失明——三方合并会把远端
-     删的条目复活、把远端对本页新增条目的编辑当本地改动丢掉 */
+  closeUndoEntry(snap);
+  /* 与其它 mutator 一样先灌盘上最新内容（远端写可能还排在 storage 事件队列里）。
+     不脏时它把盘上内容（含结算标记）采纳进内存；脏窗口里内存领先，远端改动攒在
+     pendingExternal，随后的 persist 会按 dirtyBase 三方合并——两种情况下
+     撤销都只在「当前内存」上做操作级逆操作，不会整条回滚任何已合入的远端字段 */
   syncTodosFromDisk();
-  /* 不整体回滚：先读盘，盘上被别页动过就走三方合并——
-     S=快照、M=内存、D=盘，逐条归因 */
-  let diskList = null;
-  if (!localDirty){
-    try {
-      const d = JSON.parse(store.get(STORAGE_KEY) || "null");
-      const l = d && (Array.isArray(d) ? d : d.todos);
-      if (Array.isArray(l)) diskList = sanitizeList(l).todos;
-      /* 盘上的结算标记一并采纳：undo 后的 persist 会把当前 settledSegs
-         写回去，不先并进来就可能把别页刚记的标记盖掉 */
-      if (d && !Array.isArray(d)) adoptSettledSegs(d.settledSegs || d.settledSeg);
-    } catch { /* 读不出就走纯快照恢复 */ }
+  const next = invertUndoEntry(snap, todos);
+  for (const t of next){
+    const prev = todos.find((x) => x.id === t.id);
+    if (!prev || !userEq(prev, t)) remoteIds.delete(t.id);   // 撤销写出的版本是本页的
   }
-  const liveMap = new Map(todos.map((t) => [t.id, t]));
-  /* pomodoros/ClickUp 关联都是系统侧写入不是用户编辑（pushTodoToClickUp
-     回写不压快照）：恢复快照时绝不用旧值盖新值，哪边有留哪边 */
-  const restore = (t) => {
-    const l = liveMap.get(t.id);
-    if (!l) return t;
-    return { ...t,
-      pomodoros: Math.max(l.pomodoros || 0, t.pomodoros || 0),
-      clickupTaskId: l.clickupTaskId || t.clickupTaskId,
-      clickupUrl: l.clickupUrl || t.clickupUrl };
-  };
-  if (diskList){
-    /* 归因靠 remoteIds（条目级）：远端版本流入内存时登记，本页改写时销记——
-       「盘==内存且≠快照」可能是我方编辑也可能是远端编辑流入，全局标志分不清 */
-    const S = new Map(snap.todos.map((t) => [t.id, t]));
-    const M = new Map(todos.map((t) => [t.id, t]));
-    const diskIds = new Set(diskList.map((t) => t.id));
-    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-    /* 字段级归因：pomodoros/ClickUp 关联/updatedAt 是系统回写，不是用户编辑。
-       一条待办自快照以来只有系统字段变了，就说明这次撤销跟它无关——
-       不管它的版本是谁写的，都按盘上原样保留，绝不能借机回滚别页的编辑 */
-    const eqUser = (a, b) => eq(userFields(a), userFields(b));
-    let merged = [];
-    for (const d of diskList){
-      const s = S.get(d.id), m = M.get(d.id);
-      if (!s){
-        /* 盘有快照没有：远端内容才保留——版本登记过的、出身是远端的、
-           根本没进过内存的、或盘上版本与内存不同（远端编辑还卡在事件
-           队列没流入）。进内存的都顺手登记为远端；
-           在内存里见过、与盘一致、又没被标 → 我们加的，撤销就该移除 */
-        if (!m || remoteIds.has(d.id) || remoteOriginIds.has(d.id) || !eq(d, m)){
-          remoteIds.add(d.id);
-          if (!m) remoteOriginIds.add(d.id);   // 没进过内存的盘条目：远端新增
-          merged.push(d);
-        }
-        continue;
-      }
-      /* 三方共有：盘≠内存说明远端版较新（远端赢）；盘==内存且≠快照时，
-         登记过的是远端流入（远端赢），没登记的是我方改动（回滚到快照） */
-      if (!m || !eq(d, m) || eqUser(m, s) || remoteIds.has(d.id)) merged.push(d);
-      else merged.push(s);
-    }
-    /* 快照有而盘没有：登记过的是远端删的（不复活），没登记的是我们删的
-       （按原位插回——找「快照里的下一个幸存邻居」） */
-    const mergedIds = new Set(merged.map((t) => t.id));
-    for (let i = 0; i < snap.todos.length; i++){
-      const s = snap.todos[i];
-      if (mergedIds.has(s.id) || diskIds.has(s.id) || remoteIds.has(s.id)) continue;
-      let at = merged.length;
-      for (let j = i + 1; j < snap.todos.length; j++){
-        const pos = merged.findIndex((t) => t.id === snap.todos[j].id);
-        if (pos >= 0){ at = pos; break; }
-      }
-      merged.splice(at, 0, s);
-      mergedIds.add(s.id);
-    }
-    /* 撤销纯排序：merged 按盘序输出会让「撤销调整顺序」变成无声空操作——
-       合并结果与快照同集合、同内容时，按快照顺序排回 */
-    const byId = new Map(merged.map((t) => [t.id, t]));
-    if (merged.length === snap.todos.length
-        && snap.todos.every((t) => { const g = byId.get(t.id); return g && eqUser(g, t); })){
-      merged = snap.todos.map((t) => byId.get(t.id));
-    }
-    todos = merged.map(restore);
-    /* 合并态下有 dirtyBase 时 pendingExternal 还要留给恢复合并用，不能清 */
-    if (!dirtyBase) pendingExternal = null;
-  } else {
-    /* 快照恢复兜底（读不出盘/脏窗口）：remoteIds/remoteOriginIds 标记的
-       内存条目是远端内容——可能刚从 pendingExternal 合进来而快照里没有，
-       无脑恢复快照会把它们从内存抹掉（pendingExternal 已被消费时就是
-       永久丢失）。合不进去的就别丢：追加到末尾 */
-    const snapIds = new Set(snap.todos.map((t) => t.id));
-    const remoteOnly = todos.filter((t) =>
-      !snapIds.has(t.id) && (remoteIds.has(t.id) || remoteOriginIds.has(t.id)));
-    /* 对称的一侧也不能漏：快照里有、内存里没有、还带着远端标记的——
-       那是远端删的（标记来源只剩 markRemoteAdopted 的删除登记），
-       无脑恢复等于复活并广播僵尸。注意不能只看标记：远端改过的条目
-       也在 remoteIds 里但仍在内存，得用 liveIds 区分 */
-    const liveIds = new Set(todos.map((t) => t.id));
-    todos = snap.todos
-      .filter((s) => !remoteIds.has(s.id) || liveIds.has(s.id))
-      .map(restore).concat(remoteOnly);
-  }
+  todos = next;
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
   const restorable = (id) => id && todos.some((t) => t.id === id && !t.completed);
@@ -2239,9 +2294,9 @@ async function pushTodoToClickUp(id, btnEl, pushOpts){
     }
     /* 系统字段回写不改编辑归因：不动 remoteIds。若这条刚流入了别页的编辑，
        它仍算远端版本，撤销本页无关操作时不会被回滚成旧正文 */
+    /* updatedAt 是用户编辑时间：系统回写不推它，否则软合并会把本页旧正文当成更新版 */
     live.clickupTaskId = taskId;
     live.clickupUrl = safeUrl || ("https://app.clickup.com/t/" + taskId);
-    live.updatedAt = Date.now();
     persist();
     render();
     const msg = "已传到 ClickUp · " + scheduleHint;
@@ -2554,6 +2609,27 @@ function syncTodosFromDisk(){
   return (same && !mergedFromDirty) ? "same" : "applied";
 }
 
+/* 双方都改过同一条时的三方合并：用户字段与系统字段分开判定。
+   · 用户字段逐组：本页这组没动（==基线）→ 取远端；本页动过 → 本页为准。
+     只有系统字段回写（ClickUp taskId/url、番茄入账）的本页版本，用户字段
+     全等于基线，于是远端的正文/状态编辑全部胜出——系统回写绝不给旧正文撑腰。
+   · 系统字段：番茄取大、ClickUp 关联哪边有留哪边。
+   · updatedAt（用户编辑时间）：取实际胜出的用户字段来源中较新的那个 */
+function mergeThreeWay(ours, base, theirs){
+  const out = { ...ours };
+  let tookTheirs = false, keptOurs = false;
+  for (const g of USER_FIELD_GROUPS){
+    if (groupEq(ours, base, g)){
+      if (!groupEq(theirs, base, g)) tookTheirs = true;
+      for (const f of g) out[f] = theirs[f];
+    } else keptOurs = true;
+  }
+  Object.assign(out, mergeSystemFields(ours, theirs));
+  const ou = ours.updatedAt || 0, tu = theirs.updatedAt || 0;
+  out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
+  return out;
+}
+
 /* 三方合并远端内容进内存：base=参照基线（脏窗口前的盘 或 刚采纳的盘）、
    ours=内存、theirs=远端快照。逐条判定——
    · 我们没碰过的基线条目（ours==base）→ 取远端版（远端编辑/番茄入账要活下来）
@@ -2575,12 +2651,7 @@ function mergeRemoteWindow(parsed, base, followDeletes){
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
       if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
-      /* 双方都改：本页普通字段为准，但 pomodoros 取大、ClickUp 关联字段
-         哪边有哪边留——taskId/url 是外部系统回写，合并丢掉会断链 */
-      return { ...t,
-        pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
-        clickupTaskId: t.clickupTaskId || r.clickupTaskId,
-        clickupUrl: t.clickupUrl || r.clickupUrl };
+      return mergeThreeWay(t, b, r);
     });
   for (const t of remote){
     if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
@@ -2603,13 +2674,10 @@ function mergeSoftRemote(parsed){
   const merged = todos.map((t) => {
     const r = remoteMap.get(t.id);
     if (!r) return t;
+    /* 用户字段按用户编辑时间（updatedAt，系统回写不推它）整体取较新一方；
+       系统字段独立合并——ClickUp 回写/番茄入账不能让旧正文显得「更新」 */
     const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
-    const l = w === r ? t : r;
-    /* 赢方普通字段为准，但 pomodoros 取大、ClickUp 关联字段哪边有哪边留 */
-    return { ...w,
-      pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
-      clickupTaskId: w.clickupTaskId || l.clickupTaskId,
-      clickupUrl: w.clickupUrl || l.clickupUrl };
+    return { ...t, ...userFields(w), updatedAt: w.updatedAt, ...mergeSystemFields(t, r) };
   });
   for (const t of remote){
     if (!ourIds.has(t.id)) merged.push(t);
