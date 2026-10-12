@@ -255,6 +255,14 @@
   }
   let keyWarm = null;
   let keyWarmProvider = null;
+  // 每个服务商的 key 代际：保存/清除时递增，迁移等迟到的读取不得覆盖用户的新操作
+  const keyGenerations = new Map();
+  function keyGeneration(providerId) {
+    return keyGenerations.get(providerId) || 0;
+  }
+  function bumpKeyGeneration(providerId) {
+    keyGenerations.set(providerId, keyGeneration(providerId) + 1);
+  }
 
   function secure() {
     return globalThis.LUMINA_SECURE_STORE || null;
@@ -286,16 +294,18 @@
   async function warmApiKey(provider = currentProvider()) {
     // 按服务商预热：切换后要给新服务商的 key 做一次 Keychain 迁移
     if (keyWarm && keyWarmProvider === provider.id) return keyWarm;
+    const gen = keyGeneration(provider.id);
+    const adopt = (v) => {
+      if (gen !== keyGeneration(provider.id)) return cacheFor(provider)?.value ?? null;
+      storeCache(v, provider.id);
+      return v;
+    };
     const p = (async () => {
       const s = secure();
       if (s?.migrateKey) {
-        const v = parseApiKey(await s.migrateKey(provider.keyStore), provider);
-        storeCache(v, provider.id);
-        return v;
+        return adopt(parseApiKey(await s.migrateKey(provider.keyStore), provider));
       }
-      const v = loadKeyFromLocalStorage(provider);
-      storeCache(v, provider.id);
-      return v;
+      return adopt(loadKeyFromLocalStorage(provider));
     })();
     keyWarm = p;
     keyWarmProvider = provider.id;
@@ -324,8 +334,10 @@
     }
     const s = secure();
     if (s?.get) {
+      const gen = keyGeneration(provider.id);
       try {
         const v = parseApiKey(await s.get(provider.keyStore), provider);
+        if (gen !== keyGeneration(provider.id)) return cacheFor(provider)?.value ?? null;
         storeCache(v, provider.id);
         return v;
       } catch (err) {
@@ -341,6 +353,7 @@
   async function setApiKey(raw) {
     const provider = currentProvider();
     const line = String(raw || "").trim();
+    bumpKeyGeneration(provider.id);
     if (!line) {
       const s = secure();
       if (s?.remove) {
@@ -568,6 +581,8 @@
   class SseLineBuffer {
     constructor() {
       this.buf = "";
+      // 收到 [DONE] 才算服务端正常收尾；没有它的 EOF 是断流，不能当成功
+      this.done = false;
     }
     push(chunk) {
       this.buf += chunk;
@@ -585,7 +600,8 @@
         if (line.endsWith("\r")) line = line.slice(0, -1);
         if (line.startsWith("data:")) {
           const payload = line.slice(5).trim();
-          if (payload && payload !== "[DONE]") out.push(payload);
+          if (payload === "[DONE]") this.done = true;
+          else if (payload) out.push(payload);
         }
       }
       return out;
@@ -596,7 +612,8 @@
       this.buf = "";
       if (line.startsWith("data:")) {
         const payload = line.slice(5).trim();
-        if (payload && payload !== "[DONE]") return [payload];
+        if (payload === "[DONE]") this.done = true;
+        else if (payload) return [payload];
       }
       return [];
     }
@@ -818,6 +835,28 @@
     };
   }
 
+  /**
+   * OpenAI 兼容服务在 HTTP 200 的流里也可能下发 {"error": …}（上游限流、内容审核、中途崩溃）。
+   * 这种流必须整体判失败：之前累计的工具调用一条都不能执行。
+   */
+  function streamPayloadError(json) {
+    const raw = json && typeof json === "object" ? json.error : null;
+    if (raw == null || raw === false) return null;
+    const detail =
+      typeof raw === "string"
+        ? raw
+        : typeof raw?.message === "string"
+          ? raw.message
+          : "";
+    const err = new Error(
+      "AI 服务在回复中途报错" + (detail ? "：" + redactSecrets(detail).slice(0, 200) : "")
+    );
+    err.code = "STREAM_ERROR";
+    const status = Number(raw?.code ?? raw?.status);
+    if (Number.isFinite(status) && status >= 400 && status < 600) err.status = status;
+    return err;
+  }
+
   async function consumeStream(res, onDelta, ctx = {}) {
     const { signal, onStall } = ctx;
     const reader = res.body?.getReader?.();
@@ -916,6 +955,8 @@
         throw err;
       }
       const data = JSON.parse(text);
+      const payloadErr = streamPayloadError(data);
+      if (payloadErr) throw payloadErr;
       const choice = data?.choices?.[0];
       const msg = choice?.message || {};
       finishReason = choice?.finish_reason || null;
@@ -979,9 +1020,16 @@
         idleTimer = setTimeout(() => onStall?.(), LIMITS.streamIdleTimeoutMs);
       };
       const applyPayload = (payload) => {
+        let json;
         try {
-          const json = JSON.parse(payload);
-          const choice = json?.choices?.[0];
+          json = JSON.parse(payload);
+        } catch {
+          return; // 非 JSON 的保活/注释行忽略
+        }
+        const payloadErr = streamPayloadError(json);
+        if (payloadErr) throw payloadErr;
+        const choice = json?.choices?.[0];
+        try {
           applyDelta(choice?.delta || {}, choice?.finish_reason || null);
         } catch (err) {
           if (err?.code === "RESPONSE_TOO_LARGE") throw err;
@@ -1011,6 +1059,13 @@
         } catch {
           /* ignore */
         }
+      }
+      // 既没有 finish_reason 也没有 [DONE] 就 EOF：连接被截断，结果不完整。
+      // 不能合成为成功，尤其不能执行半截流里累计的工具调用。
+      if (!aborted && !finishReason && !lines.done) {
+        const err = new Error("AI 回复意外中断（流未正常结束），本轮结果已丢弃");
+        err.code = "STREAM_INCOMPLETE";
+        throw err;
       }
     }
 
@@ -1386,8 +1441,33 @@
 
       (async () => {
         let link = null;
+        let finished = false;
+        // CapacitorHttp 可能忽略 AbortSignal：停止后原生请求迟迟不返回。
+        // 本地必须立刻收尾并释放并发名额，迟到的响应只做清理、不再回调。
+        const stopSignal = entry.ac.signal;
+        let onStop = null;
+        const stopped = new Promise((_, reject) => {
+          onStop = () =>
+            reject(stopSignal.reason || new DOMException("已停止", "AbortError"));
+          if (stopSignal.aborted) onStop();
+          else stopSignal.addEventListener("abort", onStop, { once: true });
+        });
+        stopped.catch(() => {});
+        const discardLate = (late) => {
+          if (!late || late === link) return;
+          try {
+            late.dispose?.();
+          } catch {
+            /* ignore */
+          }
+          try {
+            late.res?.body?.cancel?.()?.catch?.(() => {});
+          } catch {
+            /* ignore */
+          }
+        };
         try {
-          const call = await callChatApi({
+          const callPromise = callChatApi({
             messages: body.messages,
             tools: useTools ? getTools() : undefined,
             tool_choice: useTools
@@ -1401,16 +1481,29 @@
             provider,
             base,
           });
-          link = call;
-          const result = await consumeStream(
-            call.res,
-            (piece) => emitDelta(requestId, piece),
-            {
-              signal: call.signal,
-              onStall: () =>
-                entry.ac.abort(new DOMException("流已停顿", "TimeoutError")),
-            }
+          callPromise.then(
+            (late) => {
+              if (finished) discardLate(late);
+            },
+            () => {}
           );
+          const call = await Promise.race([callPromise, stopped]);
+          link = call;
+          const result = await Promise.race([
+            consumeStream(
+              call.res,
+              (piece) => {
+                // 本地已收尾（停止/超时）后，后台还在读的旧流不得再往同 requestId 推数据
+                if (!finished) emitDelta(requestId, piece);
+              },
+              {
+                signal: call.signal,
+                onStall: () =>
+                  entry.ac.abort(new DOMException("流已停顿", "TimeoutError")),
+              }
+            ),
+            stopped,
+          ]);
           emitDone(requestId, {
             content: result.content,
             reasoning: result.reasoning,
@@ -1437,8 +1530,12 @@
             status: err?.status,
           });
           logRequestFailure("chat stream", err, { url: endpoint, status: err?.status });
-          emitError(requestId, classified.message);
+          // 流内错误/断流保留具体原因（含上游给的错误信息），别被 HTTP 状态分类盖掉
+          const streamFailed = err?.code === "STREAM_ERROR" || err?.code === "STREAM_INCOMPLETE";
+          emitError(requestId, streamFailed ? err.message : classified.message);
         } finally {
+          finished = true;
+          stopSignal.removeEventListener("abort", onStop);
           link?.dispose?.();
           endRequest(requestId, entry);
         }
@@ -1501,6 +1598,7 @@
       if (!Number.isFinite(endedAt) || endedAt <= 0) endedAt = Date.now();
       return cu.logPomodoro({
         title: typeof src.title === "string" ? src.title : "",
+        taskId: typeof src.taskId === "string" ? src.taskId : undefined,
         minutes: Number(src.minutes) || 0,
         endedAt,
         operationId: typeof src.operationId === "string" ? src.operationId : undefined,
