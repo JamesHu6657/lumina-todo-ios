@@ -3560,6 +3560,132 @@ async function main() {
   }
   ok("审查八① 编辑冲突记录随每次合并刷新远端基准（远端改成与本页相同也刷新）：依次撤销露出远端最新值（有/无 storage 事件，L/R2；非脏采纳；回显不刷新；每步各一条）");
 
+  /* ======================= Linear 复审第九轮回归：撤销改为按字段写入戳判定 ======================= */
+
+  /* ---- 审查九① 首次「同值」独立远端编辑也受撤销保护：A 改成 L（写失败），B 独立改成同一个 L，A 撤销不得把 B 的 L 改回原值 ---- */
+  for (const field of ["text", "priority"]) {
+    for (const deliverEvent of [true, false]) {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "Original", priority: "low" }).todo;
+      const B = loadApp({ storage });
+      const tag = `${field} / ${deliverEvent ? "有" : "无"} storage 事件`;
+      const patch = field === "text" ? { text: "L" } : { priority: "high" };
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: x.id, ...patch }).ok, true);   // A: Original→L（写失败）
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, ...patch }).ok, true);   // B 独立写下同值 L
+      if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      const r = A.invoke("undo");
+      assert.equal(r.ok, true);
+      const dx = diskTodos(storage).find((t) => t.id === x.id);
+      assert.equal(dx[field], patch[field], `${tag}：B 独立写下的同值不得被撤销写回原值`);
+      assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], patch[field], `${tag}：内存同样保留 B 的值`);
+      assert.ok(Array.isArray(r.skipped) && r.skipped.some((s) => s.id === x.id && s.field === field),
+        `${tag}：部分撤销要报告被跳过的字段组`);
+    }
+  }
+  ok("审查九① 同值独立远端编辑受撤销保护（text / priority × 有/无 storage 事件），并报告跳过的字段");
+
+  /* ---- 审查九② 迟到的陈旧 storage 事件不得让内存或撤销基准倒退 ---- */
+  for (const stale of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    const tag = stale ? "迟到的陈旧 R1 事件" : "对照：无陈旧事件";
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "M" }).ok, true);   // E1: O→M（写失败）
+    storage.failTodoWrites = false;
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R1" }).ok, true);
+    const e1 = storage.getItem(TODO_KEY);                                        // R1 的 storage 事件被扣住
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "R2" }).ok, true);
+    const u = A.invoke("add_todo", { text: "u" }).todo;                          // 恢复合并看到 R2，本页 M 落盘
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "M");
+    if (stale) {
+      A.deliverStorage(TODO_KEY, e1);                                            // 陈旧 R1 事件此刻才到
+      assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id).text, "M", `${tag}：陈旧快照不得让内存倒退`);
+      assert.ok(A.invoke("list_todos", {}).todos.some((t) => t.id === u.id), `${tag}：陈旧快照不得吞掉本页新增`);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "M", `${tag}：陈旧快照不得被写回盘`);
+    }
+    assert.equal(A.invoke("undo").ok, true);                                     // 撤销 u
+    assert.ok(!diskTodos(storage).some((t) => t.id === u.id));
+    assert.equal(A.invoke("undo").ok, true);                                     // 撤销 E1
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "R2", `${tag}：撤销须露出最新远端 R2，不得写回陈旧 R1`);
+  }
+  ok("审查九② 迟到的陈旧 storage 事件按盘修订号丢弃：内存不倒退，撤销露出最新远端 R2（含无陈旧事件对照）");
+
+  /* ---- 审查九③ 撤销新增：别页在条目上写过（即便净值相同）就保留，绝不删掉别页的编辑 ---- */
+  for (const deliverEvent of [true, false]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const y = A.invoke("add_todo", { text: "Y", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(B.invoke("update_todo", { id: y.id, priority: "high" }).ok, true);
+    assert.equal(B.invoke("update_todo", { id: y.id, priority: "low" }).ok, true);   // 别页写过，净值回到 low
+    if (deliverEvent) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    const r = A.invoke("undo");
+    assert.equal(r.ok, true);
+    assert.ok(diskTodos(storage).some((t) => t.id === y.id), `${deliverEvent}：别页在条目上写过，撤销新增不得删掉它`);
+    assert.ok(Array.isArray(r.skipped) && r.skipped.some((s) => s.id === y.id), `${deliverEvent}：报告保留下来的新增条目`);
+  }
+  ok("审查九③ 撤销新增按写入戳判定：别页写过的条目保留并报告");
+
+  /* ---- 审查九④ 写入戳随条目落盘并在合并中保留；旧版（无戳、无修订号）存档照常加载、编辑、撤销 ---- */
+  {
+    const storage = sharedStorage();
+    storage.setItem(TODO_KEY, JSON.stringify({ v: 4, writer: "old-tab", savedAt: 1, todos: [
+      { id: "legacy-1", text: "旧条目", completed: false, priority: "low", category: "inbox", dueDate: null,
+        createdAt: 1700000000000, updatedAt: 1700000000000, completedAt: null, pomodoros: 0, clickupTaskId: null, clickupUrl: null },
+    ] }));
+    const A = loadApp({ storage });
+    assert.equal(A.invoke("list_todos", {}).todos[0].text, "旧条目");
+    assert.equal(A.invoke("update_todo", { id: "legacy-1", text: "新正文" }).ok, true);
+    const disk = JSON.parse(storage.getItem(TODO_KEY));
+    assert.ok(Number.isFinite(disk.rev) && disk.rev > 0, "新写入带单调盘修订号");
+    const d0 = disk.todos[0];
+    assert.ok(d0._fw && d0._fw.text && d0._fw.text.op, "写过的字段组带写入戳落盘");
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage)[0].text, "旧条目", "旧数据上的本页编辑照常撤销");
+    // 戳经别页往返后仍在
+    const B = loadApp({ storage });
+    assert.equal(B.invoke("add_todo", { text: "B 新增" }).ok, true);
+    const after = JSON.parse(storage.getItem(TODO_KEY));
+    assert.ok(after.rev > disk.rev, "盘修订号单调递增");
+    assert.ok(after.todos.find((t) => t.id === "legacy-1"), "旧条目仍在");
+    assert.ok(after.todos.find((t) => t.text === "B 新增")._fw, "别页新增同样带戳");
+    // 导出不带内部写入戳
+    assert.ok(!A.sandbox.__luminaExportSnapshot().todos.some((t) => "_fw" in t), "导出快照不含内部写入戳");
+  }
+  ok("审查九④ 写入戳与盘修订号落盘、跨页往返保留；旧版存档照常加载/编辑/撤销；导出不含内部戳");
+
+  /* ---- 审查九⑤ 本页写盘恰好盖掉一份没见过的远端写：它的 storage 事件到达时仍按修订号视为新快照、软合并救回；
+     软合并逐组按写入戳取较新一方，不再整条按 updatedAt 覆盖掉本页刚写的另一组 ---- */
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    const rawSet = storage.setItem;
+    let hook = true, eB = null;
+    storage.setItem = (k, v) => {
+      if (hook && k === TODO_KEY) {                 // A 已读盘、尚未落盘的瞬间，B 写入 R
+        hook = false;
+        assert.equal(B.invoke("update_todo", { id: x.id, text: "R" }).ok, true);
+        eB = storage.getItem(TODO_KEY);
+      }
+      rawSet(k, v);
+    };
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);
+    storage.setItem = rawSet;
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "O", "前提：A 的写盖掉了 B 的 R");
+    A.deliverStorage(TODO_KEY, eB);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx.text, "R", "被盖掉的远端写须被软合并救回");
+    assert.equal(dx.priority, "high", "软合并不得用远端整条覆盖本页刚写的优先级");
+  }
+  ok("审查九⑤ 被本页写盖掉的远端写按修订号仍可软合并救回；软合并逐组按写入戳取较新一方");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
