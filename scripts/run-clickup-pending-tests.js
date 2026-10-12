@@ -59,8 +59,8 @@ function makeClickUp() {
   return state;
 }
 
-async function load(pendings, cu) {
-  const store = makeStore();
+async function load(pendings, cu, opts = {}) {
+  const store = opts.store || makeStore();
   const sandbox = {
     console,
     setTimeout,
@@ -71,14 +71,44 @@ async function load(pendings, cu) {
     URLSearchParams,
     URL,
   };
+  if (opts.navigator) sandbox.navigator = opts.navigator;
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox);
   const api = sandbox.LUMINA_MOBILE_CLICKUP;
   assert.equal((await api.setStoredToken("pk_" + "x".repeat(24))).ok, true);
   await new Promise((r) => setTimeout(r, 20)); // 等 setStoredToken 触发的空队列 flush 结束
-  store.setItem(PENDING_KEY, JSON.stringify(pendings));
+  if (pendings) store.setItem(PENDING_KEY, JSON.stringify(pendings));
   return { api, store };
+}
+
+/** 多「页面」共享的 Web Locks 替身（FIFO、exclusive、ifAvailable） */
+function makeLockManager() {
+  const held = new Map();
+  const waiters = new Map();
+  const grant = (name) => {
+    const q = waiters.get(name);
+    if (held.get(name) || !q || !q.length) return;
+    q.shift()();
+  };
+  return {
+    request(name, options, cb) {
+      if (typeof options === "function") { cb = options; options = {}; }
+      if (options.ifAvailable && held.get(name)) return Promise.resolve().then(() => cb(null));
+      return new Promise((resolve, reject) => {
+        const run = () => {
+          held.set(name, true);
+          Promise.resolve()
+            .then(() => cb({ name, mode: "exclusive" }))
+            .then(resolve, reject)
+            .finally(() => { held.set(name, false); grant(name); });
+        };
+        if (!waiters.has(name)) waiters.set(name, []);
+        waiters.get(name).push(run);
+        grant(name);
+      });
+    },
+  };
 }
 
 function pending(operationId, ageMs) {
@@ -275,6 +305,46 @@ async function main() {
     assert.equal(q2[0].tries, 0);
     console.log("✔ 待核对记录已满时新打卡转入队列，不淘汰旧记录、不盲发");
   }
+
+  // 审查三⑥：重叠的「重试待核对」——同页 single-flight、跨页 Web Lock 串行、无锁时 compare-and-clear
+  for (const mode of ["same-page", "two-tabs-locks", "two-tabs-no-locks"]) {
+    const cu = makeClickUp();
+    cu.postFail = 1;            // 第一次补发 504：结果未知，必须留下新的待核对
+    const slowFetch = cu.fetch;
+    // 时序（评审复现）：两次重试同时读到旧记录；第一次查询先返回、开始补发并写入新 pending、
+    // POST 在途；第二次的查询更慢，在这之后才返回并拿旧快照去「清除」
+    const lookupDelays = [20, 60];
+    cu.fetch = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || "GET";
+      if (u.includes("/time_entries") && method === "GET") {
+        await new Promise((r) => setTimeout(r, lookupDelays.length ? lookupDelays.shift() : 20));
+      }
+      if (u.includes("/time_entries") && method === "POST") {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      return slowFetch(url, opts);
+    };
+    const nav = mode === "two-tabs-locks" ? { locks: makeLockManager() } : undefined;
+    const realFetch = cu.fetch;
+    cu.fetch = slowFetch;   // 加载阶段不计入时序
+    const first = await load([{ ...pending("op-overlap-1", GRACE_MS + 60_000), needsManual: true }], cu, { navigator: nav });
+    const second = mode === "same-page" ? first : await load(null, cu, { store: first.store, navigator: nav });
+    cu.fetch = realFetch;
+    const [r1, r2] = await Promise.all([first.api.retryPendingPomos(), second.api.retryPendingPomos()]);
+    assert.ok(r1 && r2);
+    assert.equal(cu.posts.length, 1, `${mode}：重叠重试只允许补发一次`);
+    const pend = JSON.parse(first.store.getItem(PENDING_KEY) || "[]");
+    assert.equal(pend.length, 1, `${mode}：504 后的新待核对记录不得被旧快照清掉`);
+    assert.equal(pend[0].operationId, "op-overlap-1");
+    // 之后的自动刷新/对账/补发都不得绕过待核对再次 POST
+    await first.api.flushQueue();
+    await second.api.flushQueue();
+    await first.api.reconcilePendingPomos();
+    await first.api.flushQueue();
+    assert.equal(cu.posts.length, 1, `${mode}：自动刷新不得重复 POST`);
+  }
+  console.log("✔ 审查三⑥ 重叠手动重试：single-flight + 锁 + 版本校验，504 后不被旧快照清除、不重复补发");
 }
 
 main().catch((err) => {
