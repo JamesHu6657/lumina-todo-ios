@@ -198,6 +198,35 @@ async function main() {
     console.log("✔ 原生 fetch 忽略 signal 时，complete 仍会超时且接住迟到失败");
   }
 
+  // 审查第二轮 #5：Factory 中转（droid exec）不支持采样参数，App 不得再发送 max_tokens/temperature
+  {
+    const bodies = [];
+    const capture = (provider) => async (_url, options) => {
+      bodies.push({ provider, body: JSON.parse(options.body) });
+      return completeResponse("ok");
+    };
+    const factory = loadBridge(store, capture("factory"));
+    const r = await within(factory.complete({
+      messages: [{ role: "user", content: "hi" }], temperature: 0.9, max_tokens: 900,
+    }));
+    assert.equal(r.ok, true);
+    const fb = bodies.find((b) => b.provider === "factory").body;
+    assert.equal("temperature" in fb, false, "Factory 请求不应携带 temperature");
+    assert.equal("max_tokens" in fb, false, "Factory 请求不应携带 max_tokens");
+    const other = makeLocalStorage();
+    other.setItem("lumina-api-provider", "opencode");
+    other.setItem("lumina-api-key", "sk-" + "o".repeat(30));
+    const oc = loadBridge(other, capture("opencode"));
+    await within(oc.complete({ messages: [{ role: "user", content: "hi" }], temperature: 0.9, max_tokens: 900 }));
+    const ob = bodies.find((b) => b.provider === "opencode").body;
+    assert.equal(ob.temperature, 0.9, "其他服务商仍发送 temperature");
+    assert.equal(ob.max_tokens, 900, "其他服务商仍发送 max_tokens");
+    const pv = await factory.providers();
+    const fp = pv.list.find((x) => x.id === "factory");
+    assert.equal(fp.samplingParams, false, "providers() 应声明 Factory 不支持采样参数");
+    console.log("✔ Factory 不再发送被中转忽略的 max_tokens/temperature，其他服务商不受影响");
+  }
+
   for (const stop of [true, false]) {
     const text = deferred();
     const bodyStarted = deferred();
