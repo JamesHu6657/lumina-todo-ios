@@ -363,8 +363,18 @@
       }
       refreshMasks();
     });
-    document.getElementById("setCuRetryPending")?.addEventListener("click", async () => {
+    let retryPendingBusy = false;
+    document.getElementById("setCuRetryPending")?.addEventListener("click", async (ev) => {
+      // 执行期间禁用按钮；真正的互斥在 bridge/mobile-clickup（single-flight + 锁 + 版本校验）
+      if (retryPendingBusy) return;
+      const btn = ev?.currentTarget || document.getElementById("setCuRetryPending");
       if (!confirm("重新核对长时间未确认的 ClickUp 记录？ClickUp 里仍查不到的番茄打卡会按原标记补传一次。")) return;
+      if (retryPendingBusy) return;
+      retryPendingBusy = true;
+      if (btn) {
+        btn.disabled = true;
+        btn.setAttribute?.("aria-busy", "true");
+      }
       try {
         const r = await window.luminaClickUp?.retryPending?.();
         if (!r) toast("ClickUp 模块未加载");
@@ -377,6 +387,12 @@
         }
       } catch (err) {
         toast(err?.message || "重试失败");
+      } finally {
+        retryPendingBusy = false;
+        if (btn) {
+          btn.disabled = false;
+          btn.removeAttribute?.("aria-busy");
+        }
       }
       refreshMasks();
     });
