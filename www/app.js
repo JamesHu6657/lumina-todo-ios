@@ -1502,10 +1502,36 @@ function invertUndoEntry(entry, current){
   }
   return out;
 }
+/* 审查四①：脏窗口里撤销前必须先把盘上最新的远端写按 dirtyBase 合进内存并前移基线，
+   再在「最新状态」上做逆操作。否则逆操作基于旧内存，随后的恢复写会把别页对同一条的
+   编辑盖掉（撤销新增时甚至会删掉别页刚编辑过的条目）。
+   读不到/解析不了盘就放弃本次撤销（撤销步留在栈里），绝不拿旧内存去覆盖。
+   返回 true=已合并或无需合并，false=无法确认最新状态 */
+function mergeLatestBeforeDirtyUndo(){
+  if (!localDirty || !storageWritable) return true;   // 不脏走常规 sync；存储不可用时没有别页能写
+  let raw = null;
+  try { raw = localStorage.getItem(STORAGE_KEY); } catch { return false; }
+  let disk = null;
+  if (raw != null){
+    try { disk = JSON.parse(raw); } catch { return false; }
+    if (!disk || typeof disk !== "object") return false;
+    const list = Array.isArray(disk) ? disk : disk.todos;
+    if (!Array.isArray(list)) return false;
+  } else if (Array.isArray(dirtyBase) && dirtyBase.length) {
+    return false;   // 窗口前盘上明明有数据，现在却读成空：当作读失败
+  }
+  if (!Array.isArray(dirtyBase)) dirtyBase = lastAppliedList.map((t) => ({ ...t }));
+  mergeRemoteBeforeRecoveryWrite();   // 盘上是别页写就用它，否则用排队快照；内部前移 dirtyBase
+  return true;
+}
 function undo(){
+  if (!undoStack.length){ syncUndoBtn(); toast("没有可以撤销的操作了"); return false; }
+  if (!mergeLatestBeforeDirtyUndo()){
+    toast("暂时读不到最新数据，为避免覆盖其他页面的改动，这次没有撤销");
+    return false;
+  }
   const snap = undoStack.pop();
   syncUndoBtn();
-  if (!snap){ toast("没有可以撤销的操作了"); return; }
   closeUndoEntry(snap);
   /* 与其它 mutator 一样先灌盘上最新内容（远端写可能还排在 storage 事件队列里）。
      不脏时它把盘上内容（含结算标记）采纳进内存；脏窗口里内存领先，远端改动攒在
@@ -1527,6 +1553,7 @@ function undo(){
   persist(); render();
   play("r-nod");
   toast(`已撤销：${snap.label}`);
+  return true;
 }
 
 /* ------------------------------------------------------------ 存储提示 */
@@ -3557,7 +3584,7 @@ function agentInvoke(name, rawArgs){
       }
       case "undo": {
         if (!undoStack.length) return { ok:false, error:"没有可撤销的操作" };
-        undo();
+        if (!undo()) return { ok:false, error:"暂时读不到最新数据，为避免覆盖其他页面的改动，本次未撤销" };
         return { ok:true, message:"已撤销上一步" };
       }
       case "get_app_status": {
