@@ -91,7 +91,15 @@
       for (const tc of toolCalls) {
         const id = typeof tc?.id === "string" ? tc.id.trim() : "";
         const name = tc?.function?.name || tc?.name || "";
-        if (!id || !name || seen.has(id)) {
+        // 审查五 B：键存在但类型不对（含显式 null）= 无效调用，整轮不执行
+        const own = (o, k) => !!o && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
+        const fn = tc?.function;
+        const badFn = own(tc, "function") && (!fn || typeof fn !== "object" || Array.isArray(fn));
+        const a = own(fn, "arguments") ? fn.arguments : undefined;
+        const badArgs = own(fn, "arguments") &&
+          typeof a !== "string" && (a === null || typeof a !== "object" || Array.isArray(a));
+        const badName = own(fn, "name") && typeof fn.name !== "string";
+        if (!id || !name || typeof name !== "string" || badFn || badArgs || badName || seen.has(id)) {
           const err = new Error("模型返回了无效或重复的工具调用，未执行任何操作");
           err.code = "INVALID_TOOL_CALLS";
           throw err;
