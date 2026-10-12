@@ -1,7 +1,8 @@
 /**
  * ClickUp 番茄打卡「待核对」回归测试（Node，无真机）
- * 直接打卡超时后只留 pending、不入队；对账确认远端没有时，过了宽限期必须转入补发队列，
- * 否则这条番茄永远进不了 ClickUp，「待核对」也永远不消。
+ * 直接打卡超时后只留 pending、不入队；对账持续按 marker 查。
+ * 审查第二轮 #3：宽限期过后一次空查询不能证明原请求不会再提交——不自动补发，
+ * 只标记为「需手动重试」；用户手动重试且再次确认查无，才按原 operationId 补发一次。
  */
 "use strict";
 
@@ -95,23 +96,52 @@ function pending(operationId, ageMs) {
 }
 
 async function main() {
-  // 1. 确认没有 + 已过宽限期：转入队列并按原 operationId 补发一次
+  // 1. 查无 + 已过宽限期：不自动补发，标记需手动；继续对账；手动重试才补发一次
   {
     const cu = makeClickUp();
     const { api, store } = await load([pending("op-lost-1", GRACE_MS + 60_000)], cu);
     const r = await api.reconcilePendingPomos();
-    assert.equal(r.requeued, 1);
-    assert.equal(r.left, 0);
-    const q = JSON.parse(store.getItem(QUEUE_KEY) || "[]");
-    assert.equal(q.length, 1);
-    assert.equal(q[0].operationId, "op-lost-1");
+    assert.equal(r.requeued, 0, "宽限期后的空查询不得自动转入补发");
+    assert.equal(r.left, 1);
+    assert.equal(r.needsManual, 1);
+    assert.equal(JSON.parse(store.getItem(QUEUE_KEY) || "[]").length, 0);
     await api.flushQueue();
-    assert.equal(cu.posts.length, 1, "应补发一次");
+    assert.equal(cu.posts.length, 0, "不得自动补发");
+    assert.equal((await api.status()).pendingManual, 1);
+    // 迟到的原请求随后落库：对账找回，不再需要手动处理
+    // （这里先验证仍查无时，再次对账保持原状）
+    await api.reconcilePendingPomos();
+    assert.equal(cu.posts.length, 0);
+    const m = await api.retryPendingPomos();
+    assert.equal(m.ok, true);
+    assert.equal(m.requeued, 1);
+    assert.equal(cu.posts.length, 1, "手动重试后补发一次");
     assert.match(cu.posts[0].description, /\[lumina-op:op-lost-1\]/);
     const st = await api.status();
     assert.equal(st.queue, 0);
     assert.equal(st.pendingPomo, 0);
-    console.log("✔ 确认远端没有且过宽限期：转入队列，按原 operationId 补发一次");
+    assert.equal(st.pendingManual, 0);
+    console.log("✔ 过宽限期仍查无：不自动补发、标记需手动；手动重试才按原 operationId 补发一次");
+  }
+
+  // 1b. 需手动的记录在原请求迟到落库后由对账自动消掉；手动重试遇到查询失败什么都不动
+  {
+    const cu = makeClickUp();
+    const { api } = await load([pending("op-late-1", GRACE_MS + 60_000)], cu);
+    await api.reconcilePendingPomos();
+    assert.equal((await api.status()).pendingManual, 1);
+    cu.lookup = "fail";
+    const f = await api.retryPendingPomos();
+    assert.equal(f.ok, false);
+    assert.equal(f.code, "LOOKUP_FAILED");
+    assert.equal(cu.posts.length, 0, "手动重试时查询失败也不得 POST");
+    cu.lookup = "hit";
+    cu.hitOp = "op-late-1";
+    const r = await api.reconcilePendingPomos();
+    assert.equal(r.reconciled, 1);
+    assert.equal((await api.status()).pendingPomo, 0);
+    assert.equal(cu.posts.length, 0);
+    console.log("✔ 需手动记录仍持续对账：原请求迟到落库即消；手动重试查询失败不发");
   }
 
   // 2. 宽限期内：保持待核对，不入队、不 POST
@@ -154,20 +184,21 @@ async function main() {
     console.log("✔ 远端已有：只清待核对");
   }
 
-  // 5. 队列里已有同 operationId：不重复入队
+  // 5. 手动重试时队列里已有同 operationId：不重复入队
   {
     const cu = makeClickUp();
+    cu.postFail = 99; // 让补发停在队列里，便于检查条数
     const p = pending("op-dup-1", GRACE_MS + 60_000);
     const { api, store } = await load([p], cu);
     store.setItem(QUEUE_KEY, JSON.stringify([{
       queueId: "q-existing", operationId: "op-dup-1", title: "focus", minutes: 25,
       endedAt: p.endedAt, tries: 0, queuedAt: Date.now(),
     }]));
-    const r = await api.reconcilePendingPomos();
+    const r = await api.retryPendingPomos();
     assert.equal(r.requeued, 1);
-    assert.equal(r.left, 0);
-    assert.equal(JSON.parse(store.getItem(QUEUE_KEY)).length, 1, "同 operationId 只能有一条");
-    console.log("✔ 队列已有同 operationId 时不重复入队");
+    const q = JSON.parse(store.getItem(QUEUE_KEY));
+    assert.equal(q.filter((x) => x.operationId === "op-dup-1").length, 1, "同 operationId 只能有一条");
+    console.log("✔ 手动重试时队列已有同 operationId 不重复入队");
   }
 
   // 6. 队列写失败：pending 不能被清掉（否则记录丢失）
@@ -179,20 +210,20 @@ async function main() {
       if (k === QUEUE_KEY) throw new Error("quota");
       setItem(k, v);
     };
-    const r = await api.reconcilePendingPomos();
+    const r = await api.retryPendingPomos();
     assert.equal(r.requeued, 0);
+    assert.equal(r.code, "QUEUE_WRITE_FAILED");
     assert.equal(r.left, 1, "队列写不进去时必须保留待核对");
     console.log("✔ 队列写失败时保留待核对，不丢记录");
   }
 
-  // 7. 年长 pending 重入队后遇到不确定 POST：宽限期内不能立即再次 POST
+  // 7. 手动重试的补发又遇到不确定 POST：宽限期内不能再次 POST，过期后也不自动补发
   {
     const operationId = "op-retry-grace-1";
     const cu = makeClickUp();
     cu.postFail = 1;
     const { api, store } = await load([pending(operationId, GRACE_MS + 60_000)], cu);
-    await api.reconcilePendingPomos();
-    await api.flushQueue();
+    await api.retryPendingPomos();
     assert.equal(cu.posts.length, 1);
     assert.equal((await api.status()).queue, 1);
     assert.equal((await api.status()).pendingPomo, 1);
@@ -208,12 +239,16 @@ async function main() {
     store.setItem(PENDING_KEY, JSON.stringify(pendingItems));
     await api.reconcilePendingPomos();
     await api.flushQueue();
-    assert.equal(cu.posts.length, 2, "宽限期结束并确认远端没有后只补发一次");
+    assert.equal(cu.posts.length, 1, "宽限期结束后一次空查询也不得自动补发");
+    assert.equal((await api.status()).queue, 0, "需手动的记录交给待核对，不堵队列");
+    assert.equal((await api.status()).pendingManual, 1);
+    await api.retryPendingPomos();
+    assert.equal(cu.posts.length, 2, "用户手动重试且确认远端没有后只补发一次");
     assert.equal((await api.status()).queue, 0);
     assert.equal((await api.status()).pendingPomo, 0);
     assert.match(cu.posts[0].description, /\[lumina-op:op-retry-grace-1\]/);
     assert.match(cu.posts[1].description, /\[lumina-op:op-retry-grace-1\]/);
-    console.log("✔ 不确定的队列 POST 在宽限期内不重复发送，过期后按原 operationId 补发");
+    console.log("✔ 不确定的补发在宽限期内不重发，过期后也只在手动重试时按原 operationId 补发");
   }
 
   // 审查第一轮：待核对记录（上限 50）已满时，新打卡不发无法对账的 POST、不挤掉旧记录，转入队列
