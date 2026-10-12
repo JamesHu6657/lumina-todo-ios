@@ -30,9 +30,13 @@
   const TOKEN_KEY = "lumina-cu-token";
   const PENDING_PUSH_KEY = "lumina-cu-pending-push-v1";
   const PENDING_POMO_KEY = "lumina-cu-pending-pomo-v1";
+  const PUSHED_KEY = "lumina-cu-pushed-v1";
   const CORRUPT_QUEUE_KEY = "lumina-cu-queue-corrupt-v1";
+  // 容量上限只用来拒绝新增，绝不淘汰未确认的旧记录
   const MAX_QUEUE = 200;
-  const MAX_FAILED = 50;
+  const MAX_FAILED = 200;
+  const MAX_PENDING = 50;
+  const MAX_PUSHED = 500;
   const MAX_TRIES = 5;
   const MAX_LIST_PAGES = 5;
   const OP_RE = /\[lumina-op:([A-Za-z0-9._:-]{6,80})\]/;
@@ -41,8 +45,8 @@
     tokenCacheMs: 5 * 60 * 1000,
     taskCacheMs: 10 * 60 * 1000,
     requestTimeoutMs: 15000,
-    maxTitleChars: 200,
-    maxPushTitleChars: 500,
+    // 番茄打卡与上传待办共用同一条标题规范：长度不同会让番茄按名称找不到已上传的任务
+    maxTaskTitleChars: 500,
     minTokenChars: 20,
     maxMinutes: 180,
     maxResponseChars: 512 * 1024,
@@ -52,7 +56,10 @@
   };
 
   let tokenCache = { value: null, at: 0 };
-  let userIdCache = { value: null, at: 0 };
+  // 身份缓存按 token 隔离：换账号后绝不能沿用旧账号的 assignee
+  let userIdCache = { value: null, at: 0, token: null };
+  // 每次保存/清除 token 递增；迁移等异步读取回来时代际不符就不许覆盖缓存
+  let tokenGeneration = 0;
   const taskCache = new Map();
   const ensureInflight = new Map();
   let flushPromise = null;
@@ -147,23 +154,22 @@
 
   async function ensureTokenMigrated() {
     if (tokenReady) return tokenReady;
+    const gen = tokenGeneration;
+    // 迁移期间用户保存/清除了 token：以用户的新操作为准，迁移结果作废
+    const adopt = (value) => {
+      if (gen !== tokenGeneration) return tokenCache.value;
+      tokenCache = { value, at: Date.now() };
+      return value;
+    };
     const p = (async () => {
       const s = secure();
       if (s?.migrateKey) {
         const v = await s.migrateKey(TOKEN_KEY);
-        if (isValidToken(v)) {
-          tokenCache = { value: v, at: Date.now() };
-          return v;
-        }
-        if (usesKeychain()) {
-          tokenCache = { value: null, at: Date.now() };
-          return null;
-        }
+        if (isValidToken(v)) return adopt(v);
+        if (usesKeychain()) return adopt(null);
       }
       const raw = (storeGet(TOKEN_KEY) || "").trim();
-      const t = isValidToken(raw) ? raw : null;
-      tokenCache = { value: t, at: Date.now() };
-      return t;
+      return adopt(isValidToken(raw) ? raw : null);
     })();
     tokenReady = p;
     try {
@@ -180,9 +186,11 @@
     if (tokenCache.value && isValidToken(tokenCache.value)) return tokenCache.value;
     const s = secure();
     if (s?.get) {
+      const gen = tokenGeneration;
       try {
         const v = await s.get(TOKEN_KEY);
         const t = isValidToken(v) ? v : null;
+        if (gen !== tokenGeneration) return tokenCache.value;
         tokenCache = { value: t, at: Date.now() };
         return t;
       } catch (err) {
@@ -198,6 +206,7 @@
 
   async function setStoredToken(token) {
     const t = String(token || "").trim();
+    tokenGeneration++;
     if (!t) {
       const s = secure();
       if (s?.remove) {
@@ -210,12 +219,12 @@
       }
       if (usesKeychain()) {
         tokenCache = { value: null, at: 0 };
-        userIdCache = { value: null, at: 0 };
+        userIdCache = { value: null, at: 0, token: null };
         return { ok: true, backend: "keychain" };
       }
       storeRemove(TOKEN_KEY);
       tokenCache = { value: null, at: 0 };
-      userIdCache = { value: null, at: 0 };
+      userIdCache = { value: null, at: 0, token: null };
       return { ok: true };
     }
     if (!isValidToken(t)) {
@@ -237,8 +246,10 @@
     if (!ok) {
       return { ok: false, error: "无法保存 ClickUp Token（本地存储不可用）" };
     }
+    if (tokenCache.value !== t) userIdCache = { value: null, at: 0, token: null };
     tokenCache = { value: t, at: Date.now() };
-    retryFailedQueue().then(() => flushQueue()).catch(() => {});
+    // 新凭证就绪：把因缺 token / 鉴权失败而搁置的记录放回队列再补传
+    retryFailedQueue({ includeAuth: true }).then(() => flushQueue()).catch(() => {});
     return { ok: true, backend: s?.backend?.() || "localStorage" };
   }
 
@@ -252,40 +263,42 @@
 
   function invalidateToken() {
     tokenCache = { value: null, at: 0 };
-    userIdCache = { value: null, at: 0 };
+    userIdCache = { value: null, at: 0, token: null };
   }
 
   async function cu(token, method, urlPath, body) {
     const ctrl = new AbortController();
+    // 一个 deadline 覆盖「发请求 + 读正文」全过程：iOS 原生 HTTP 会忽略 AbortSignal，
+    // 只给正文读取设超时的话，迟迟不回包的 POST 会一直占着上传与队列单飞锁。
+    let onAbort;
+    const timedOut = new Promise((_, reject) => {
+      onAbort = () => {
+        const err = new Error("ClickUp 请求超时");
+        err.name = "AbortError";
+        reject(err);
+      };
+      ctrl.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    timedOut.catch(() => {});
     const timer = setTimeout(() => ctrl.abort(), LIMITS.requestTimeoutMs);
     let res;
     let text;
     try {
-      res = await fetch(API + urlPath, {
-        method,
-        headers: { Authorization: token, "Content-Type": "application/json" },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: ctrl.signal,
-      });
+      res = await Promise.race([
+        fetch(API + urlPath, {
+          method,
+          headers: { Authorization: token, "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: ctrl.signal,
+        }),
+        timedOut,
+      ]);
       // Keep the same deadline while consuming the body. A peer that sends
       // headers but never finishes its body must not freeze the flush lock.
-      let onAbort;
-      const timedOut = new Promise((_, reject) => {
-        onAbort = () => {
-          const err = new Error("ClickUp 请求超时");
-          err.name = "AbortError";
-          reject(err);
-        };
-        if (ctrl.signal.aborted) onAbort();
-        else ctrl.signal.addEventListener("abort", onAbort, { once: true });
-      });
-      try {
-        text = await Promise.race([res.text(), timedOut]);
-      } finally {
-        ctrl.signal.removeEventListener("abort", onAbort);
-      }
+      text = await Promise.race([res.text(), timedOut]);
     } finally {
       clearTimeout(timer);
+      ctrl.signal.removeEventListener("abort", onAbort);
     }
     if (text.length > LIMITS.maxResponseChars) {
       const err = new Error("ClickUp 响应过大");
@@ -310,7 +323,11 @@
     }
   }
 
-  const normTitle = (s) => String(s || "").trim().toLowerCase();
+  /** 任务标题的唯一规范化入口（与 app.js 的 MAX_TEXT=500 一致） */
+  function cleanTaskTitle(s) {
+    return String(s || "").trim().slice(0, LIMITS.maxTaskTitleChars);
+  }
+  const normTitle = (s) => cleanTaskTitle(s).toLowerCase();
 
   function rememberTasks(tasks) {
     const at = Date.now();
@@ -444,7 +461,7 @@
     try {
       const arr = JSON.parse(raw || "[]");
       if (!Array.isArray(arr)) return [];
-      return arr.slice(-MAX_QUEUE).map((item) => ({
+      return arr.map((item) => ({
         ...item,
         queueId:
           typeof item?.queueId === "string" && item.queueId
@@ -468,21 +485,23 @@
     }
   }
   function writeQueue(arr) {
-    return storeSet(QUEUE_KEY, JSON.stringify(arr.slice(-MAX_QUEUE)));
+    return storeSet(QUEUE_KEY, JSON.stringify(arr));
   }
   function readFailedQueue() {
     try {
       const arr = JSON.parse(storeGet(FAILED_QUEUE_KEY) || "[]");
-      return Array.isArray(arr) ? arr.slice(-MAX_FAILED) : [];
+      return Array.isArray(arr) ? arr : [];
     } catch {
       return [];
     }
   }
   function writeFailedQueue(arr) {
-    return storeSet(FAILED_QUEUE_KEY, JSON.stringify(arr.slice(-MAX_FAILED)));
+    return storeSet(FAILED_QUEUE_KEY, JSON.stringify(arr));
   }
   function recordFailed(item, result) {
     const failed = readFailedQueue().filter((entry) => entry.queueId !== item.queueId);
+    // 失败记录满了就拒绝写入：调用方会把这条留在队列里，而不是挤掉更早的失败记录
+    if (failed.length >= MAX_FAILED) return false;
     failed.push({
       ...item,
       failedAt: Date.now(),
@@ -492,26 +511,36 @@
     });
     return writeFailedQueue(failed);
   }
-  async function retryFailedQueue() {
+  // 凭证类失败：换上新 token 后可以重试（旧版本会把缺 token 的离线记录误记为永久失败）
+  const AUTH_FAILURE_CODES = new Set(["NO_TOKEN", "HTTP_401", "HTTP_403"]);
+  async function retryFailedQueue({ includeAuth = false } = {}) {
     const failed = readFailedQueue();
     if (!failed.length) return { restored: 0, left: 0 };
     const queue = readQueue();
     const ids = new Set(queue.map((entry) => entry.queueId));
     const retryableCodes = new Set(["TIMEOUT", "REQUEST_FAILED", "QUEUE_WRITE_FAILED"]);
     const keep = [];
+    let room = Math.max(0, MAX_QUEUE - queue.length);
     const restore = failed
       .filter((entry) => {
         if (ids.has(entry.queueId)) return false;
-        if (entry.failureRetryable === false || !retryableCodes.has(entry.failureCode || "REQUEST_FAILED")) {
+        const code = entry.failureCode || "REQUEST_FAILED";
+        const restorable =
+          (includeAuth && AUTH_FAILURE_CODES.has(code)) ||
+          (entry.failureRetryable !== false && retryableCodes.has(code));
+        // 队列放不下的留在失败记录里，下次再放回，不挤掉队列里的记录
+        if (!restorable || room <= 0) {
           keep.push(entry);
           return false;
         }
+        room--;
         return true;
       })
       .map((entry) => ({
         queueId: entry.queueId || newQueueId(),
         operationId: entry.operationId || newOpId(),
         title: entry.title || "",
+        taskId: isClickUpTaskId(entry.taskId) ? entry.taskId : null,
         minutes: entry.minutes,
         endedAt: entry.endedAt,
         tries: 0,
@@ -526,10 +555,12 @@
   }
   function enqueue(entry) {
     const q = readQueue();
+    if (q.length >= MAX_QUEUE) return false;
     q.push({
       queueId: newQueueId(),
       operationId: newOpId(entry.operationId),
       title: typeof entry.title === "string" ? entry.title : "",
+      taskId: isClickUpTaskId(entry.taskId) ? entry.taskId : null,
       minutes: entry.minutes,
       endedAt: entry.endedAt,
       tries: 0,
@@ -541,16 +572,17 @@
   function readPendingPushes() {
     try {
       const arr = JSON.parse(storeGet(PENDING_PUSH_KEY) || "[]");
-      return Array.isArray(arr) ? arr.slice(-50) : [];
+      return Array.isArray(arr) ? arr : [];
     } catch {
       return [];
     }
   }
   function writePendingPushes(arr) {
-    return storeSet(PENDING_PUSH_KEY, JSON.stringify(arr.slice(-50)));
+    return storeSet(PENDING_PUSH_KEY, JSON.stringify(arr));
   }
   function upsertPendingPush(entry) {
     const list = readPendingPushes().filter((x) => x.operationId !== entry.operationId);
+    if (list.length >= MAX_PENDING) return false;
     list.push({
       operationId: entry.operationId,
       title: entry.title,
@@ -566,19 +598,47 @@
     return writePendingPushes(list);
   }
 
+  /**
+   * 已确认创建成功的上传：operationId → taskId。远端成功但 App 没能把关联存下来
+   * （本地写失败、页面被杀、从备份恢复）时，同一待办再传直接复用，不再 POST。
+   * 这只是确认缓存，超出上限淘汰最旧的也不会丢数据（远端 marker 查询兜底）。
+   */
+  function readPushedRecords() {
+    try {
+      const arr = JSON.parse(storeGet(PUSHED_KEY) || "[]");
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+  function findPushedRecord(operationId) {
+    return readPushedRecords().find((x) => x && x.operationId === operationId && isClickUpTaskId(x.taskId)) || null;
+  }
+  function rememberPushed(operationId, taskId, url) {
+    if (!operationId || !isClickUpTaskId(taskId)) return false;
+    const list = readPushedRecords().filter((x) => x && x.operationId !== operationId);
+    list.push({ operationId, taskId, url: url || null, at: Date.now() });
+    return storeSet(PUSHED_KEY, JSON.stringify(list.slice(-MAX_PUSHED)));
+  }
+
   function readPendingPomos() {
     try {
       const arr = JSON.parse(storeGet(PENDING_POMO_KEY) || "[]");
-      return Array.isArray(arr) ? arr.slice(-50) : [];
+      return Array.isArray(arr) ? arr : [];
     } catch {
       return [];
     }
   }
   function writePendingPomos(arr) {
-    return storeSet(PENDING_POMO_KEY, JSON.stringify(arr.slice(-50)));
+    return storeSet(PENDING_POMO_KEY, JSON.stringify(arr));
+  }
+  function pendingPomosFull(operationId) {
+    const list = readPendingPomos();
+    return list.length >= MAX_PENDING && !list.some((item) => item.operationId === operationId);
   }
   function upsertPendingPomo(entry) {
     const list = readPendingPomos().filter((item) => item.operationId !== entry.operationId);
+    if (list.length >= MAX_PENDING) return false;
     list.push({ ...entry, createdAt: entry.createdAt || Date.now() });
     return writePendingPomos(list);
   }
@@ -604,6 +664,7 @@
     const already = readQueue().some((item) => item.operationId === pending.operationId);
     if (!already && !enqueue({
       title: typeof pending.title === "string" ? pending.title : "",
+      taskId: pending.taskId,
       minutes: pending.minutes,
       endedAt: pending.endedAt,
       operationId: pending.operationId,
@@ -692,7 +753,13 @@
 
   async function getSelfUserId(token) {
     const now = Date.now();
-    if (userIdCache.value && now - userIdCache.at < LIMITS.taskCacheMs) return userIdCache.value;
+    if (
+      userIdCache.value &&
+      userIdCache.token === token &&
+      now - userIdCache.at < LIMITS.taskCacheMs
+    ) {
+      return userIdCache.value;
+    }
     const data = await cu(token, "GET", "/user");
     const id = data && data.user && data.user.id;
     if (!id && id !== 0) {
@@ -700,8 +767,7 @@
       err.retryable = true;
       throw err;
     }
-    userIdCache.value = String(id);
-    userIdCache.at = now;
+    userIdCache = { value: String(id), at: now, token };
     return userIdCache.value;
   }
 
@@ -805,8 +871,10 @@
       };
     }
 
-    const clean = String(title || "").trim().slice(0, LIMITS.maxTitleChars);
+    const clean = cleanTaskTitle(title);
     const name = clean || "番茄钟 · " + dayLabel(endedAt);
+    // 待办已上传过 ClickUp 时直接记到那个任务上，不再按标题查找/新建
+    const knownTaskId = isClickUpTaskId(opts && opts.taskId) ? opts.taskId : null;
     const duration = mins * 60 * 1000;
     const start = endedAt - duration;
     if (!Number.isFinite(start) || start <= 0) {
@@ -868,10 +936,26 @@
       }
     }
 
+    // 待核对记录已满：不能再发一条无法对账的 POST，也不能挤掉旧记录。
+    // 先放进离线队列（队列补发时会再检查），等旧的待核对记录消化掉再提交。
+    if (pendingPomosFull(operationId)) {
+      const full = {
+        ok: false,
+        code: "PENDING_FULL",
+        error: "待核对的打卡记录过多，这条暂缓提交",
+        retryable: true,
+        operationId,
+      };
+      if (noQueue) return full;
+      return enqueuePomoResult(full, { title: clean, taskId: knownTaskId, minutes: mins, endedAt, operationId });
+    }
+
     let pendingPomo = false;
     try {
-      const tid = await ensureTask(token, name, endedAt);
-      if (!upsertPendingPomo({ operationId, title: clean, minutes: mins, endedAt, start, duration })) {
+      const tid = knownTaskId || (await ensureTask(token, name, endedAt));
+      if (!upsertPendingPomo({
+        operationId, title: clean, taskId: knownTaskId, minutes: mins, endedAt, start, duration,
+      })) {
         return {
           ok: false,
           code: "PENDING_WRITE_FAILED",
@@ -885,6 +969,7 @@
         await postTimeEntry(token, tid, start, duration, mins, operationId);
       } catch (err) {
         if (err && err.status === 404) {
+          // 已知任务在远端被删了：退回按标题查找/新建
           forgetTaskId(tid);
           taskCache.delete(normTitle(name));
           const tid2 = await ensureTask(token, name, endedAt);
@@ -918,30 +1003,37 @@
       const result = failPayload(err);
       // 仅明确可重试且非 INDETERMINATE 时入队；入队复用 operationId
       if (!noQueue && result.retryable && result.code !== "INDETERMINATE") {
-        const queued = enqueue({
+        return enqueuePomoResult(result, {
           title: clean,
+          taskId: knownTaskId,
           minutes: mins,
           endedAt,
           operationId,
         });
-        if (!queued) {
-          return {
-            ...result,
-            code: "QUEUE_WRITE_FAILED",
-            retryable: false,
-            queued: false,
-            error: result.error + "；离线队列写入失败，记录未保存",
-          };
-        }
-        return { ...result, queued: true };
       }
       return result;
     }
   }
 
+  /** 入队并给出明确结果：队列满或写失败都要如实告诉调用方，不能显示「已入队」 */
+  function enqueuePomoResult(result, entry) {
+    const full = readQueue().length >= MAX_QUEUE;
+    if (full || !enqueue(entry)) {
+      return {
+        ...result,
+        code: full ? "QUEUE_FULL" : "QUEUE_WRITE_FAILED",
+        retryable: false,
+        queued: false,
+        error: full
+          ? result.error + "；离线队列已满（" + MAX_QUEUE + " 条），这条记录未保存"
+          : result.error + "；离线队列写入失败，记录未保存",
+      };
+    }
+    return { ...result, queued: true };
+  }
+
   async function pushTodo(opts) {
-    const maxLen = LIMITS.maxPushTitleChars;
-    const clean = String((opts && opts.title) || "").trim().slice(0, maxLen);
+    const clean = cleanTaskTitle(opts && opts.title);
     if (!clean) return { ok: false, code: "BAD_ARGS", error: "标题为空", retryable: false };
 
     const token = await readToken();
@@ -955,52 +1047,77 @@
     }
 
     // 稳定 operationId：同待办重试不重复创建
-    const operationId = newOpId(
+    const opHint =
       (opts && opts.operationId) ||
-        (opts && opts.todoId ? stableTodoOperationId(opts.todoId) : null)
-    );
+      (opts && opts.todoId ? stableTodoOperationId(opts.todoId) : null);
+    const operationId = newOpId(opHint);
+    const stableOp = operationId === opHint;
     const marker = opMarker(operationId);
-    const hadPending = readPendingPushes().some((x) => x.operationId === operationId);
+    const pendingPush = readPendingPushes().find((x) => x.operationId === operationId) || null;
+    const hadPending = Boolean(pendingPush);
+    const recovered = (taskId, rawUrl, extra) => {
+      const url = safeClickUpTaskUrl(rawUrl, taskId);
+      taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
+      rememberPushed(operationId, taskId, url);
+      clearPendingPush(operationId);
+      return {
+        ok: true,
+        taskId,
+        url,
+        name: clean,
+        recovered: true,
+        operationId,
+        scheduleDay: resolveTaskSchedule(opts && opts.dueDate)?.day || null,
+        scheduleDefaulted: !isRealISODate(opts && opts.dueDate),
+        ...extra,
+      };
+    };
 
-    // 曾提交过（pending）或显式恢复：先按 marker 查，避免重复创建
-    if (hadPending || opts?.recoverOnly) {
+    // 本机已确认创建过：直接复用，不发请求
+    const pushed = stableOp ? findPushedRecord(operationId) : null;
+    if (pushed) return recovered(pushed.taskId, pushed.url, { localRecord: true });
+
+    // 稳定 id（同一待办）或曾提交过（pending）或显式恢复：先按 marker 查，避免重复创建
+    if (stableOp || hadPending || opts?.recoverOnly) {
+      let found = null;
       try {
-        const found = await findTaskByOpMarker(token, operationId);
-        if (found && found.id) {
-          const taskId = String(found.id);
-          const url = safeClickUpTaskUrl(found.url, taskId);
-          taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
-          clearPendingPush(operationId);
-          return {
-            ok: true,
-            taskId,
-            url,
-            name: clean,
-            recovered: true,
-            operationId,
-            scheduleDay: resolveTaskSchedule(opts && opts.dueDate)?.day || null,
-            scheduleDefaulted: !isRealISODate(opts && opts.dueDate),
-          };
-        }
-        if (opts?.recoverOnly) {
+        found = await findTaskByOpMarker(token, operationId);
+      } catch {
+        // 查询失败且已有 pending：不能再盲 POST；全新的待办（没提交过）允许继续创建
+        if (hadPending || opts?.recoverOnly) {
           return {
             ok: false,
-            code: "NOT_FOUND",
-            error: "未找到对应的 ClickUp 任务",
-            retryable: true,
+            code: "INDETERMINATE",
+            error: "无法查询 ClickUp 是否已创建任务，暂不重复提交",
+            retryable: false,
             operationId,
           };
         }
-        // pending 但查无：可能上次没写上，允许再 POST
-      } catch {
-        // 查询失败且已有 pending：不能再盲 POST
+      }
+      if (found && found.id) return recovered(String(found.id), found.url);
+      if (opts?.recoverOnly) {
         return {
           ok: false,
-          code: "INDETERMINATE",
-          error: "无法查询 ClickUp 是否已创建任务，暂不重复提交",
-          retryable: false,
+          code: "NOT_FOUND",
+          error: "未找到对应的 ClickUp 任务",
+          retryable: true,
           operationId,
         };
+      }
+      // pending 但暂时查无：上次的 POST 可能稍后才落库，宽限期内不重建
+      if (hadPending) {
+        const createdAt = Number(pendingPush.createdAt);
+        const age = Number.isFinite(createdAt) && createdAt > 0 ? Date.now() - createdAt : 0;
+        if (age < LIMITS.pendingRequeueGraceMs) {
+          return {
+            ok: false,
+            code: "INDETERMINATE",
+            error: "上次创建结果尚未确认，稍后会自动核对；宽限期内不会重复创建",
+            retryable: false,
+            operationId,
+          };
+        }
+        // 过了宽限期仍查无：确认上次没写上，允许再 POST
       }
     }
 
@@ -1038,11 +1155,14 @@
         dueDate: opts && opts.dueDate,
         state: "indeterminate",
       })) {
+        const full = readPendingPushes().filter((x) => x.operationId !== operationId).length >= MAX_PENDING;
         return {
           ok: false,
-          code: "PENDING_WRITE_FAILED",
-          error: "无法保存创建任务的恢复记录，已取消提交以避免重复创建",
-          retryable: false,
+          code: full ? "PENDING_FULL" : "PENDING_WRITE_FAILED",
+          error: full
+            ? "待核对的上传过多，请稍后再试（已暂停提交以避免重复创建）"
+            : "无法保存创建任务的恢复记录，已取消提交以避免重复创建",
+          retryable: full,
           operationId,
         };
       }
@@ -1055,28 +1175,16 @@
         if (isTimeoutError(err) || (err && (err.status >= 500 || err.status === 429))) {
           try {
             const found = await findTaskByOpMarker(token, operationId);
-            if (found && found.id) {
-              const taskId = String(found.id);
-              const url = safeClickUpTaskUrl(found.url, taskId);
-              taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
-              clearPendingPush(operationId);
-              return {
-                ok: true,
-                taskId,
-                url,
-                name: clean,
-                recovered: true,
-                operationId,
-                scheduleDay: schedule?.day || null,
-                scheduleDefaulted: !isRealISODate(opts && opts.dueDate),
-              };
-            }
-            // 确认没有 → 可重试
+            if (found && found.id) return recovered(String(found.id), found.url);
+            // 暂时查无 ≠ 没写上：迟到的提交可能稍后落库。保留 pending，
+            // 宽限期内不重建，由对账（reconcilePendingPushes / 下次上传预查）确认
             return {
               ok: false,
-              code: isTimeoutError(err) ? "TIMEOUT" : "REQUEST_FAILED",
-              error: redactSecrets(String(err.message || err)).slice(0, 300),
-              retryable: true,
+              code: "INDETERMINATE",
+              error:
+                redactSecrets(String(err.message || err)).slice(0, 200) +
+                "；创建结果尚未确认，稍后会自动核对，宽限期内不会重复创建",
+              retryable: false,
               operationId,
             };
           } catch {
@@ -1105,6 +1213,8 @@
       const taskId = String(made.id);
       const url = safeClickUpTaskUrl(made.url, taskId);
       taskCache.set(normTitle(clean), { id: taskId, at: Date.now() });
+      // 先记「已创建」再清 pending：App 侧关联落盘失败时，重传能直接复用
+      rememberPushed(operationId, taskId, url);
       clearPendingPush(operationId);
       return {
         ok: true,
@@ -1129,6 +1239,14 @@
   async function flushQueueImpl() {
     let q = readQueue();
     if (!q.length) return { flushed: 0, left: 0 };
+    // 缺凭证时整个队列暂停：记录原样留着，等用户重新配置 token 后（setStoredToken）再补传
+    let token = null;
+    try {
+      token = await readToken();
+    } catch {
+      token = null;
+    }
+    if (!token) return { flushed: 0, left: q.length, paused: "NO_TOKEN" };
     if (!writeQueue(q)) {
       return { flushed: 0, left: q.length, error: "QUEUE_WRITE_FAILED" };
     }
@@ -1138,6 +1256,7 @@
       const queueId = item.queueId;
       const r = await logPomodoro({
         title: item.title,
+        taskId: item.taskId || undefined,
         minutes: item.minutes,
         endedAt: item.endedAt,
         operationId: item.operationId,
@@ -1157,8 +1276,13 @@
         continue;
       }
       // INDETERMINATE：保留队列项但不增加 tries 的盲目重 POST；等下次能查询时 dedupe
-      if (r.code === "INDETERMINATE") {
+      // PENDING_FULL：待核对记录满了，等对账消化后再发
+      if (r.code === "INDETERMINATE" || r.code === "PENDING_FULL") {
         break;
+      }
+      // 凭证缺失/失效不是这条记录的错：整队暂停，不消耗重试次数、不移入失败记录
+      if (r.code === "NO_TOKEN" || r.code === "HTTP_401") {
+        return { flushed, left: q.length, paused: r.code };
       }
       if (!r.retryable || (item.tries || 0) >= MAX_TRIES) {
         if (!recordFailed(item, r)) {
@@ -1213,6 +1337,31 @@
     return { reconciled, requeued, left: readPendingPomos().length };
   }
 
+  /**
+   * 不确定的创建请求持续对账：查到 marker 就记为已创建（App 再传时直接复用），
+   * 查无则保留 pending 交给宽限期判断；查询失败什么都不动。
+   */
+  async function reconcilePendingPushes() {
+    const token = await readToken();
+    const list = readPendingPushes();
+    if (!token || !list.length) return { reconciled: 0, left: list.length };
+    let reconciled = 0;
+    for (const pending of list) {
+      try {
+        const found = await findTaskByOpMarker(token, pending.operationId);
+        if (found && found.id) {
+          const taskId = String(found.id);
+          rememberPushed(pending.operationId, taskId, safeClickUpTaskUrl(found.url, taskId));
+          clearPendingPush(pending.operationId);
+          reconciled++;
+        }
+      } catch {
+        break;
+      }
+    }
+    return { reconciled, left: readPendingPushes().length };
+  }
+
   function flushQueue() {
     if (flushPromise) return flushPromise;
     flushPromise = flushQueueImpl().finally(() => {
@@ -1245,7 +1394,9 @@
 
   // 预热 token 迁移和恢复连接后的补发都不阻塞启动。
   function reconcileAndFlush() {
-    return reconcilePendingPomos().then(() => flushQueue());
+    return reconcilePendingPomos()
+      .then(() => reconcilePendingPushes().catch(() => {}))
+      .then(() => flushQueue());
   }
   ensureTokenMigrated().then(() => reconcileAndFlush()).catch(() => {});
   root.addEventListener?.("online", () => reconcileAndFlush().catch(() => {}));
@@ -1258,6 +1409,7 @@
     retryFailedQueue,
     clearFailedQueue,
     reconcilePendingPomos,
+    reconcilePendingPushes,
     setStoredToken,
     getStoredToken,
     status,
