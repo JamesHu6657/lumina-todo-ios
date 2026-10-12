@@ -439,6 +439,8 @@
               finish({
                 text,
                 toolCalls,
+                // 审查四②：结束原因交给 agent-loop 做执行前闸门
+                finishReason: data?.finish_reason ?? null,
                 aborted: Boolean(data?.aborted),
               });
             },
