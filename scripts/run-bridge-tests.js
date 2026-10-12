@@ -3686,6 +3686,167 @@ async function main() {
   }
   ok("审查九⑤ 被本页写盖掉的远端写按修订号仍可软合并救回；软合并逐组按写入戳取较新一方");
 
+  /* ======================= Linear 复审第十轮回归 ======================= */
+
+  /* ---- 审查十② 撤销不回退字段写入 rev：A 改 O→M 落盘，B 见过 M 后写别的组；B 的写恰被 A 的撤销写盖掉，
+     它的快照（带 A 编辑 M 的旧 rev）迟到软合并时不得复活已撤销的 M ---- */
+  for (const field of ["text", "priority"]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O", priority: "low", category: "inbox" }).todo;
+    const patch = field === "text" ? { text: "M" } : { priority: "high" };
+    const orig = field === "text" ? "O" : "low";
+    assert.equal(A.invoke("update_todo", { id: x.id, ...patch }).ok, true);
+    const editRev = JSON.parse(storage.getItem(TODO_KEY)).todos.find((t) => t.id === x.id)._fw[field].rev;
+    const B = loadApp({ storage });
+    assert.equal(B.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], patch[field], "前提：B 见过 A 的编辑");
+    const rawSet = storage.setItem;
+    let hook = true, eB = null;
+    storage.setItem = (k, v) => {
+      if (hook && k === TODO_KEY) {                 // A 撤销已读盘、尚未落盘的瞬间，B 改另一组
+        hook = false;
+        assert.equal(B.invoke("update_todo", { id: x.id, category: "work" }).ok, true);
+        eB = storage.getItem(TODO_KEY);
+      }
+      rawSet(k, v);
+    };
+    assert.equal(A.invoke("undo").ok, true);
+    storage.setItem = rawSet;
+    const undone = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(undone[field], orig, `${field}：撤销已落盘`);
+    assert.ok(undone._fw[field].rev > editRev, `${field}：撤销写回的字段戳 rev 必须新于被撤销的编辑（不得回退）`);
+    assert.equal(JSON.parse(eB).todos.find((t) => t.id === x.id)[field], patch[field], "前提：B 的快照仍带已撤销的值");
+    A.deliverStorage(TODO_KEY, eB);                  // 迟到的回显快照
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx[field], orig, `${field}：迟到的回显快照不得复活已撤销的编辑`);
+    assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], orig, `${field}：内存同样不复活`);
+    assert.equal(dx.category, "work", `${field}：B 对另一组的写仍须软合并救回`);
+  }
+  // 连续两步编辑同一组：撤销后一步换了新戳，更早那步的撤销仍认得出自己
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "M1" }).ok, true);
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "M2" }).ok, true);
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "M1");
+    const r = A.invoke("undo");
+    assert.equal(r.ok, true);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "O", "更早那步仍可撤销");
+    assert.ok(!(r.skipped || []).length, "不得误报为别处写过");
+  }
+  ok("审查十② 撤销写回给字段新戳（rev 单调前进）：迟到的回显快照不再复活已撤销的编辑；连续撤销仍逐步生效");
+
+  /* ---- 审查十① 嵌套写入链作为撤销基准：A 改→B 改同组→A 撤销（保留 B）→B 撤销（回到初始值，不露出 A 已撤销的值）；
+     A 改→B 改→B 撤销（露出 A 仍有效的值） ---- */
+  for (const deliverEvent of [true, false]) {
+    for (const field of ["text", "priority"]) {
+      const vals = field === "text" ? ["O", "a", "b"] : ["low", "medium", "high"];
+      const setup = () => {
+        const storage = sharedStorage();
+        const A = loadApp({ storage });
+        const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+        const B = loadApp({ storage });
+        const sync = (to) => { if (deliverEvent) to.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY)); };
+        const cur = () => diskTodos(storage).find((t) => t.id === x.id)[field];
+        assert.equal(A.invoke("update_todo", { id: x.id, [field]: vals[1] }).ok, true); sync(B);
+        assert.equal(B.invoke("update_todo", { id: x.id, [field]: vals[2] }).ok, true); sync(A);
+        assert.equal(cur(), vals[2]);
+        return { A, B, sync, cur, id: x.id };
+      };
+      const tag = `${field}/${deliverEvent ? "有" : "无"}事件`;
+      {
+        const { A, B, sync, cur, id } = setup();
+        const r = A.invoke("undo");
+        assert.equal(r.ok, true); sync(B);
+        assert.equal(cur(), vals[2], `${tag}：A 撤销须保留 B 之后的写`);
+        assert.ok((r.skipped || []).some((s) => s.field === field), `${tag}：A 撤销报告跳过该字段`);
+        assert.equal(B.invoke("undo").ok, true); sync(A);
+        assert.equal(cur(), vals[0], `${tag}：B 撤销须回到初始值，不得露出 A 已撤销的值`);
+        if (deliverEvent) assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === id)[field], vals[0], `${tag}：A 内存随事件一致`);
+      }
+      {
+        const { B, sync, cur } = setup();
+        assert.equal(B.invoke("undo").ok, true);
+        assert.equal(cur(), vals[1], `${tag}：B 撤销须露出 A 仍有效的值`);
+      }
+    }
+  }
+  ok("审查十① 写入链完整保留：撤销跳过已撤销的写，恢复为链上最近仍有效的写（有/无 storage 事件，text/priority）");
+
+  /* ---- 审查十③ 快照不按全局 rev 丢弃：A、B 交错「读-改-写」写出同号快照（各改不同任务/字段），
+     第三页 C 依次收到两份后两处编辑都在；盘上 rev 回退时 C 仍合并新编辑 ---- */
+  for (const order of ["AB", "BA"]) {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X0", priority: "low" }).todo;
+    const y = A.invoke("add_todo", { text: "Y0", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    const C = loadApp({ storage });
+    const rawSet = storage.setItem;
+    let hook = true, eB = null;
+    storage.setItem = (k, v) => {
+      if (hook && k === TODO_KEY) {                 // A 已按盘上 rev 算好修订号、尚未落盘的瞬间，B 写入
+        hook = false;
+        assert.equal(B.invoke("update_todo", { id: y.id, priority: "high" }).ok, true);
+        eB = storage.getItem(TODO_KEY);
+      }
+      rawSet(k, v);
+    };
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "XA" }).ok, true);
+    storage.setItem = rawSet;
+    const eA = storage.getItem(TODO_KEY);
+    assert.equal(JSON.parse(eA).rev, JSON.parse(eB).rev, "前提：A、B 写出同号快照");
+    assert.equal(JSON.parse(eA).todos.find((t) => t.id === y.id).priority, "low", "前提：A 的快照不含 B 的编辑");
+    for (const e of order === "AB" ? [eA, eB] : [eB, eA]) C.deliverStorage(TODO_KEY, e);
+    const mem = C.invoke("list_todos", {}).todos;
+    assert.equal(mem.find((t) => t.id === x.id).text, "XA", `${order}：C 须保留 A 的编辑`);
+    assert.equal(mem.find((t) => t.id === y.id).priority, "high", `${order}：同号的 B 快照不得被当作旧快照丢掉`);
+    const d = diskTodos(storage);
+    assert.equal(d.find((t) => t.id === x.id).text, "XA", `${order}：合并结果写回盘`);
+    assert.equal(d.find((t) => t.id === y.id).priority, "high", `${order}：合并结果写回盘`);
+    assert.ok(JSON.parse(storage.getItem(TODO_KEY)).rev > JSON.parse(eA).rev, `${order}：写回的修订号单调递增`);
+  }
+  {
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X0", priority: "low" }).todo;
+    const y = A.invoke("add_todo", { text: "Y0", category: "inbox" }).todo;
+    const B = loadApp({ storage });
+    const C = loadApp({ storage });
+    const rawSet = storage.setItem;
+    let hook = true, eB2 = null;
+    storage.setItem = (k, v) => {
+      if (hook && k === TODO_KEY) {                 // A 读盘后、落盘前：B 连写两版，C 收到 B 的最新版
+        hook = false;
+        assert.equal(B.invoke("update_todo", { id: y.id, text: "YB" }).ok, true);
+        assert.equal(B.invoke("update_todo", { id: y.id, category: "work" }).ok, true);
+        eB2 = storage.getItem(TODO_KEY);
+        C.deliverStorage(TODO_KEY, eB2);
+      }
+      rawSet(k, v);
+    };
+    assert.equal(A.invoke("update_todo", { id: x.id, priority: "high" }).ok, true);
+    storage.setItem = rawSet;
+    const eA = storage.getItem(TODO_KEY);
+    assert.ok(JSON.parse(eA).rev < JSON.parse(eB2).rev, "前提：盘上修订号回退");
+    C.deliverStorage(TODO_KEY, eA);
+    const mem = C.invoke("list_todos", {}).todos;
+    assert.equal(mem.find((t) => t.id === x.id).priority, "high", "盘上 rev 回退：C 仍须合并 A 的新编辑");
+    assert.equal(mem.find((t) => t.id === y.id).text, "YB", "C 已合并的 B 编辑不得被回退的盘写冲掉");
+    assert.equal(mem.find((t) => t.id === y.id).category, "work");
+    const d = diskTodos(storage);
+    assert.equal(d.find((t) => t.id === x.id).priority, "high");
+    assert.equal(d.find((t) => t.id === y.id).text, "YB", "合并结果写回盘，救回被覆盖的 B 编辑");
+    assert.ok(JSON.parse(storage.getItem(TODO_KEY)).rev > JSON.parse(eB2).rev, "写回的修订号高于已见最大值");
+    // 同一份 payload 重复投递：已合并，不改内存
+    const snap = JSON.stringify(C.invoke("list_todos", {}).todos);
+    C.deliverStorage(TODO_KEY, eB2);
+    assert.equal(JSON.stringify(C.invoke("list_todos", {}).todos), snap, "重复投递的旧快照不得让内存倒退");
+  }
+  ok("审查十③ 快照按字段写入戳合并、不按全局 rev 丢弃：同号交错快照（两种到达顺序）与盘上 rev 回退都不丢编辑，写回修订号单调");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
