@@ -11,6 +11,7 @@ const path = require("path");
 const assert = require("assert");
 const vm = require("vm");
 
+const { withTaskDetail } = require("./clickup-task-detail-shim");
 const SRC = fs.readFileSync(path.join(__dirname, "..", "www", "js", "mobile-clickup.js"), "utf8");
 const PENDING_KEY = "lumina-cu-pending-pomo-v1";
 const QUEUE_KEY = "lumina-cu-queue-v1";
@@ -65,7 +66,7 @@ async function load(pendings, cu, opts = {}) {
     console,
     setTimeout,
     clearTimeout,
-    fetch: (...a) => cu.fetch(...a),
+    fetch: withTaskDetail((...a) => cu.fetch(...a)),
     localStorage: store,
     AbortController,
     URLSearchParams,
