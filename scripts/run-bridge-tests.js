@@ -4179,6 +4179,124 @@ async function main() {
   }
   ok("审查十一④ 删除写入版本化墓碑：迟到快照不再复活已删任务；撤销删除生成新版本，旧快照/旧墓碑不丢任务");
 
+  /* ---- 审查十二③ 先合并候选再比较墓碑：较新编辑与较旧删除交错时，缺席过滤不得抢在墓碑比较前丢掉条目 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const ids = (P) => P.invoke("list_todos", {}).todos.map((t) => t.id);
+    const textOf = (P, id) => (P.invoke("list_todos", {}).todos.find((t) => t.id === id) || {}).text;
+    const onDisk = (storage, id) => diskTodos(storage).find((t) => t.id === id);
+    const diskTomb = (storage, id) => ((JSON.parse(storage.getItem(TODO_KEY)) || {})._tomb || {})[id];
+    const stripTomb = (storage) => {
+      const raw = JSON.parse(storage.getItem(TODO_KEY));
+      delete raw._tomb;
+      storage.setItem(TODO_KEY, JSON.stringify(raw));
+      return storage.getItem(TODO_KEY);
+    };
+    const setup = () => {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "X" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      return { storage, A, B, C, x, y };
+    };
+    /* 恢复窗口（三方合并）：A 写盘失败进入脏窗口；B 删 X（较旧墓碑）；A 随后在窗口里改 X（较新）。
+       恢复写一次成功或再失败一次后才成功，较新编辑都要胜出 */
+    for (const deliverEvent of [true, false]) for (const failAgain of [false, true]) {
+      const tag = `deliverEvent=${deliverEvent} failAgain=${failAgain}`;
+      const { storage, A, B, C, x, y } = setup();
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y local" }).ok, true);   // 写盘失败 → 脏窗口
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      const delSnap = storage.getItem(TODO_KEY);
+      assert.ok(diskTomb(storage, x.id), "前提：删除带墓碑落盘");
+      if (deliverEvent) A.deliverStorage(TODO_KEY, delSnap);
+      await sleep(5);
+      storage.failTodoWrites = failAgain;
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "X newer" }).ok, true);
+      storage.failTodoWrites = false;
+      if (failAgain) assert.ok(A.invoke("add_todo", { text: "Z" }).ok);   // 再失败一次后的恢复写
+      assert.equal(textOf(A, x.id), "X newer", `${tag}：A 内存保留较新编辑`);
+      assert.equal((onDisk(storage, x.id) || {}).text, "X newer", `${tag}：恢复写把较新编辑落盘`);
+      assert.ok(!diskTomb(storage, x.id), `${tag}：被较新编辑压过的墓碑作废`);
+      assert.equal(onDisk(storage, y.id).text, "Y local", `${tag}：窗口里的其他编辑保留`);
+      const fin = storage.getItem(TODO_KEY);
+      C.deliverStorage(TODO_KEY, fin);
+      C.deliverStorage(TODO_KEY, delSnap);   // 较旧删除快照迟到
+      assert.equal(textOf(C, x.id), "X newer", `${tag}：迟到的较旧删除不得删掉较新编辑`);
+      assert.equal((onDisk(storage, x.id) || {}).text, "X newer", `${tag}：盘上仍有较新编辑`);
+      B.deliverStorage(TODO_KEY, fin);
+      assert.equal(textOf(B, x.id), "X newer", `${tag}：删除方收到较新编辑后接受它`);
+    }
+    /* 读盘路径：B 的较旧删除写交错盖掉 A 的较新编辑（A 编辑时还没见到这次删除） */
+    for (const deliverEvent of [true, false]) {
+      const { storage, A, B, C, x } = setup();
+      const s0 = storage.getItem(TODO_KEY);
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      const delSnap = storage.getItem(TODO_KEY);
+      storage.setItem(TODO_KEY, s0);
+      await sleep(5);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "X newer" }).ok, true);
+      storage.setItem(TODO_KEY, delSnap);
+      if (deliverEvent) A.deliverStorage(TODO_KEY, delSnap);
+      else assert.ok(A.invoke("add_todo", { text: "Z" }).ok);
+      assert.equal(textOf(A, x.id), "X newer", `读盘 deliverEvent=${deliverEvent}：A 内存保留较新编辑`);
+      assert.equal((onDisk(storage, x.id) || {}).text, "X newer", `读盘 deliverEvent=${deliverEvent}：较新编辑写回盘`);
+      assert.ok(!diskTomb(storage, x.id), `读盘 deliverEvent=${deliverEvent}：墓碑作废`);
+      C.deliverStorage(TODO_KEY, delSnap);
+      C.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(textOf(C, x.id), "X newer", `读盘 deliverEvent=${deliverEvent}：第三页最终收敛到较新编辑`);
+    }
+    /* 较新删除 vs 较旧更新：仍然删除（读盘路径与恢复窗口） */
+    {
+      const { storage, A, B, x } = setup();
+      const s0 = storage.getItem(TODO_KEY);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "X older" }).ok, true);
+      storage.setItem(TODO_KEY, s0);
+      await sleep(5);
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.ok(!ids(A).includes(x.id), "读盘：较新删除胜出，A 内存删掉 X");
+      assert.ok(!onDisk(storage, x.id), "读盘：盘上不复活 X");
+    }
+    {
+      const { storage, A, B, x, y } = setup();
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y local" }).ok, true);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "X older" }).ok, true);
+      storage.failTodoWrites = false;
+      await sleep(5);
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      assert.ok(A.invoke("add_todo", { text: "Z" }).ok);   // 触发恢复写
+      assert.ok(!ids(A).includes(x.id), "恢复窗口：较新删除胜出，A 内存删掉 X");
+      assert.ok(!onDisk(storage, x.id), "恢复窗口：盘上不复活 X");
+      assert.equal(onDisk(storage, y.id).text, "Y local");
+    }
+    /* 旧格式（无 _tomb）：缺席即删除的兼容行为不变 */
+    {
+      const { storage, A, B, x, y } = setup();
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y local" }).ok, true);
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      A.deliverStorage(TODO_KEY, stripTomb(storage));
+      assert.ok(A.invoke("add_todo", { text: "Z" }).ok);
+      assert.ok(!ids(A).includes(x.id), "旧格式恢复窗口：远端缺基线条目照常判删除");
+      assert.ok(!onDisk(storage, x.id));
+      assert.equal(onDisk(storage, y.id).text, "Y local");
+    }
+    {
+      const { storage, A, B, x } = setup();
+      assert.equal(B.invoke("delete_todo", { id: x.id }).ok, true);
+      A.deliverStorage(TODO_KEY, stripTomb(storage));
+      assert.ok(!ids(A).includes(x.id), "旧格式读盘：条目集合跟盘走");
+      assert.ok(!onDisk(storage, x.id));
+    }
+  }
+  ok("审查十二③ 先合并候选再比较墓碑：较新编辑压过较旧删除（含写盘失败后的恢复窗口），较新删除仍胜出，旧格式缺席即删除不变");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

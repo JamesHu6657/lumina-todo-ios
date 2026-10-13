@@ -1580,6 +1580,15 @@ function buryItems(items, op){
   const tb = { rev: nextStampRev(), by: TAB_ID, op: op || "delete", at: Date.now() };
   for (const t of items) tombs.set(t.id, { ...tb });
 }
+/* 审查十二③：条目集合跟盘/远端走时，本地有、对方缺席的条目先不按缺席删——有墓碑的补回候选集合，
+   由 dropBuried 统一比版本（本地在删除之后又写过 → 条目胜出）。没有墓碑（旧格式写入方）仍按缺席即删除。
+   须在 adoptTombs 之后调用：对方快照带来的墓碑要先并进来 */
+function addTombContested(list, local){
+  if (!tombs.size) return list;
+  const ids = new Set(list.map((t) => t.id));
+  const extra = local.filter((t) => !ids.has(t.id) && tombs.has(t.id));
+  return extra.length ? list.concat(extra) : list;
+}
 /* 按墓碑过滤合并结果；条目比墓碑新时墓碑作废 */
 function dropBuried(list){
   if (!tombs.size) return list;
@@ -3051,8 +3060,8 @@ function syncTodosFromDisk(){
   const before = JSON.stringify(todos);
   adoptTombs(parsed);
   /* 审查十③：条目集合跟盘走，用户字段逐组按写入戳——本地更新的组（被交错写/修订号回退的盘写冲掉的）保留。
-     盘上条目也要过墓碑：写盘的那页可能还没见过这次删除 */
-  const adopted = dropBuried(keepNewerLocalGroups(clean, todos));
+     盘上条目也要过墓碑：写盘的那页可能还没见过这次删除。盘上缺席但有墓碑的本地条目同样进候选、按版本比墓碑 */
+  const adopted = dropBuried(addTombContested(keepNewerLocalGroups(clean, todos), todos));
   if (JSON.stringify(adopted) !== before){ markRemoteAdopted(todos, adopted); todos = adopted; }   // 外部内容流进内存：undo 归因要登记
   /* 攒着的远端快照不论盘上是谁写的都逐组软合并：盘上是我方写时它可能被覆盖了（快照是唯一幸存副本）；
      盘上是远端写时也不一定包含它——两页交错写会写出同号快照，修订号也会回退。陈旧内容在戳比较里落败 */
@@ -3120,15 +3129,17 @@ function mergeThreeWay(ours, base, theirs){
    · 双方都改过的 → 本页为准，但 pomodoros 单调计数取大（远端记的番茄不能丢）
    · 双方各自新增的 → 都保留
    followDeletes=true（脏窗口恢复，远端写在窗口内、见过基线）才跟进
-   「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释 */
+   「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释。
+   有墓碑的缺席条目不在这里删，留给 dropBuried 比版本（审查十二③）；缺席即删除只给没有墓碑的旧格式数据 */
 function mergeRemoteWindow(parsed, base, followDeletes){
   const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
   const baseMap = new Map(base.map((t) => [t.id, t]));
   const ourIds = new Set(todos.map((t) => t.id));
   const remoteMap = new Map(remote.map((t) => [t.id, t]));
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  adoptTombs(parsed);
   const merged = todos
-    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id))
+    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id) || tombs.has(t.id))
     .map((t) => {
       const b = baseMap.get(t.id), r = remoteMap.get(t.id);
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
@@ -3143,7 +3154,6 @@ function mergeRemoteWindow(parsed, base, followDeletes){
     const b = baseMap.get(t.id);
     if (b && !ourIds.has(t.id) && !eq(t, b)) noteDeletedRemote(t);   // 审查九：挂到删掉它的撤销步上
   }
-  adoptTombs(parsed);
   const kept = dropBuried(merged);
   markRemoteAdopted(todos, kept);
   todos = kept;
@@ -3263,7 +3273,7 @@ function applyExternal(parsed){
   const maybeOld = r != null && r <= lastObservedRev;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
   adoptTombs(parsed);
-  const next = dropBuried(maybeOld ? softMergeList(todos, clean, false) : keepNewerLocalGroups(clean, todos));
+  const next = dropBuried(maybeOld ? softMergeList(todos, clean, false) : addTombContested(keepNewerLocalGroups(clean, todos), todos));
   observePayload(parsed); observeStamps(clean);
   if (JSON.stringify(next) === JSON.stringify(todos)){ lastAppliedList = clean.map((t) => ({ ...t })); return; }   // 内容与内存一致：套了也白套
   markRemoteAdopted(todos, next);
