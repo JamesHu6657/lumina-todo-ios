@@ -1735,7 +1735,9 @@ function stampWrite(t, gis, op){
      （before 之后会被 rebase，所以在写入这一刻定下来）。
      盖住的是别页的写 → 挂成 over：那页之后撤销时据此在链里换掉自己那一环，本页再撤销才不会露出别页已撤销的值。
      盖住本页更早的写同样挂 over：它的链与 gone 记着已见/已撤销的写，丢掉后迟到的旧事件会凭 overRev=0 挂上来，
-     撤销时露出已撤销或较旧的值（审查十四⑥）。没有可信基线时至少带上前值的 gone */
+     撤销时露出已撤销或较旧的值（审查十四⑥）。但本页自己的前值不带链/gone/cut 时挂上去不增加信息——不挂 over，
+     撤销照样从 before 还原同一个值与戳；否则每次自写都嵌套整份前值，存储膨胀数倍（审查十五②）。
+     没有可信基线（或不挂）时至少带上前值的 gone */
   const s = own ? e.todos.find((x) => x.id === t.id) : null;
   if (own && !e.wrote) e.wrote = new Map();
   if (own && !e.wroteBase) e.wroteBase = new Map();
@@ -1743,8 +1745,9 @@ function stampWrite(t, gis, op){
     const prev = stampOf(t, gi);
     const key = t.id + "\u0000" + gi;
     const base = s && stampEq(stampOf(s, gi), prev) ? { v: pickGroup(s, USER_FIELD_GROUPS[gi]), st: prev } : null;
-    const over = base || (prev && prev.by === TAB_ID && prev.op === st.op ? prev.over : null);
-    const gone = base ? null : prev && prev.gone;
+    const nest = base && prev && (foreignOwner(prev) || prev.over || prev.gone || prev.cut) ? base : null;
+    const over = nest || (prev && prev.by === TAB_ID && prev.op === st.op ? prev.over : null);
+    const gone = nest ? null : prev && prev.gone;
     setStamp(t, gi, over ? chainStamp({ ...st, over, gone }, 0) : withGone({ ...st }, gone));
     /* 记到未封口的撤销步上：撤销只反做「这一步亲手写过」的组。
        不能靠 before/after 之差——同步连续操作时 after 要到下一次 snapshot/撤销才封口，

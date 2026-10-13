@@ -4882,6 +4882,32 @@ async function main() {
   }
   ok("审查十五① 撤销拼接版本不参与墓碑比较：跳过的撤销只裁剪链盖的 mrev 不再让已删任务胜过更早的删除而复活");
 
+  /* ---- 审查十五② 自身无信息前值不再嵌套：单页连续编辑同一条（无别页参与），前值是本页的写、没有链/gone/cut，
+     挂成 over 不增加信息，只让存储膨胀。各组不带 over，体积不随编辑次数增长；撤销仍逐步回到上一个值 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "v0" }).todo;
+    const big = "x".repeat(400);
+    const prios = ["high", "low", "medium"];
+    for (let i = 0; i < 12; i++) {
+      assert.equal(A.invoke("update_todo", { id: x.id, text: big + i, priority: prios[i % 3] }).ok, true);
+      await sleep(2);
+    }
+    const sz12 = storage.getItem(TODO_KEY).length;
+    const d = diskTodos(storage).find((t) => t.id === x.id);
+    for (const k of ["text", "priority"]) assert.ok(d._fw && d._fw[k] && !d._fw[k].over, `${k} 组不嵌套本页前值`);
+    assert.ok(sz12 < 1500, `12 次编辑后体积不膨胀（${sz12} 字节）`);
+    for (let i = 10; i >= 8; i--) {
+      assert.equal(A.invoke("undo").ok, true);
+      const t = diskTodos(storage).find((t) => t.id === x.id);
+      assert.equal(t.text, big + i, `撤销回到第 ${i} 次编辑的正文`);
+      assert.equal(t.priority, prios[i % 3], `撤销回到第 ${i} 次编辑的优先级`);
+    }
+  }
+  ok("审查十五② 自身无信息前值不再嵌套：单页连续编辑不再把前值整份挂进 over，存储不膨胀，撤销仍逐步回退");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
