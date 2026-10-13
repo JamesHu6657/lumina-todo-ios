@@ -4842,6 +4842,46 @@ async function main() {
   }
   ok("审查十四⑦ 争议保留的任务插回原邻居位置：缺席争议中保留的新增任务按本地前一个邻居插回，不再跳到列表末尾");
 
+  /* ---- 审查十五① 撤销拼接版本不参与墓碑比较：A 改 X 为 a，C 见到后改成 c（链含 a）；B 删 X，但 A 没见到删除
+     （B 写失败，或 A 交错写覆盖了盘）。A 撤销被跳过、只裁剪 C 链上自己那环并盖 mrev=now（> 删除 rev）。
+     mrev 不改任何值，不能让 X 胜过更早的删除：各页与盘上 X 都应被删除 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const all = (P) => P.invoke("list_todos", { status: "all", limit: 50 }).todos;
+    for (const bDirty of [true, false]) {
+      const tag = `bDirty=${bDirty}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "a" }).ok, true);
+      for (const P of [B, C]) P.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      await sleep(3);
+      assert.equal(C.invoke("update_todo", { id: x.id, text: "c" }).ok, true);
+      const sC = storage.getItem(TODO_KEY);
+      for (const P of [A, B]) P.deliverStorage(TODO_KEY, sC);
+      await sleep(3);
+      if (bDirty) storage.failTodoWrites = true;
+      B.invoke("delete_todo", { id: x.id });
+      storage.failTodoWrites = false;
+      if (!bDirty) storage.setItem(TODO_KEY, sC);   // A 交错的读-改-写：盘上没有 B 的删除
+      await sleep(3);
+      const r = A.invoke("undo");
+      assert.deepEqual((r.skipped || []).map((s) => s.field), ["text"], `${tag}：前提 A 的撤销被跳过`);
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);   // B 恢复写 / 正常写
+      for (let i = 0; i < 4; i++) for (const P of [A, B, C]) P.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      for (const [name, P] of [["A", A], ["B", B], ["C", C]]) {
+        assert.equal(all(P).some((t) => t.id === x.id), false, `${tag}：${name} 上 X 仍被删除`);
+      }
+      assert.equal(diskTodos(storage).some((t) => t.id === x.id), false, `${tag}：盘上 X 仍被删除`);
+    }
+  }
+  ok("审查十五① 撤销拼接版本不参与墓碑比较：跳过的撤销只裁剪链盖的 mrev 不再让已删任务胜过更早的删除而复活");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

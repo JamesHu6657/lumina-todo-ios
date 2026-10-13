@@ -1275,6 +1275,8 @@ function sanitizeStamp(st, gi, depth){
   if (typeof st.wby === "string" && st.wby && st.wby.length <= 64 && st.wby !== st.by) outSt.wby = st.wby;
   const mrev = Number(st.mrev);
   if (st.mrev != null && Number.isFinite(mrev) && mrev > 0 && mrev <= Number.MAX_SAFE_INTEGER) outSt.mrev = mrev;
+  const alive = Number(st.alive);
+  if (st.alive != null && Number.isFinite(alive) && alive > 0 && alive <= Number.MAX_SAFE_INTEGER) outSt.alive = alive;
   if (Array.isArray(st.gone)){
     const gone = st.gone.filter((g) => Array.isArray(g) && g.length === 3
       && typeof g[0] === "string" && g[0] && g[0].length <= 64
@@ -1485,11 +1487,14 @@ function foreignStamp(st){ return !!st && stampWriter(st) !== TAB_ID; }
 function foreignOwner(st){ return !!st && st.by !== TAB_ID; }
 function stampRev(st){ return st && Number.isFinite(st.rev) ? st.rev : 0; }
 /* mrev：只改写入链（撤销裁剪）时盖的元数据版本，值归属（by/op/rev）不变。同一次写的两份副本比新旧用 stampVer——
-   否则裁剪前后的链 by/op/rev 完全相同，旧快照平手胜出，把已撤销的那环装回去；不同的写之间只比 rev */
-function stampVer(st){ return Math.max(stampRev(st), st && Number.isFinite(st.mrev) ? st.mrev : 0); }
-/* 按 by/op/rev 重建戳时带上写入元数据：mrev 与写入者 wby */
+   否则裁剪前后的链 by/op/rev 完全相同，旧快照平手胜出，把已撤销的那环装回去；不同的写之间只比 rev。
+   alive：撤销删除时盖的「条目在此版本仍存活」标记（见 reviveItem），同样不改值归属；带它的副本也新于不带的 */
+function stampAlive(st){ return st && Number.isFinite(st.alive) ? st.alive : 0; }
+function stampVer(st){ return Math.max(stampRev(st), st && Number.isFinite(st.mrev) ? st.mrev : 0, stampAlive(st)); }
+/* 按 by/op/rev 重建戳时带上写入元数据：mrev、alive 与写入者 wby */
 function withMrev(out, src){
   if (src && Number.isFinite(src.mrev)) out.mrev = src.mrev;
+  if (src && Number.isFinite(src.alive)) out.alive = src.alive;
   if (src && src.wby && src.wby !== out.by) out.wby = src.wby;
   return withGone(out, src && src.gone);
 }
@@ -1572,12 +1577,14 @@ function observeStamps(list){
     }
   }
 }
-/* 含 over 链：本页在合并里保留自己较旧的值时，较新的远端写只留在链上——它同样晚于更早的删除（审查十四③） */
+/* 含 over 链：本页在合并里保留自己较旧的值时，较新的远端写只留在链上——它同样晚于更早的删除（审查十四③）。
+   只比真正的写（rev）与撤销删除的 alive：跳过的撤销裁剪链时盖的 mrev 是那一刻的时钟，值没变，
+   拿它和墓碑比会让已删条目凭一次无效撤销复活（审查十五①） */
 function itemMaxStampRev(t){
   let m = 0;
   for (let gi = 0; gi < FW_KEYS.length; gi++){
     const st = stampOf(t, gi);
-    m = Math.max(m, stampVer(st), overRev(st));
+    m = Math.max(m, stampRev(st), stampAlive(st), overRev(st, stampRev));
   }
   return m;
 }
@@ -1705,14 +1712,14 @@ function tombsDifferFrom(p){
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
   return sig([...tombs]) !== sig(payloadTombs(p)) || payloadTombHorizon(p) !== tombHorizon;
 }
-/* 撤销删除插回的条目：只推一枚戳的 mrev（值归属 by/op/rev 不变），让它比删除墓碑新——否则持有墓碑的页面会再次删掉它 */
+/* 撤销删除插回的条目：只给一枚戳盖 alive（值归属 by/op/rev 不变），让它比删除墓碑新——否则持有墓碑的页面会再次删掉它 */
 const REVIVE_GROUP = FW_KEYS.indexOf("createdAt");
 function reviveItem(t){
   const out = { ...t };
   const rev = nextStampRev();
   const gi = stampOf(out, REVIVE_GROUP) ? REVIVE_GROUP : ALL_GROUPS.find((g) => stampOf(out, g));
   if (gi == null) setStamp(out, REVIVE_GROUP, makeStamp(TAB_ID, "revive", rev));
-  else setStamp(out, gi, { ...stampOf(out, gi), mrev: rev });
+  else setStamp(out, gi, { ...stampOf(out, gi), alive: rev });
   return out;
 }
 function newOpId(){ return TAB_ID + "#" + (++opCounter); }
