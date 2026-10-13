@@ -313,6 +313,7 @@
     maxCompleteResponseChars: 256 * 1024,
     maxErrorResponseChars: 8 * 1024,
     maxListedModels: 500,
+    maxModelsResponseChars: 256 * 1024,
     apiKeyCacheMs: 60000,
   };
 
@@ -1511,6 +1512,33 @@
     return err;
   }
 
+  /** 读正文但不超过 maxChars；超出返回 null。能流式读时超限即取消，不把整个响应读进内存 */
+  async function readTextCapped(res, maxChars) {
+    const reader = res.body?.getReader?.();
+    if (!reader) {
+      const text = await res.text();
+      return text.length > maxChars ? null : text;
+    }
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        if (text.length > maxChars) return null;
+      }
+      text += decoder.decode();
+      return text.length > maxChars ? null : text;
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   async function consumeStream(res, onDelta, ctx = {}) {
     const { signal, onStall, style } = ctx;
     const reader = res.body?.getReader?.();
@@ -2071,7 +2099,11 @@
         if (!res.ok) {
           return { ok: true, models: providerModels(p), source: "static", status: res.status };
         }
-        const data = await res.json();
+        const text = await readTextCapped(res, LIMITS.maxModelsResponseChars);
+        if (text == null) {
+          return { ok: true, models: providerModels(p), source: "static", code: "RESPONSE_TOO_LARGE" };
+        }
+        const data = JSON.parse(text);
         const arr = Array.isArray(data?.data) ? data.data.slice(0, LIMITS.maxListedModels) : [];
         const remote = arr
           .filter((m) => m && typeof m === "object" && typeof m.id === "string")

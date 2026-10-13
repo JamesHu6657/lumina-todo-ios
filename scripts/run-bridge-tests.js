@@ -5731,8 +5731,9 @@ async function main() {
       return {
         ok: true,
         status: 200,
-        async json() {
-          return { data: [{ id: "brand-new-model", name: "Brand New" }] };
+        body: null,
+        async text() {
+          return JSON.stringify({ data: [{ id: "brand-new-model", name: "Brand New" }] });
         },
       };
     });
@@ -5748,6 +5749,69 @@ async function main() {
     assert.equal(r2.source, "static");
     assert.ok(r2.models.length > 10);
     ok("listModels 远端成功用远端，失败回落静态列表");
+  }
+
+  /* ---- 审查 PR8④：listModels 限长读取后再解析，超限回落静态列表且不读完整个响应 ---- */
+  {
+    const huge = JSON.stringify({
+      data: Array.from({ length: 20000 }, (_, i) => ({ id: "m-" + i, name: "x".repeat(40) })),
+    });
+    let parsedWhole = false;
+    let chunksRead = 0;
+    let cancelled = false;
+    const chunkSize = 16 * 1024;
+    const { ai } = loadBridge(makeLocalStorage(), async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          async read() {
+            const start = chunksRead * chunkSize;
+            if (start >= huge.length) return { done: true };
+            chunksRead += 1;
+            return { done: false, value: Buffer.from(huge.slice(start, start + chunkSize), "utf8") };
+          },
+          async cancel() {
+            cancelled = true;
+          },
+        }),
+      },
+      async json() {
+        parsedWhole = true;
+        return JSON.parse(huge);
+      },
+      async text() {
+        parsedWhole = true;
+        return huge;
+      },
+    }));
+    const r = await ai.listModels("commandcode");
+    assert.equal(parsedWhole, false, "不得整体读取/解析超大响应");
+    assert.equal(r.ok, true);
+    assert.equal(r.source, "static", JSON.stringify(r).slice(0, 200));
+    assert.ok(chunksRead * chunkSize < huge.length, "超限后应停止读取");
+    assert.equal(cancelled, true);
+    // 分块到达的正常列表照常解析
+    const small = JSON.stringify({ data: [{ id: "chunked-model" }] });
+    let sent = false;
+    const { ai: ai2 } = loadBridge(makeLocalStorage(), async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          async read() {
+            if (sent) return { done: true };
+            sent = true;
+            return { done: false, value: Buffer.from(small, "utf8") };
+          },
+          async cancel() {},
+        }),
+      },
+    }));
+    const r2 = await ai2.listModels("commandcode");
+    assert.equal(r2.source, "remote");
+    assert.deepEqual(r2.models, [{ id: "chunked-model", label: "chunked-model" }]);
+    ok("审查 PR8④ listModels 限长读取：超大响应停止读取并回落静态列表，正常分块列表照常解析");
   }
 
   console.log("\n全部通过：", passed);
