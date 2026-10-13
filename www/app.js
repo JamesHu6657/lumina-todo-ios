@@ -1822,6 +1822,35 @@ function remoteStampWins(ts, rs){
   }
   return !(ver(ts) < ct && ver(rs) === cr);
 }
+/* 同一次写的两份副本相遇：over 链按 remoteStampWins 取更完整的一份，写入元数据合并——alive、mrev 取大，gone 取并集。
+   整份取一边会丢另一边的标记：撤销删除盖了 alive 的副本输给 mrev 更大的裁剪副本时 alive 丢失，
+   持有墓碑的页面会再次删掉已撤销删除的条目（审查十六①） */
+function mergeSameWrite(ts, rs){
+  const base = remoteStampWins(ts, rs) ? rs : ts, other = base === rs ? ts : rs;
+  /* 键序与 sanitizeStamp 一致：stampEq 按 JSON 比较，合并结果与读回的盘上副本才判得相等，不会反复写盘 */
+  const out = makeStamp(base.by, base.op, base.rev);
+  if (base.wby) out.wby = base.wby;
+  const mrev = Math.max(Number.isFinite(base.mrev) ? base.mrev : 0, Number.isFinite(other.mrev) ? other.mrev : 0);
+  const alive = Math.max(stampAlive(base), stampAlive(other));
+  if (mrev > 0) out.mrev = mrev;
+  if (alive > 0) out.alive = alive;
+  const gone = goneList([base.gone, other.gone], []);
+  if (gone.length) out.gone = gone;
+  if (base.over) out.over = base.over;
+  else if (base.cut) out.cut = true;
+  return stampEq(out, base) ? base : out;
+}
+/* 远端条目 r 整条采纳时，并入本地 t 里同一次写副本的元数据 */
+function withSameWriteMeta(r, t){
+  let out = null;
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    const ts = stampOf(t, gi), rs = stampOf(r, gi);
+    if (!sameWrite(ts, rs) || stampEq(ts, rs) || !groupEq(t, r, g)) return;
+    const m = mergeSameWrite(ts, rs);
+    if (!stampEq(m, rs)){ if (!out) out = { ...r }; setStamp(out, gi, m); }
+  });
+  return out || r;
+}
 /* 系统字段独立合并：番茄计数单调取大；ClickUp 关联哪边有留哪边（taskId 一旦写入不会改） */
 function mergeSystemFields(ours, theirs){
   const link = ours.clickupTaskId ? ours : (theirs.clickupTaskId ? theirs : ours);
@@ -1940,7 +1969,7 @@ function restoreFromRemote(s, r){
     if (stampEq(ss, rs) && groupEq(s, r, g)) return;
     if (groupEq(s, r, g)){
       /* 同值也比完整写入版本：远端同值的旧写不得盖掉本页较新的戳 */
-      setStamp(out, gi, sameWrite(ss, rs) || foreignStamp(rs) ? (remoteStampWins(ss, rs) ? rs : ss) : (ss || rs));
+      setStamp(out, gi, sameWrite(ss, rs) ? mergeSameWrite(ss, rs) : foreignStamp(rs) ? (remoteStampWins(ss, rs) ? rs : ss) : (ss || rs));
       return;
     }
     if ((!ss && !rs) || stampRev(rs) >= stampRev(ss)){ copyGroup(out, r, gi); tookTheirs = true; return; }
@@ -3228,7 +3257,7 @@ function mergeThreeWay(ours, base, theirs){
     const os = stampOf(ours, gi), ts = stampOf(theirs, gi);
     if (groupEq(ours, theirs, g)){
       /* 同值：远端独立写下了它——采用远端戳，撤销本页那步不得把它改回 before（审查九①） */
-      if (sameWrite(os, ts)){ if (remoteStampWins(os, ts)) setStamp(out, gi, ts); }   // 同一次写、只差写入链：链版本新者胜
+      if (sameWrite(os, ts)) setStamp(out, gi, mergeSameWrite(os, ts));   // 同一次写、只差写入链：链取更完整者，元数据合并
       else if (foreignStamp(ts)){   // 同值也比完整写入版本：盘上同值旧写不得盖掉本页较新的戳
         if (remoteStampWins(os, ts)) setStamp(out, gi, ts);
         /* 本页戳胜出：远端这次同值写仍是独立编辑，照样挂进 over——撤销本页那步时保留它，而不是退回 before（审查十三②） */
@@ -3271,7 +3300,7 @@ function mergeRemoteWindow(parsed, base, followDeletes){
     .map((t) => {
       const b = baseMap.get(t.id), r = remoteMap.get(t.id);
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
-      if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版（值与写入戳）
+      if (eq(t, b)) return withSameWriteMeta({ ...r }, t);   // 我们没碰过 → 远端版（值与写入戳；同一次写的副本并入本地元数据）
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
       return mergeThreeWay(t, b, r);
     });
@@ -3326,6 +3355,7 @@ function softMergeItem(t, r, plain){
   USER_FIELD_GROUPS.forEach((g, gi) => {
     const ts = stampOf(t, gi), rs = stampOf(r, gi);
     if (stampEq(ts, rs) && groupEq(t, r, g)) return;
+    if (sameWrite(ts, rs) && groupEq(t, r, g)){ setStamp(out, gi, mergeSameWrite(ts, rs)); return; }
     const remoteWins = ts || rs ? remoteStampWins(ts, rs) : w === r;
     if (groupEq(t, r, g)){
       if (plain){ if (remoteWins) setStamp(out, gi, rs); return; }
@@ -3364,7 +3394,13 @@ function keepNewerLocalGroups(clean, local){
     let out = null, keptValue = false;
     USER_FIELD_GROUPS.forEach((g, gi) => {
       const ts = stampOf(t, gi), rs = stampOf(r, gi);
-      if (!ts || stampEq(ts, rs) || remoteStampWins(ts, rs)) return;
+      if (!ts || stampEq(ts, rs)) return;
+      if (sameWrite(ts, rs) && groupEq(t, r, g)){
+        const m = mergeSameWrite(ts, rs);
+        if (!stampEq(m, rs)){ if (!out) out = { ...r }; setStamp(out, gi, m); }
+        return;
+      }
+      if (remoteStampWins(ts, rs)) return;
       /* 同值也按完整写入版本比较：盘上是同值的旧写时保留本地较新的戳（撤销戳/写入链），
          否则之后的迟到快照凭旧戳复活已撤销的值 */
       if (groupEq(t, r, g)){

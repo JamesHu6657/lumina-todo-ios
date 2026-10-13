@@ -4941,6 +4941,59 @@ async function main() {
   }
   ok("审查十五③ 写失败窗口保留的任务插回原邻居位置：删除落败保留的任务按远端前一个邻居插回，不再跳到列表末尾");
 
+  /* ---- 审查十六① 同一写入副本合并元数据：同一次写（tabB 的 text 写）有两份副本——一份带撤销删除盖的 alive，
+     另一份是跳过的撤销裁剪链后盖了更大 mrev 的副本（链里拿掉的那环记进 gone）。本页持其中一份、收到另一份时
+     不能整份取一边：alive、mrev 取大，gone 取并集，链取裁剪过的那份。持有删除墓碑（rev 介于写入与 alive 之间）的
+     页面收到合并结果后不得再次删掉该条目。覆盖采纳盘快照、迟到旧快照软合并、写失败窗口恢复三条路径 ---- */
+  for (const route of ["adopt", "soft", "dirty"]) {
+    for (const localHas of ["alive", "mrev"]) {
+      const tag = `${route}/本页持 ${localHas} 副本`;
+      const all = (Q) => Q.invoke("list_todos", { status: "all", limit: 50 }).todos;
+      const storage = sharedStorage();
+      const S = loadApp({ storage });
+      const x = S.invoke("add_todo", { text: "c" }).todo;
+      const y = S.invoke("add_todo", { text: "Y" }).todo;
+      const d0 = JSON.parse(storage.getItem(TODO_KEY));
+      const R = Date.now() + 1000;
+      const link = ["tabC", "tabC#1", R - 5];
+      const w = { by: "tabB", op: "tabB#1", rev: R };
+      const copyAlive = { ...w, alive: R + 20, over: { v: { text: "a" }, st: { by: link[0], op: link[1], rev: link[2] } } };
+      const copyMrev = { ...w, mrev: R + 30, gone: [link] };
+      const withX = (st) => d0.todos.map((t) => (t.id === x.id ? { ...t, _fw: { ...t._fw, text: st } } : t));
+      const [local, remote] = localHas === "alive" ? [copyAlive, copyMrev] : [copyMrev, copyAlive];
+      /* P 持有删除墓碑、已删掉 X（还没见到撤销删除） */
+      storage.setItem(TODO_KEY, JSON.stringify({ ...d0, rev: d0.rev + 1, writer: "tabD",
+        _tomb: { [x.id]: { rev: R + 10, by: "tabD", op: "tabD#1", at: Date.now() } }, todos: d0.todos.filter((t) => t.id !== x.id) }));
+      const P = loadApp({ storage });
+      assert.equal(all(P).some((t) => t.id === x.id), false, `${tag}：前提 P 上 X 已删除`);
+      storage.setItem(TODO_KEY, JSON.stringify({ ...d0, rev: d0.rev + 2, writer: "tabB", todos: withX(local) }));
+      const A = loadApp({ storage });
+      const snap = JSON.stringify({ ...d0, rev: route === "soft" ? d0.rev : d0.rev + 3, writer: "tabE", todos: withX(remote) });
+      if (route === "dirty") {
+        storage.failTodoWrites = true;
+        assert.equal(A.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);
+        storage.failTodoWrites = false;
+      }
+      if (route !== "soft") storage.setItem(TODO_KEY, snap);
+      A.deliverStorage(TODO_KEY, snap);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y3" }).ok, true);   // 落盘（写失败窗口的恢复写）
+      const st = (list) => ((list.find((t) => t.id === x.id) || {})._fw || {}).text;
+      const s = st(diskTodos(storage));   // A 落盘的就是它合并后的内存
+      assert.ok(s, `${tag}：A 写回的盘上 X 仍在`);
+      assert.equal(s.alive, R + 20, `${tag}：保留 alive`);
+      assert.equal(s.mrev, R + 30, `${tag}：保留 mrev`);
+      assert.deepEqual(s.gone, [link], `${tag}：gone 取并集`);
+      assert.equal(s.over, undefined, `${tag}：链取裁剪过的那份`);
+      for (let i = 0; i < 3; i++) for (const Q of [P, A]) Q.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      for (const [name, Q] of [["A", A], ["P", P]]) {
+        const t = all(Q).find((t) => t.id === x.id);
+        assert.equal(t && t.text, "c", `${tag}：${name} 上 X 未被墓碑重新删除`);
+      }
+      assert.equal(diskTodos(storage).some((t) => t.id === x.id), true, `${tag}：盘上 X 未被重新删除`);
+    }
+  }
+  ok("审查十六① 同一写入副本合并元数据：alive 取大、mrev 取大、gone 取并集，撤销删除标记不丢，持墓碑页不再重新删除");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
