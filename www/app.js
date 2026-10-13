@@ -1275,6 +1275,13 @@ function sanitizeStamp(st, gi, depth){
   if (typeof st.wby === "string" && st.wby && st.wby.length <= 64 && st.wby !== st.by) outSt.wby = st.wby;
   const mrev = Number(st.mrev);
   if (st.mrev != null && Number.isFinite(mrev) && mrev > 0 && mrev <= Number.MAX_SAFE_INTEGER) outSt.mrev = mrev;
+  if (Array.isArray(st.gone)){
+    const gone = st.gone.filter((g) => Array.isArray(g) && g.length === 3
+      && typeof g[0] === "string" && g[0] && g[0].length <= 64
+      && typeof g[1] === "string" && g[1] && g[1].length <= 128
+      && Number.isFinite(g[2]) && g[2] > 0 && g[2] <= Number.MAX_SAFE_INTEGER).map((g) => [g[0], g[1], g[2]]);
+    if (gone.length) outSt.gone = gone.slice(-MAX_GONE);
+  }
   const o = st.over;
   if (o && typeof o === "object" && !Array.isArray(o)){
     if (depth >= MAX_OVER_DEPTH) outSt.cut = true;
@@ -1462,11 +1469,11 @@ function stampIsOp(st, op){ return !!st && !!op && st.by === TAB_ID && (st.op ==
    但值仍属于被还原的那次写：by/op 原样保留（别页的也一样，wby 记成本页），那一步之后撤销时还认得出自己。
    旧存档里本页撤销写回的 op 是 "undo>原 op"，stampIsOp 仍兼容 */
 const UNDO_OP_PREFIX = "undo>";
-function undoStamp(restored){
-  if (!restored) return makeStamp(TAB_ID, "undo", nextStampRev());
-  const st = { ...makeStamp(restored.by, restored.op, nextStampRev()), over: restored.over, cut: restored.cut };
-  /* 撤销也盖 mrev：撤销这一刻已见过的写（含刚撤销的那次）版本都不大于它，迟到快照据此不得再挂回链上 */
-  st.mrev = st.rev;
+function undoStamp(restored, undone){
+  /* 撤销消费掉的写：刚撤销的那次、以及换成新 rev 的还原值原来那次——迟到快照不得把它们重新挂回链上 */
+  const gone = goneList([undone && undone.gone, restored && restored.gone], [undone, restored]);
+  if (!restored) return withGone(makeStamp(TAB_ID, "undo", nextStampRev()), gone);
+  const st = { ...makeStamp(restored.by, restored.op, nextStampRev()), over: restored.over, cut: restored.cut, gone };
   if (restored.by !== TAB_ID) st.wby = TAB_ID;
   /* 还原值底下的写入链照带：链上更早的写（含别页的）之后撤销时还要靠它找到自己、露出它盖住的值 */
   return chainStamp(st, 0);
@@ -1484,7 +1491,29 @@ function stampVer(st){ return Math.max(stampRev(st), st && Number.isFinite(st.mr
 function withMrev(out, src){
   if (src && Number.isFinite(src.mrev)) out.mrev = src.mrev;
   if (src && src.wby && src.wby !== out.by) out.wby = src.wby;
+  return withGone(out, src && src.gone);
+}
+/* gone：撤销/裁剪时实际从链上拿掉的写的身份 [by, op, rev]（有上限）。挂接远端写时只拒绝这些身份——
+   不能拿版本号代表「已见」：撤销那一刻还没到达的并发远端写版本可能更小，它仍要挂进链，之后撤销才露得出来 */
+const MAX_GONE = 16;
+function withGone(out, gone){
+  if (gone && gone.length) out.gone = gone;
   return out;
+}
+function goneList(lists, sts){
+  const out = [];
+  const push = (g) => { if (!out.some((x) => x[0] === g[0] && x[1] === g[1] && x[2] === g[2])) out.push(g); };
+  for (const l of lists) if (l) l.forEach(push);
+  for (const s of sts) if (s) push([s.by, s.op, s.rev]);
+  return out.slice(-MAX_GONE);
+}
+/* 远端写 rs 是否已在 ts 的链上（ts 自己或某一环），或是 ts/链上各环记下的已撤销/已裁剪的写 */
+function isKnownWrite(ts, rs){
+  for (let s = ts; s; s = s.over && s.over.st){
+    if (s.by === rs.by && s.op === rs.op && s.rev === rs.rev) return true;
+    if (s.gone && s.gone.some((g) => g[0] === rs.by && g[1] === rs.op && g[2] === rs.rev)) return true;
+  }
+  return false;
 }
 function sameWrite(a, b){ return !!a && !!b && a.by === b.by && a.op === b.op && a.rev === b.rev && stampWriter(a) === stampWriter(b); }
 /* over 链：每一环 = 被盖住的那次写（值 v + 它自己的戳 st，st 可再带 over）。撤销要沿链找「最近一个仍有效的写」，
@@ -1514,6 +1543,11 @@ function spliceUndoneLink(st, op, base){
     link = { v: o.v, st: deeper };
   }
   return { ...st, over: link };
+}
+/* 链上属于本页这一步（op）的那一环的戳（spliceUndoneLink 换掉的就是它） */
+function opLinkStamp(st, op){
+  for (let o = st && st.over; o && o.st; o = o.st.over) if (stampIsOp(o.st, op)) return o.st;
+  return null;
 }
 /* 写时复制：_fw 在浅拷贝的条目之间共享引用，绝不原地改 */
 function setStamp(t, gi, st){
@@ -1722,11 +1756,10 @@ function overRev(st){
   for (let o = st && st.over; o && o.st; o = o.st.over) m = Math.max(m, stampVer(o.st));
   return m;
 }
-/* 远端写 rs 能否挂成本地戳 ts 的 over：须比链上每一环都新，也须比 ts 自己的 mrev（撤销/裁剪时盖的版本）新——
-   不比 mrev 新的写在撤销那一刻已被见过并处理掉（撤销或裁出链），旧快照不得把它重新引入 */
+/* 远端写 rs 能否挂成本地戳 ts 的 over：须比链上每一环都新，不是链上已有的写，也不是撤销/裁剪时已拿掉的写（gone）——
+   旧快照不得把它们重新引入；mrev 只参与新旧比较，不当「已见」截断，否则会误拦撤销时尚未到达的并发写 */
 function canAttachOver(ts, rs){
-  const cut = Math.max(overRev(ts), ts && Number.isFinite(ts.mrev) ? ts.mrev : 0);
-  return foreignStamp(rs) && stampVer(rs) > cut;
+  return foreignStamp(rs) && stampVer(rs) > overRev(ts) && !isKnownWrite(ts, rs);
 }
 /* 远端这组的写是否比本地新：比整条链的最大版本（rev 与 mrev）；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端 */
 function remoteStampWins(ts, rs){
@@ -1900,7 +1933,7 @@ function invertUndoEntry(entry, current, diskMap){
         const spliced = spliceUndoneLink(cs, op, (entry.wroteBase && entry.wroteBase.get(t.id + "\u0000" + gi)) || null);
         if (spliced){
           if (next === t) next = { ...t };
-          setStamp(next, gi, chainStamp({ ...spliced, mrev: nextStampRev() }, 0));
+          setStamp(next, gi, chainStamp({ ...spliced, mrev: nextStampRev(), gone: goneList([spliced.gone], [opLinkStamp(cs, op)]) }, 0));
         }
         return;
       }
@@ -1910,10 +1943,10 @@ function invertUndoEntry(entry, current, diskMap){
       reverted = true;
       if (cs.over){
         for (const f of g) next[f] = cs.over.v[f];
-        setStamp(next, gi, undoStamp(cs.over.st || null));
+        setStamp(next, gi, undoStamp(cs.over.st || null, cs));
       } else {
         for (const f of g) next[f] = s[f];
-        setStamp(next, gi, undoStamp(stampOf(s, gi)));   // 新 rev；op 仍指向 before 那步，更早那步的撤销认得出自己
+        setStamp(next, gi, undoStamp(stampOf(s, gi), cs));   // 新 rev；op 仍指向 before 那步，更早那步的撤销认得出自己
       }
     });
     if (reverted) next.updatedAt = Math.max(t.updatedAt || 0, Date.now());
@@ -3151,7 +3184,7 @@ function mergeThreeWay(ours, base, theirs){
       return;
     }
     /* 值不同：本页胜出（策略不变），被盖住的远端值挂在本页戳的 over 上——撤销本页这步时露出它。
-       比链上已有各环与本页撤销/裁剪版本（mrev）都新的远端写才覆盖 over，远端之后的独立写也会换掉整枚戳，所以它始终是最新的 */
+       比链上已有各环都新、且不是撤销/裁剪已拿掉（gone）的远端写才覆盖 over，远端之后的独立写也会换掉整枚戳，所以它始终是最新的 */
     /* 远端这份是本页自己更早写的（带本页戳的回显）：不是别页的写，不挂 over */
     if (os && (!ts || canAttachOver(os, ts))) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
   });

@@ -4480,6 +4480,40 @@ async function main() {
   }
   ok("审查十三② 同值分支本地戳胜出时挂接远端写入：撤销本页那步保留别页相同值的独立编辑，恢复路径与软合并路径都不退回旧值");
 
+  /* ---- 审查十三③ 撤销按已裁剪节点身份拒绝挂接：A 改 O→a→b；B 见到 b 后并发改成 c，A 没见到就撤销回 a。
+     B 的 c 版本早于 A 的撤销戳，但撤销时 A 还没见过它——它仍要挂进链，A 再撤销须露出 c，而不是回到 O ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const textOf = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === id).text;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O" }).todo;
+    const B = loadApp({ storage });
+    await sleep(3);
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "a" }).ok, true);
+    await sleep(3);
+    assert.equal(A.invoke("update_todo", { id: x.id, text: "b" }).ok, true);
+    await sleep(3);
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    const pre = storage.getItem(TODO_KEY);
+    assert.equal(B.invoke("update_todo", { id: x.id, text: "c" }).ok, true);
+    const eB = storage.getItem(TODO_KEY);
+    storage.setItem(TODO_KEY, pre);                  // A 读不到 c：盘被交错写回 c 之前的版本
+    await sleep(3);
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(textOf(A, x.id), "a", "前提：A 第一次撤销回到 a");
+    const bSt = JSON.parse(pre).todos.find((t) => t.id === x.id)._fw.text;
+    const gone = diskTodos(storage).find((t) => t.id === x.id)._fw.text.gone || [];
+    assert.ok(gone.some((g) => g[0] === bSt.by && g[1] === bSt.op && g[2] === bSt.rev), "撤销戳记下被撤销那次写（b）的身份");
+    A.deliverStorage(TODO_KEY, eB);                  // B 的 c 迟到
+    assert.equal(textOf(A, x.id), "a", "A 的撤销戳较新，值保持 a");
+    await sleep(3);
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(textOf(A, x.id), "c", "A 第二次撤销露出 B 的 c，不回到 O");
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "c", "盘上同样是 c");
+  }
+  ok("审查十三③ 撤销按已裁剪节点身份拒绝挂接：撤销时尚未到达的并发远端写仍挂进链，再次撤销露出它");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
