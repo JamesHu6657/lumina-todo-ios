@@ -5751,6 +5751,40 @@ async function main() {
     ok("listModels 远端成功用远端，失败回落静态列表");
   }
 
+  /* ---- 审查 PR8⑤：流式 chat 返回的 model 就是请求实际发送的 model ---- */
+  {
+    const store = makeLocalStorage();
+    let sent = null;
+    const { ai } = loadBridge(store, async (_url, opts) => {
+      sent = JSON.parse(opts.body);
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("commandcode").ok, true);
+    assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+    // 模拟请求准备期间用户在设置里反复改模型：每次读取都拿到不同的已选模型
+    const baseGet = store.getItem;
+    let reads = 0;
+    store.getItem = (k) => (k === "lumina-api-model:commandcode" ? `switching-model-${++reads}` : baseGet(k));
+    let start;
+    const done = await new Promise((resolve) => {
+      ai.chat({ messages: [{ role: "user", content: "hi" }] }, { onDone: resolve, onError: (e) => resolve({ error: e }) })
+        .then((s) => { start = s; });
+    });
+    store.getItem = baseGet;
+    assert.equal(done.error, undefined, JSON.stringify(done));
+    assert.equal(start.ok, true);
+    assert.equal(start.model, sent.model, "chat 返回值应是请求实际使用的模型");
+    assert.equal(done.model, sent.model);
+    ok("审查 PR8⑤ 流式 chat 返回请求实际使用的模型，不再重新读取已选模型");
+  }
+
   /* ---- 审查 PR8④：listModels 限长读取后再解析，超限回落静态列表且不读完整个响应 ---- */
   {
     const huge = JSON.stringify({

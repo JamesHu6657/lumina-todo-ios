@@ -1330,8 +1330,8 @@
     timeoutMs,
     provider = currentProvider(),
     base = providerBase(provider),
+    model = selectedModel(provider),
   }) {
-    const model = selectedModel(provider);
     const style = apiStyle(provider, model);
     const endpoint = chatEndpoint(provider, base, model);
     if (!base) {
@@ -2137,7 +2137,9 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      const endpoint = chatEndpoint(provider, base);
+      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求
+      const model = selectedModel(provider);
+      const endpoint = chatEndpoint(provider, base, model);
       if (!base) return { requestId, ...noBaseError() };
       if (!(await resolveApiKey({ provider }))) {
         return { requestId, ...noKeyError(provider) };
@@ -2166,6 +2168,7 @@
               timeoutMs: 0,
               provider,
               base,
+              model,
             });
             link = call;
             if (entry.ac.signal.aborted) throw entry.ac.signal.reason;
@@ -2282,7 +2285,9 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      const endpoint = chatEndpoint(provider, base);
+      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求
+      const model = selectedModel(provider);
+      const endpoint = chatEndpoint(provider, base, model);
 
       if (pending.has(requestId)) {
         const message = "requestId 正在使用中";
@@ -2366,6 +2371,7 @@
             timeoutMs: provider.requestTimeoutMs || LIMITS.connectTimeoutMs,
             provider,
             base,
+            model,
           });
           callPromise.then(
             (late) => {
@@ -2432,7 +2438,7 @@
         }
       })();
 
-      return { ok: true, requestId, model: selectedModel(provider) };
+      return { ok: true, requestId, model };
     },
 
     async abort(requestId) {
