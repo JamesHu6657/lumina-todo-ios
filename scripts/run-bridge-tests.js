@@ -4431,6 +4431,55 @@ async function main() {
   }
   ok("审查十三① 新格式快照缺席不再视为删除：别页覆盖写不含刚新增的任务时新增胜出并写回盘，删除只由墓碑决定，旧格式与墓碑视界外仍按缺席删除");
 
+  /* ---- 审查十三② 同值分支本地戳胜出：B 先独立把 X 改成 "v"，A 之后也写 "v"。A 的戳较新胜出，
+     B 的同值写要挂进 A 戳的 over——A 撤销自己那步时 X 保持 "v"，不得退回 "O" 抹掉 B 的编辑 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const textOf = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === id).text;
+    const diskText = (storage, id) => diskTodos(storage).find((t) => t.id === id).text;
+    /* 恢复路径（mergeThreeWay / keepNewerLocalGroups）：A 脏窗口内，B 写 v，A 再写 v 触发恢复写 */
+    for (const deliver of [false, true]) {
+      const tag = `恢复路径 deliver=${deliver}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "O" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      await sleep(3);
+      storage.failTodoWrites = true;
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);
+      storage.failTodoWrites = false;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "v" }).ok, true);
+      if (deliver) A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "v" }).ok, true);
+      assert.equal(textOf(A, x.id), "v", `${tag}：前提 A 写入后为 v`);
+      A.invoke("undo");
+      assert.equal(textOf(A, x.id), "v", `${tag}：撤销后内存保持 B 的 v`);
+      assert.equal(diskText(storage, x.id), "v", `${tag}：撤销后盘上保持 B 的 v`);
+      assert.equal(diskText(storage, y.id), "Y2", `${tag}：A 的另一条编辑仍在`);
+    }
+    /* 普通软合并路径（softMergeItem）：A 拿旧盘写 v，之后收到 B 更早的同值写快照 */
+    {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "O" }).todo;
+      const B = loadApp({ storage });
+      await sleep(3);
+      const pre = storage.getItem(TODO_KEY);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "v" }).ok, true);
+      const eB = storage.getItem(TODO_KEY);
+      storage.setItem(TODO_KEY, pre);
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "v" }).ok, true);
+      A.deliverStorage(TODO_KEY, eB);
+      A.invoke("undo");
+      assert.equal(textOf(A, x.id), "v", "软合并：撤销后内存保持 B 的 v");
+      assert.equal(diskText(storage, x.id), "v", "软合并：撤销后盘上保持 B 的 v");
+    }
+  }
+  ok("审查十三② 同值分支本地戳胜出时挂接远端写入：撤销本页那步保留别页相同值的独立编辑，恢复路径与软合并路径都不退回旧值");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

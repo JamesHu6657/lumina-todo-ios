@@ -3141,7 +3141,11 @@ function mergeThreeWay(ours, base, theirs){
     if (groupEq(ours, theirs, g)){
       /* 同值：远端独立写下了它——采用远端戳，撤销本页那步不得把它改回 before（审查九①） */
       if (sameWrite(os, ts)){ if (remoteStampWins(os, ts)) setStamp(out, gi, ts); }   // 同一次写、只差写入链：链版本新者胜
-      else if (foreignStamp(ts)){ if (remoteStampWins(os, ts)) setStamp(out, gi, ts); }   // 同值也比完整写入版本：盘上同值旧写不得盖掉本页较新的戳
+      else if (foreignStamp(ts)){   // 同值也比完整写入版本：盘上同值旧写不得盖掉本页较新的戳
+        if (remoteStampWins(os, ts)) setStamp(out, gi, ts);
+        /* 本页戳胜出：远端这次同值写仍是独立编辑，照样挂进 over——撤销本页那步时保留它，而不是退回 before（审查十三②） */
+        else if (os && canAttachOver(os, ts)) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
+      }
       else if (!ts && os) setStamp(out, gi, makeStamp("remote", "unknown", stampRev(os)));   // 远端是无戳旧版：标成「非本页」
       /* ts 是本页自己更早的戳（回显）：没有别页写过，保留本页戳 */
       return;
@@ -3221,6 +3225,8 @@ function softMergeItem(t, r, plain){
     if (groupEq(t, r, g)){
       if (plain){ if (remoteWins) setStamp(out, gi, rs); return; }
       if (remoteWins && rs) setStamp(out, gi, rs);
+      /* 本页戳胜出：同值的远端独立写也挂进 over，撤销本页那步时不得抹掉它（审查十三②） */
+      else if (!remoteWins && ts && canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
       return;
     }
     if (remoteWins){ copyGroup(out, r, gi); tookTheirs = true; return; }
@@ -3258,7 +3264,8 @@ function keepNewerLocalGroups(clean, local){
          否则之后的迟到快照凭旧戳复活已撤销的值 */
       if (groupEq(t, r, g)){
         if (!out) out = { ...r };
-        setStamp(out, gi, ts);
+        /* 盘上同值写若是别页的独立编辑，挂进本地戳的 over：撤销本地那步时保留它（审查十三②） */
+        setStamp(out, gi, rs && canAttachOver(ts, rs) ? withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts) : ts);
         return;
       }
       if (!rs) return;
