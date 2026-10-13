@@ -5805,6 +5805,130 @@ async function main() {
     ok("listModels 远端成功用远端，失败回落静态列表");
   }
 
+  /* ---- 审查 PR8 复审③：中转 /models 列表不含当前所选模型时，下拉标为不可用并提示 ---- */
+  {
+    function makeEl(tag) {
+      const e = {
+        tagName: String(tag).toUpperCase(),
+        children: [],
+        handlers: {},
+        hidden: false,
+        className: "",
+        textContent: "",
+        id: "",
+        value: "",
+        style: {},
+        classList: { add() {}, remove() {} },
+        setAttribute() {},
+        focus() {},
+        addEventListener(n, f) {
+          (this.handlers[n] ||= []).push(f);
+        },
+        appendChild(c) {
+          this.children.push(c);
+          return c;
+        },
+        click() {
+          for (const f of this.handlers.click || []) f({});
+        },
+      };
+      let html = "";
+      Object.defineProperty(e, "innerHTML", {
+        get: () => html,
+        set(v) {
+          html = v;
+          e.children = [];
+          sel = -1;
+        },
+      });
+      let sel = -1;
+      if (e.tagName === "SELECT") {
+        Object.defineProperty(e, "options", { get: () => e.children });
+        Object.defineProperty(e, "selectedIndex", { get: () => sel });
+        Object.defineProperty(e, "value", {
+          get: () => (sel >= 0 && e.children[sel] ? e.children[sel].value : ""),
+          set(v) {
+            sel = e.children.findIndex((o) => o.value === v);
+          },
+        });
+        e.appendChild = (c) => {
+          e.children.push(c);
+          if (sel < 0) sel = 0;
+          return c;
+        };
+      }
+      return e;
+    }
+    async function runSettings({ providerId = "factory", baseStore = true, current, staticModels, remote, source = "remote" }) {
+      const els = new Map();
+      const toasts = [];
+      const toastMsg = makeEl("p");
+      Object.defineProperty(toastMsg, "textContent", { get: () => toasts[toasts.length - 1] || "", set: (v) => toasts.push(v) });
+      els.set("toast", makeEl("div"));
+      els.set("toastMsg", toastMsg);
+      els.set("setProvider", makeEl("select"));
+      els.set("setModel", makeEl("select"));
+      const document = {
+        readyState: "complete",
+        activeElement: null,
+        addEventListener() {},
+        body: makeEl("body"),
+        createElement: makeEl,
+        querySelector: () => null,
+        contains: () => true,
+        getElementById(id) {
+          if (id === "settingsSheet") return els.get(id) || null;
+          if (!els.has(id)) els.set(id, makeEl("div"));
+          return els.get(id);
+        },
+      };
+      const entry = { id: providerId, label: providerId, model: current, defaultModel: staticModels[0].id, models: staticModels, keyHint: "key", baseStore, base: baseStore ? "https://relay.example" : "" };
+      const sandbox = {
+        console,
+        setTimeout,
+        clearTimeout,
+        document,
+        localStorage: makeLocalStorage(),
+        luminaAI: {
+          providers: async () => ({ ok: true, current: providerId, list: [entry] }),
+          listModels: async () => ({ ok: true, source, models: remote }),
+          setModel: () => ({ ok: true }),
+          getApiKeyMask: async () => ({ ok: true, mask: "" }),
+        },
+      };
+      sandbox.window = sandbox;
+      sandbox.globalThis = sandbox;
+      vm.createContext(sandbox);
+      vm.runInContext(fs.readFileSync(path.join(WWW, "js/mobile-settings.js"), "utf8"), sandbox);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+      const modelSel = els.get("setModel");
+      return { modelSel, toasts, labels: modelSel.options.map((o) => [o.value, o.textContent]) };
+    }
+    const staticModels = [{ id: "claude-opus-4-8", label: "Opus 4.8" }, { id: "claude-gone", label: "Gone" }];
+    const remote = [{ id: "claude-opus-4-8", label: "Opus 4.8" }, { id: "claude-sonnet-4-6", label: "Sonnet 4.6" }];
+    // 中转列表不含所选模型：保留选中但标为不可用，并提示
+    let s = await runSettings({ current: "claude-gone", staticModels, remote });
+    assert.equal(s.modelSel.value, "claude-gone");
+    assert.deepEqual(s.labels.find(([v]) => v === "claude-gone"), ["claude-gone", "claude-gone（不可用）"], JSON.stringify(s.labels));
+    assert.ok(s.toasts.some((t) => /claude-gone/.test(t) && /不在中转允许的列表中/.test(t)), JSON.stringify(s.toasts));
+    // 所选模型在中转列表里：不标记、不提示
+    s = await runSettings({ current: "claude-sonnet-4-6", staticModels, remote });
+    assert.equal(s.modelSel.value, "claude-sonnet-4-6");
+    assert.ok(!s.labels.some(([, l]) => /不可用/.test(l)), JSON.stringify(s.labels));
+    assert.deepEqual(s.toasts, []);
+    // 回落到内置列表（中转不可达）时不能判定可用性
+    s = await runSettings({ current: "claude-custom", staticModels, remote: staticModels, source: "static" });
+    assert.equal(s.modelSel.value, "claude-custom");
+    assert.ok(!s.labels.some(([, l]) => /不可用/.test(l)), JSON.stringify(s.labels));
+    assert.deepEqual(s.toasts, []);
+    // 非中转服务商的远端列表不作为白名单
+    s = await runSettings({ providerId: "commandcode", baseStore: false, current: "claude-gone", staticModels, remote });
+    assert.equal(s.modelSel.value, "claude-gone");
+    assert.ok(!s.labels.some(([, l]) => /不可用/.test(l)), JSON.stringify(s.labels));
+    assert.deepEqual(s.toasts, []);
+    ok("审查 PR8 复审③ 中转 /models 不含所选模型时下拉标为不可用并提示，回落列表与其它服务商不受影响");
+  }
+
   /* ---- 审查 PR8⑤：流式 chat 返回的 model 就是请求实际发送的 model ---- */
   {
     const store = makeLocalStorage();

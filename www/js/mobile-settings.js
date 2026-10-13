@@ -225,8 +225,12 @@
     let previousProvider = providerSel?.value || "";
     let previousModel = modelSel?.value || "";
 
-    function fillModels(models, current) {
-      if (!modelSel) return;
+    /**
+     * authoritative：列表来自中转 /models（即 ALLOWED_MODELS），不在其中的模型每次请求都会 400。
+     * 返回 true 表示当前所选模型已被标为不可用。
+     */
+    function fillModels(models, current, { authoritative = false } = {}) {
+      if (!modelSel) return false;
       modelSel.innerHTML = "";
       for (const m of models || []) {
         const opt = document.createElement("option");
@@ -236,14 +240,16 @@
       }
       // 当前选中的不在列表里（比如换过模型名）也显示出来，避免下拉闪到别的模型
       const present = [...modelSel.options].some((o) => o.value === current);
+      const unavailable = Boolean(!present && current && authoritative);
       if (!present && current) {
         const opt = document.createElement("option");
         opt.value = current;
-        opt.textContent = current;
+        opt.textContent = unavailable ? `${current}（不可用）` : current;
         modelSel.appendChild(opt);
       }
       if (current) modelSel.value = current;
       previousModel = modelSel.value || "";
+      return unavailable;
     }
 
     let modelsGen = 0;
@@ -265,7 +271,10 @@
             if (gen !== modelsGen) return;
             if (r?.ok && r.source === "remote" && document.contains(modelSel)) {
               // previousModel 跟随用户在等待期间的改选，不能回退到发请求时的旧值
-              fillModels(r.models, previousModel || cur.model);
+              const selected = previousModel || cur.model;
+              if (fillModels(r.models, selected, { authoritative: cur.baseStore })) {
+                toast(`模型 ${selected} 不在中转允许的列表中，请改选其它模型`);
+              }
             }
           })
           .catch(() => {});
