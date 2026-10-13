@@ -5362,7 +5362,7 @@ async function main() {
   {
     const store = makeLocalStorage();
     let sent = null;
-    const { ai } = loadBridge(store, async (url, opts) => {
+    const { sandbox: claudeSandbox, ai } = loadBridge(store, async (url, opts) => {
       sent = { url, body: JSON.parse(opts.body), headers: opts.headers };
       return {
         ok: true,
@@ -5388,6 +5388,10 @@ async function main() {
     assert.equal(ai.setProvider("commandcode").ok, true);
     assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
     assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+    const anyOfNamesBefore = claudeSandbox.LUMINA_AGENT_TOOLS.tools
+      .filter((x) => x.function?.parameters?.anyOf)
+      .map((x) => x.function.name);
+    assert.ok(anyOfNamesBefore.length > 0, "回归前提：内置工具里确有顶层 anyOf");
     const result = await ai.complete({
       messages: [
         { role: "system", content: "SYS" },
@@ -5410,11 +5414,101 @@ async function main() {
     assert.equal(sent.body.messages[2].content[0].tool_use_id, "t1");
     assert.equal(sent.body.tool_choice.type, "auto");
     assert.ok(sent.body.tools.every((t) => t.input_schema && !t.function), "tools 应为 Anthropic input_schema 形");
+    for (const t of sent.body.tools) {
+      for (const k of ["oneOf", "allOf", "anyOf"]) {
+        assert.ok(!(k in t.input_schema), `${t.name} 的 input_schema 顶层不得含 ${k}（Anthropic 会 400）`);
+      }
+      assert.equal(t.input_schema.type, "object", `${t.name} 的 input_schema 顶层须为 object`);
+    }
+    {
+      // 必须用桥接自己沙箱里的同一份对象：真机上 assertToolArgs 与桥接共用它
+      const pack = claudeSandbox.LUMINA_AGENT_TOOLS;
+      const withAnyOf = anyOfNamesBefore.map((n) => pack.tools.find((x) => x.function.name === n));
+      for (const orig of withAnyOf) {
+        const sentTool = sent.body.tools.find((x) => x.name === orig.function.name);
+        assert.ok(sentTool, `${orig.function.name} 应随请求发送`);
+        assert.match(sentTool.description, /id 或 match_text/, `${orig.function.name} 描述应保留二选一约束`);
+        assert.ok(orig.function.parameters.anyOf, "原始 parameters 不应被改动（本地校验仍依赖 anyOf）");
+        const local = pack.assertToolArgs(orig.function.name, {});
+        assert.equal(local.ok, false, `${orig.function.name} 发过 Claude 请求后本地仍须拒绝缺 id/match_text 的调用`);
+      }
+    }
     assert.equal(result.message.content, "我帮你建待办");
     assert.equal(result.message.tool_calls[0].function.name, "todo_add");
     assert.equal(result.message.tool_calls[0].function.arguments, JSON.stringify({ title: "买牛奶" }));
     assert.equal(result.finish_reason, "tool_calls");
     ok("claude-* 走 /messages，请求与响应完成 Anthropic 双向转换");
+  }
+
+  /* ---- Anthropic 顶层组合关键字：allOf / 单分支 anyOf 的 required 并进顶层，不丢约束 ---- */
+  {
+    const store = makeLocalStorage();
+    let sent = null;
+    const { sandbox, ai } = loadBridge(store, async (url, opts) => {
+      sent = { url, body: JSON.parse(opts.body) };
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        body: null,
+        async text() {
+          return JSON.stringify({ model: "claude-sonnet-5-5", stop_reason: "end_turn", content: [{ type: "text", text: "ok" }] });
+        },
+      };
+    });
+    const pack = sandbox.LUMINA_AGENT_TOOLS;
+    const allOfParams = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" }, c: { type: "string" } },
+      required: ["a"],
+      allOf: [{ required: ["b"] }, { required: ["c", "a"] }],
+    };
+    const allOfExtraParams = {
+      type: "object",
+      properties: { a: { type: "string" } },
+      allOf: [{ required: ["a"], minProperties: 1 }],
+    };
+    const multiExtraParams = {
+      type: "object",
+      properties: { id: { type: "string" }, q: { type: "string" } },
+      anyOf: [{ required: ["id"] }, { properties: { q: { minLength: 3 } } }],
+    };
+    const singleParams = {
+      type: "object",
+      properties: { id: { type: "string" } },
+      anyOf: [{ required: ["id"] }],
+    };
+    pack.tools.push(
+      { type: "function", function: { name: "zz_allof", description: "x", parameters: allOfParams } },
+      { type: "function", function: { name: "zz_single", description: "y", parameters: singleParams } },
+      { type: "function", function: { name: "zz_allof_extra", description: "e", parameters: allOfExtraParams } },
+      { type: "function", function: { name: "zz_multi_extra", description: "m", parameters: multiExtraParams } }
+    );
+    try {
+      assert.equal(ai.setProvider("commandcode").ok, true);
+      assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+      assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+      const r = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true });
+      assert.equal(r.ok, true);
+      const ta = sent.body.tools.find((x) => x.name === "zz_allof");
+      const ts = sent.body.tools.find((x) => x.name === "zz_single");
+      assert.ok(!("allOf" in ta.input_schema) && !("anyOf" in ts.input_schema));
+      assert.deepEqual([...ta.input_schema.required].sort(), ["a", "b", "c"], "allOf 各分支 required 并进顶层并去重");
+      assert.deepEqual([...ts.input_schema.required], ["id"], "单分支 anyOf 等价于必填");
+      assert.ok(allOfParams.allOf && singleParams.anyOf && allOfParams.required.length === 1, "原始 parameters 不被改动");
+      assert.equal(ta.description, "x", "纯 required 的 allOf 不往描述里加内容");
+      assert.equal(ts.description, "y", "单分支纯 required 不往描述里加内容");
+      const te = sent.body.tools.find((x) => x.name === "zz_allof_extra");
+      assert.deepEqual([...te.input_schema.required], ["a"]);
+      assert.match(te.description, /另需满足：\[\{"minProperties":1\}\]/, "allOf 分支的非 required 约束写进描述且不重复 required");
+      const tm = sent.body.tools.find((x) => x.name === "zz_multi_extra");
+      assert.ok(!("anyOf" in tm.input_schema));
+      assert.match(tm.description, /至少满足其一：/, "多分支含非 required 约束时整体写进描述，不静默丢弃");
+      assert.match(tm.description, /minLength/);
+    } finally {
+      pack.tools.splice(pack.tools.length - 4, 4);
+    }
+    ok("Anthropic tools：allOf / 单分支 anyOf 的必填字段并进顶层 required，原始 schema 不变");
   }
 
   /* ---- 审查 PR8①：新款 Claude 不发 temperature，max_tokens 留出思考预算，required 失败关闭 ---- */
