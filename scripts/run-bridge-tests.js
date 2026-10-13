@@ -4908,6 +4908,39 @@ async function main() {
   }
   ok("审查十五② 自身无信息前值不再嵌套：单页连续编辑不再把前值整份挂进 over，存储不膨胀，撤销仍逐步回退");
 
+  /* ---- 审查十五③ 写失败窗口保留的任务插回原邻居位置：A 写失败期间删 X，B 之后改 X；A 的恢复写里删除落败、X 保留，
+     X 不能追加到末尾——按远端快照里的前一个邻居插回，写回盘后各页顺序一致 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const order = (list) => list.map((t) => t.text).join(",");
+    for (const target of ["X", "Q"]) {
+      const tag = `删除 ${target}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const p = A.invoke("add_todo", { text: "P" }).todo;
+      const q = A.invoke("add_todo", { text: "Q" }).todo;
+      const x = A.invoke("add_todo", { text: "X" }).todo;
+      const B = loadApp({ storage });
+      await sleep(3);
+      assert.equal(order(A.invoke("list_todos", { status: "all", limit: 50 }).todos), "X,Q,P", `${tag}：前提顺序`);
+      const id = target === "X" ? x.id : q.id;
+      storage.failTodoWrites = true;
+      A.invoke("delete_todo", { id });
+      storage.failTodoWrites = false;
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id, text: target + "-b" }).ok, true);
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: p.id, text: "P2" }).ok, true);   // 恢复写
+      for (let i = 0; i < 3; i++) for (const P of [A, B]) P.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      const want = target === "X" ? "X-b,Q,P2" : "X,Q-b,P2";
+      assert.equal(order(A.invoke("list_todos", { status: "all", limit: 50 }).todos), want, `${tag}：A 上保留的任务在原位置`);
+      assert.equal(order(B.invoke("list_todos", { status: "all", limit: 50 }).todos), want, `${tag}：B 顺序一致`);
+      assert.equal(order(diskTodos(storage)), want, `${tag}：写回盘的顺序`);
+    }
+  }
+  ok("审查十五③ 写失败窗口保留的任务插回原邻居位置：删除落败保留的任务按远端前一个邻居插回，不再跳到列表末尾");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

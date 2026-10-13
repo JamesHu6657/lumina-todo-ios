@@ -1663,16 +1663,20 @@ function buryItems(items, op){
 function addTombContested(list, local, p){
   const ids = new Set(list.map((t) => t.id));
   const keep = new Set(local.filter((t) => !ids.has(t.id) && keepAbsent(p, t)).map((t) => t.id));
-  if (!keep.size) return list;
+  return keep.size ? insertAtNeighbors(list, local, keep) : list;
+}
+/* 把 ref 里 id 属于 keep 的条目插进 list：放在 ref 中离它最近、已在结果里的前一个邻居之后（没有就置顶）。
+   按 ref 顺序逐条插，先插回的条目也能当后面条目的邻居 */
+function insertAtNeighbors(list, ref, keep){
   const out = list.slice();
-  for (let i = 0; i < local.length; i++){
-    if (!keep.has(local[i].id)) continue;
+  for (let i = 0; i < ref.length; i++){
+    if (!keep.has(ref[i].id)) continue;
     let pos = 0;
     for (let j = i - 1; j >= 0; j--){
-      const k = out.findIndex((x) => x.id === local[j].id);
+      const k = out.findIndex((x) => x.id === ref[j].id);
       if (k >= 0){ pos = k + 1; break; }
     }
-    out.splice(pos, 0, local[i]);
+    out.splice(pos, 0, ref[i]);
   }
   return out;
 }
@@ -3280,10 +3284,11 @@ function mergeRemoteWindow(parsed, base, followDeletes){
        与写盘成功时（applyExternal 走墓碑比较）结果一致 */
     const b = baseMap.get(t.id);
     if (!b || ourIds.has(t.id) || eq(t, b)) continue;
-    if (tombs.has(t.id)){ merged.push(t); contested.push(t); }
+    if (tombs.has(t.id)) contested.push(t);
     else noteDeletedRemote(t);   // 审查九：挂到删掉它的撤销步上
   }
-  let kept = dropBuried(merged);
+  /* 候选按远端快照里的前一个邻居插回，不追加到末尾：删除落败、条目保留时它要留在原位置（审查十五③） */
+  let kept = dropBuried(contested.length ? insertAtNeighbors(merged, remote, new Set(contested.map((t) => t.id))) : merged);
   if (contested.length){
     const keptIds = new Set(kept.map((t) => t.id));
     const revived = new Map();
