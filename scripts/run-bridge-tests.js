@@ -5417,6 +5417,58 @@ async function main() {
     ok("claude-* 走 /messages，请求与响应完成 Anthropic 双向转换");
   }
 
+  /* ---- 审查 PR8①：新款 Claude 不发 temperature，max_tokens 留出思考预算，required 失败关闭 ---- */
+  {
+    const store = makeLocalStorage();
+    const sent = [];
+    const { ai } = loadBridge(store, async (url, opts) => {
+      sent.push({ url, body: JSON.parse(opts.body) });
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("commandcode").ok, true);
+    assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+    const modern = [
+      "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+      "claude-fable-5-1", "claude-fable-5", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+    ];
+    for (const model of modern) {
+      assert.equal(ai.setModel(model).ok, true);
+      sent.length = 0;
+      const r = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true, temperature: 0.2, max_tokens: 1500 });
+      assert.equal(r.ok, true, model + JSON.stringify(r));
+      const b = sent[0].body;
+      assert.match(sent[0].url, /\/messages$/);
+      for (const k of ["temperature", "top_p", "top_k"]) assert.equal(Object.prototype.hasOwnProperty.call(b, k), false, `${model} 不得发送 ${k}`);
+      assert.ok(b.max_tokens >= 16000, `${model} max_tokens 应留出思考预算：${b.max_tokens}`);
+      assert.equal(b.tool_choice.type, "auto");
+      sent.length = 0;
+      const req = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true, tool_choice: "required" });
+      assert.equal(req.ok, false, `${model} required 应失败关闭`);
+      assert.equal(req.code, "UNSUPPORTED_TOOL_CHOICE");
+      assert.equal(sent.length, 0, "失败关闭时不发请求");
+    }
+    for (const model of ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"]) {
+      assert.equal(ai.setModel(model).ok, true);
+      sent.length = 0;
+      const r = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true, temperature: 0.2, max_tokens: 1500, tool_choice: "required" });
+      assert.equal(r.ok, true, model + JSON.stringify(r));
+      const b = sent[0].body;
+      assert.equal(b.temperature, 0.2, `${model} 接受 temperature`);
+      assert.equal(Object.prototype.hasOwnProperty.call(b, "top_p"), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(b, "top_k"), false);
+      assert.equal(b.max_tokens, 1500);
+      assert.deepEqual(b.tool_choice, { type: "any" });
+    }
+    ok("审查 PR8① 新款 Claude 不发采样参数且放宽 max_tokens；required 仅旧款映射为 any，其余失败关闭");
+  }
+
   /* ---- Anthropic 流式事件（text_delta/input_json_delta/message_delta）---- */
   {
     const store = makeLocalStorage();

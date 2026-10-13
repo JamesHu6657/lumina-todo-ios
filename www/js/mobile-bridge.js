@@ -296,6 +296,8 @@
     perMessageChars: { system: 16000, assistant: 12000, user: 12000, tool: 8000 },
     totalChars: 160000,
     maxTokens: { min: 64, max: 8192, default: 2048 },
+    // 低于非流式请求的长输出阈值（约 21K），兼顾思考与正文
+    anthropicThinkingMaxTokens: 16000,
     connectTimeoutMs: 30000,
     completeTimeoutMs: 120000,
     streamIdleTimeoutMs: 90000,
@@ -1093,8 +1095,23 @@
     }));
   }
 
-  function toAnthropicToolChoice(choice) {
-    if (choice === "required") return { type: "any" };
+  /**
+   * 只有这些旧款 Claude 接受 temperature 与 tool_choice:any。更新的型号（Opus 4.7 起、Fable、
+   * Sonnet/Haiku 5.x）对任何非默认 temperature 返回 400，且常开思考，强制工具调用同样会被拒绝。
+   */
+  const ANTHROPIC_LEGACY_SAMPLING = /^claude-(?:sonnet-4-6|haiku-4-5)(?:-\d{8})?$/i;
+  function anthropicAcceptsSampling(model) {
+    return ANTHROPIC_LEGACY_SAMPLING.test(String(model || ""));
+  }
+
+  function toAnthropicToolChoice(choice, model) {
+    if (choice === "required") {
+      if (anthropicAcceptsSampling(model)) return { type: "any" };
+      // 降级成 auto 会悄悄改变语义：调用方要求必须调工具，模型却可以直接回文字
+      const err = new Error(`${model} 不支持强制工具调用（tool_choice: required）`);
+      err.code = "UNSUPPORTED_TOOL_CHOICE";
+      throw err;
+    }
     if (choice === "none") return { type: "none" };
     return { type: "auto" };
   }
@@ -1331,18 +1348,23 @@
     let body;
     if (style === "anthropic") {
       const { system, messages: converted } = toAnthropicMessages(clipped);
-      // Anthropic Messages 规定 max_tokens 必填
+      const legacy = anthropicAcceptsSampling(model);
+      // Anthropic Messages 规定 max_tokens 必填。新款常开思考，思考 token 也计入 max_tokens，
+      // 按正文预算给会频繁 stop_reason=max_tokens，工具调用随之被失败关闭丢弃。
       body = {
         model,
         messages: converted,
         stream: Boolean(stream),
-        max_tokens: maxTokens,
+        max_tokens: legacy ? maxTokens : Math.max(maxTokens, LIMITS.anthropicThinkingMaxTokens),
       };
-      if (provider.samplingParams !== false) body.temperature = clampNumber(temperature, 0, 2, 0.4);
+      // top_p / top_k 从不发送：新款同样拒绝，旧款也不需要
+      if (legacy && provider.samplingParams !== false) {
+        body.temperature = clampNumber(temperature, 0, 1, 0.4);
+      }
       if (system) body.system = system;
       if (tools?.length) {
         body.tools = toAnthropicTools(tools);
-        body.tool_choice = toAnthropicToolChoice(tool_choice);
+        body.tool_choice = toAnthropicToolChoice(tool_choice, model);
       }
     } else {
       body = {
