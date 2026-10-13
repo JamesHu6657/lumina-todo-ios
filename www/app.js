@@ -396,6 +396,7 @@ let lastObservedRev = 0;       // 已合并进内存的盘快照中最高的修�
 let lastWrittenRev = 0;        // 本页最近一次写盘用的修订号
 let stampClock = 0;            // 写入戳的单调时钟：max(Date.now(), 已见最大 rev + 1)
 const tombs = new Map();       // 删除墓碑 id → {rev, by, op, at}，随盘快照的 _tomb 传播
+let tombHorizon = 0;           // 墓碑视界（随快照的 _tombH 传播）：rev 不大于它的删除可能已无墓碑
 let opCounter = 0;
 let lastUndoSkipped = [];      // 最近一次撤销里因别人写过而保留最新值的字段组 [{id, field}]
 let undoSeq = 0;               // 撤销步序号
@@ -1413,7 +1414,7 @@ function persist(){
   pruneTombs(todos);
   /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
      比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
-  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, rev, settledSegs:pomo.settledSegs, _tomb:tombsPayload(), todos });
+  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, rev, settledSegs:pomo.settledSegs, _tomb:tombsPayload(), _tombH:tombHorizon, todos });
   try {
     store.set(STORAGE_KEY, payload);
     lastWrittenRev = rev;
@@ -1567,12 +1568,34 @@ function payloadTombs(p){
   return out;
 }
 function putTomb(map, id, tb){ const cur = map.get(id); if (!cur || tb.rev > cur.rev) map.set(id, tb); }
-/* 旧数据没有 _tomb：什么也不做 */
+/* 审查十三①：新格式快照（_tomb 对象 + 数字 _tombH）里每次 rev 大于 _tombH 的删除都带墓碑，缺席条目没有墓碑
+   只说明写入方没见过它（比如它读盘后、写盘前别页刚新增的）。旧格式（裸数组、无 _tomb 或无 _tombH，含十二轮写入方：
+   它裁剪墓碑不记视界）返回 null，缺席仍按删除处理 */
+function payloadTombHorizon(p){
+  if (!p || Array.isArray(p) || !p._tomb || typeof p._tomb !== "object" || Array.isArray(p._tomb)) return null;
+  const h = p._tombH;
+  return typeof h === "number" && Number.isFinite(h) && h >= 0 && h <= Number.MAX_SAFE_INTEGER ? h : null;
+}
+function raiseTombHorizon(rev){ if (rev > tombHorizon) tombHorizon = Math.min(rev, Number.MAX_SAFE_INTEGER); }
+/* 旧数据没有 _tomb：不采纳墓碑。旧格式写入方的删除不留墓碑，把视界推到当前时钟——
+   之后本页写出的快照里缺席的旧条目仍按删除处理，别页不会凭本页快照复活旧格式写入方删掉的条目 */
 function adoptTombs(p){
   for (const [id, tb] of payloadTombs(p)){
     putTomb(tombs, id, tb);
     stampClock = Math.max(stampClock, tb.rev);   // 之后的写（撤销删除）必须比见过的删除新
   }
+  const h = payloadTombHorizon(p);
+  raiseTombHorizon(h == null ? Math.max(stampClock, Date.now()) : h);
+}
+/* 本地有、快照 p 缺席的条目是否保留：有墓碑 → 保留为候选，由 dropBuried 比版本；新格式且条目写入版本不低于
+   视界 → 保留（写入方没见过它，新增胜出）；否则（旧格式 / 视界外）缺席即删除，视界推过该条目，
+   本页之后的快照照样把它的缺席当删除传下去 */
+function keepAbsent(p, t){
+  if (tombs.has(t.id)) return true;
+  const h = payloadTombHorizon(p), m = itemMaxStampRev(t);
+  if (h != null && m >= h) return true;
+  raiseTombHorizon(m + 1);
+  return false;
 }
 function buryItems(items, op){
   if (!items.length) return;
@@ -1580,13 +1603,12 @@ function buryItems(items, op){
   const tb = { rev: nextStampRev(), by: TAB_ID, op: op || "delete", at: Date.now() };
   for (const t of items) tombs.set(t.id, { ...tb });
 }
-/* 审查十二③：条目集合跟盘/远端走时，本地有、对方缺席的条目先不按缺席删——有墓碑的补回候选集合，
-   由 dropBuried 统一比版本（本地在删除之后又写过 → 条目胜出）。没有墓碑（旧格式写入方）仍按缺席即删除。
+/* 审查十二③/十三①：条目集合跟盘/远端走时，本地有、对方快照 p 缺席的条目先不按缺席删——有墓碑的补回候选集合，
+   由 dropBuried 统一比版本（本地在删除之后又写过 → 条目胜出）；新格式快照缺席且无墓碑的同样补回（见 keepAbsent）。
    须在 adoptTombs 之后调用：对方快照带来的墓碑要先并进来 */
-function addTombContested(list, local){
-  if (!tombs.size) return list;
+function addTombContested(list, local, p){
   const ids = new Set(list.map((t) => t.id));
-  const extra = local.filter((t) => !ids.has(t.id) && tombs.has(t.id));
+  const extra = local.filter((t) => !ids.has(t.id) && keepAbsent(p, t));
   return extra.length ? list.concat(extra) : list;
 }
 /* 按墓碑过滤合并结果；条目比墓碑新时墓碑作废 */
@@ -1605,22 +1627,25 @@ function pruneTombs(list){
   const cutoff = Date.now() - TOMB_TTL_MS;
   for (const [id, tb] of tombs){
     const t = live.get(id);
-    if ((t && tb.rev <= itemMaxStampRev(t)) || (tb.at && tb.at < cutoff)) tombs.delete(id);
+    if (t && tb.rev <= itemMaxStampRev(t)) tombs.delete(id);   // 作废：条目更新，不是删除
+    else if (tb.at && tb.at < cutoff){ tombs.delete(id); raiseTombHorizon(tb.rev); }   // 过期：删除仍成立，记进视界
   }
   if (tombs.size > TOMB_KEEP){
-    const keep = [...tombs].sort((a, b) => b[1].rev - a[1].rev).slice(0, TOMB_KEEP);
+    const sorted = [...tombs].sort((a, b) => b[1].rev - a[1].rev);
     tombs.clear();
-    for (const [id, tb] of keep) tombs.set(id, tb);
+    for (const [id, tb] of sorted.slice(0, TOMB_KEEP)) tombs.set(id, tb);
+    for (const [, tb] of sorted.slice(TOMB_KEEP)) raiseTombHorizon(tb.rev);
   }
 }
-function tombsPayload(){ return tombs.size ? Object.fromEntries(tombs) : undefined; }
+/* 没有墓碑也写空对象：_tomb + _tombH 是新格式标记（见 payloadTombHorizon） */
+function tombsPayload(){ return Object.fromEntries(tombs); }
 /* 审查十二④：内存墓碑与盘上不同（新增、版本更新、作废）也算待落盘的变化——只合并了墓碑、列表与盘相同时不写，
    重开页面后墓碑就丢了，迟到的新增快照会复活已删条目。先按 persist 的规则裁剪再比，免得过期墓碑引发无谓写盘 */
 function tombsDifferFrom(p){
   pruneTombs(todos);
   const sig = (entries) => JSON.stringify(entries.map(([id, tb]) => [id, tb.rev, tb.by, tb.op, tb.at])
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
-  return sig([...tombs]) !== sig(payloadTombs(p));
+  return sig([...tombs]) !== sig(payloadTombs(p)) || payloadTombHorizon(p) !== tombHorizon;
 }
 /* 撤销删除插回的条目：只推一枚戳的 mrev（值归属 by/op/rev 不变），让它比删除墓碑新——否则持有墓碑的页面会再次删掉它 */
 const REVIVE_GROUP = FW_KEYS.indexOf("createdAt");
@@ -3068,8 +3093,9 @@ function syncTodosFromDisk(){
   const before = JSON.stringify(todos);
   adoptTombs(parsed);
   /* 审查十③：条目集合跟盘走，用户字段逐组按写入戳——本地更新的组（被交错写/修订号回退的盘写冲掉的）保留。
-     盘上条目也要过墓碑：写盘的那页可能还没见过这次删除。盘上缺席但有墓碑的本地条目同样进候选、按版本比墓碑 */
-  const adopted = dropBuried(addTombContested(keepNewerLocalGroups(clean, todos), todos));
+     盘上条目也要过墓碑：写盘的那页可能还没见过这次删除。盘上缺席但有墓碑的本地条目同样进候选、按版本比墓碑；
+     新格式盘快照缺席且无墓碑的本地条目保留，下面随内存与盘不同一起写回 */
+  const adopted = dropBuried(addTombContested(keepNewerLocalGroups(clean, todos), todos, parsed));
   if (JSON.stringify(adopted) !== before){ markRemoteAdopted(todos, adopted); todos = adopted; }   // 外部内容流进内存：undo 归因要登记
   /* 攒着的远端快照不论盘上是谁写的都逐组软合并：盘上是我方写时它可能被覆盖了（快照是唯一幸存副本）；
      盘上是远端写时也不一定包含它——两页交错写会写出同号快照，修订号也会回退。陈旧内容在戳比较里落败 */
@@ -3139,7 +3165,8 @@ function mergeThreeWay(ours, base, theirs){
    · 双方各自新增的 → 都保留
    followDeletes=true（脏窗口恢复，远端写在窗口内、见过基线）才跟进
    「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释。
-   有墓碑的缺席条目不在这里删，留给 dropBuried 比版本（审查十二③）；缺席即删除只给没有墓碑的旧格式数据 */
+   有墓碑的缺席条目不在这里删，留给 dropBuried 比版本（审查十二③）；缺席即删除只给旧格式快照或墓碑视界外的条目
+   （审查十三①：新格式远端写缺基线条目且无墓碑 → 远端没见过它，不是删了） */
 function mergeRemoteWindow(parsed, base, followDeletes){
   const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
   const baseMap = new Map(base.map((t) => [t.id, t]));
@@ -3148,7 +3175,7 @@ function mergeRemoteWindow(parsed, base, followDeletes){
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   adoptTombs(parsed);
   const merged = todos
-    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id) || tombs.has(t.id))
+    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id) || keepAbsent(parsed, t))
     .map((t) => {
       const b = baseMap.get(t.id), r = remoteMap.get(t.id);
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
@@ -3257,7 +3284,13 @@ function combineSnapshots(a, b){
   if (rev != null) out.rev = rev; else delete out.rev;
   const tb = new Map();
   for (const [id, t] of [...payloadTombs(a), ...payloadTombs(b)]) putTomb(tb, id, t);
-  if (tb.size) out._tomb = Object.fromEntries(tb); else delete out._tomb;
+  /* 两份都是新格式，合成的才算新格式（视界取大）；任一份是旧格式，缺席就可能是没留墓碑的删除 */
+  const ha = payloadTombHorizon(a), hb = payloadTombHorizon(b);
+  if (ha != null && hb != null){ out._tomb = Object.fromEntries(tb); out._tombH = Math.max(ha, hb); }
+  else {
+    delete out._tombH;
+    if (tb.size) out._tomb = Object.fromEntries(tb); else delete out._tomb;
+  }
   return out;
 }
 function mergeSoftRemote(parsed){
@@ -3282,12 +3315,20 @@ function applyExternal(parsed){
   const maybeOld = r != null && r <= lastObservedRev;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
   adoptTombs(parsed);
-  const next = dropBuried(maybeOld ? softMergeList(todos, clean, false) : addTombContested(keepNewerLocalGroups(clean, todos), todos));
+  const next = dropBuried(maybeOld ? softMergeList(todos, clean, false) : addTombContested(keepNewerLocalGroups(clean, todos), todos, parsed));
   observePayload(parsed); observeStamps(clean);
-  if (JSON.stringify(next) === JSON.stringify(todos)){ lastAppliedList = clean.map((t) => ({ ...t })); return; }   // 内容与内存一致：套了也白套
+  /* 审查十三①：快照缺席、本页保留下来的条目要写回——否则盘上只有不含它的那份快照，本页关掉它就丢了 */
+  const cleanIds = new Set(clean.map((t) => t.id));
+  const keptAbsent = !maybeOld && next.some((t) => !cleanIds.has(t.id));
+  if (JSON.stringify(next) === JSON.stringify(todos)){
+    lastAppliedList = clean.map((t) => ({ ...t }));   // 内容与内存一致：套了也白套
+    if (keptAbsent) persist();
+    return;
+  }
   markRemoteAdopted(todos, next);
   todos = next;
   lastAppliedList = clean.map((t) => ({ ...t }));
+  if (keptAbsent) persist();
   reconcilePomoTask();
   render();
   play("r-peek");

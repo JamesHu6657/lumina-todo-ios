@@ -4330,6 +4330,107 @@ async function main() {
   }
   ok("审查十二④ 仅合并墓碑时也持久化：列表不变、只采纳新墓碑，重开页面后墓碑仍在，迟到的新增快照不复活任务");
 
+  /* ---- 审查十三① 新格式快照缺席不再视为删除：A 读盘后、写盘前 B 新增 X，A 的覆盖写不含 X 也没有 X 的墓碑。
+     A 从没见过 X（也收不到 B 的事件）——B 不论收到 A 的事件还是下次操作先读盘，X 都要留在内存并写回盘；
+     旧格式载荷缺席仍按删除；墓碑删除照常生效；墓碑过期后视界外的缺席退回按删除处理 ---- */
+  {
+    const has = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.some((t) => t.id === id);
+    const onDisk = (storage, id) => diskTodos(storage).some((t) => t.id === id);
+    const setup = () => {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const s0 = storage.getItem(TODO_KEY);
+      return { storage, A, B, y, s0 };
+    };
+    /* A 拿着不含 X 的旧盘写入：等价于 A 读盘之后、写盘之前 B 的新增落盘 */
+    const raceAdd = ({ storage, A, B, y, s0 }) => {
+      const x = B.invoke("add_todo", { text: "X by B" }).todo;
+      storage.setItem(TODO_KEY, s0);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y by A" }).ok, true);
+      const eA = storage.getItem(TODO_KEY);
+      assert.ok(!onDisk(storage, x.id) && !(JSON.parse(eA)._tomb || {})[x.id], "前提：A 的覆盖写不含 X、也没有 X 的墓碑");
+      return { x, eA };
+    };
+    for (const deliverEvent of [true, false]) {
+      const tag = `deliverEvent=${deliverEvent}`;
+      const ctx = setup();
+      const { storage, A, B, y } = ctx;
+      const { x, eA } = raceAdd(ctx);
+      if (deliverEvent) B.deliverStorage(TODO_KEY, eA);
+      else assert.ok(B.invoke("add_todo", { text: "Z" }).ok);
+      assert.ok(has(B, x.id), `${tag}：B 内存保留自己刚新增的 X`);
+      assert.ok(onDisk(storage, x.id), `${tag}：X 写回盘`);
+      assert.equal(diskTodos(storage).find((t) => t.id === y.id).text, "Y by A", `${tag}：A 的编辑保留`);
+      /* A 从盘上重新拿到 X；之后带墓碑的删除照常生效 */
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.ok(has(A, x.id), `${tag}：A 收到写回后也有 X`);
+      assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+      const delSnap = storage.getItem(TODO_KEY);
+      assert.ok(JSON.parse(delSnap)._tomb[x.id], "前提：删除带墓碑落盘");
+      if (deliverEvent) B.deliverStorage(TODO_KEY, delSnap);
+      else assert.ok(B.invoke("add_todo", { text: "W" }).ok);
+      assert.ok(!has(B, x.id), `${tag}：有墓碑的删除仍生效`);
+      assert.ok(!onDisk(storage, x.id), `${tag}：盘上不复活 X`);
+    }
+    /* 恢复写路径：B 新增 X 后写盘失败进入脏窗口（基线含 X），A 拿不含 X 的旧盘覆盖写，B 的恢复写不得按缺席删掉 X */
+    for (const deliverEvent of [true, false]) {
+      const tag = `恢复窗口 deliverEvent=${deliverEvent}`;
+      const { storage, A, B, y, s0 } = setup();
+      const x = B.invoke("add_todo", { text: "X by B" }).todo;
+      storage.failTodoWrites = true;
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "X edited" }).ok, true);
+      storage.failTodoWrites = false;
+      storage.setItem(TODO_KEY, s0);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y by A" }).ok, true);
+      if (deliverEvent) B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.ok(B.invoke("add_todo", { text: "Z" }).ok);   // 触发恢复写
+      assert.ok(has(B, x.id), `${tag}：B 内存保留 X`);
+      assert.equal((diskTodos(storage).find((t) => t.id === x.id) || {}).text, "X edited", `${tag}：恢复写把 X 落盘`);
+      assert.equal(diskTodos(storage).find((t) => t.id === y.id).text, "Y by A", `${tag}：A 的编辑保留`);
+    }
+    /* 旧格式载荷（无 _tomb/_tombH 的对象、裸数组）：缺席仍按删除 */
+    for (const legacy of ["object", "array"]) {
+      for (const deliverEvent of [true, false]) {
+        const tag = `旧格式 ${legacy} deliverEvent=${deliverEvent}`;
+        const ctx = setup();
+        const { storage, B } = ctx;
+        const { x, eA } = raceAdd(ctx);
+        const raw = JSON.parse(eA);
+        delete raw._tomb; delete raw._tombH;
+        storage.setItem(TODO_KEY, JSON.stringify(legacy === "array" ? raw.todos : raw));
+        if (deliverEvent) B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+        else assert.ok(B.invoke("add_todo", { text: "Z" }).ok);
+        assert.ok(!has(B, x.id), `${tag}：缺席即删除`);
+        assert.ok(!onDisk(storage, x.id), `${tag}：盘上没有 X`);
+      }
+    }
+    /* 墓碑过期：C 收到删除 X 的快照时墓碑已过 30 天——C 照样删掉 X，裁掉墓碑并把视界推过它。
+       没收到删除的 B 再读 C 的快照：X 在视界外，缺席按删除处理，不会复活 */
+    {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "X" }).todo;
+      A.invoke("add_todo", { text: "Y" });
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+      const raw = JSON.parse(storage.getItem(TODO_KEY));
+      raw._tomb[x.id].at = Date.now() - 31 * 24 * 3600 * 1000;
+      storage.setItem(TODO_KEY, JSON.stringify(raw));
+      C.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.ok(!has(C, x.id), "前提：C 删掉 X");
+      const cSnap = JSON.parse(storage.getItem(TODO_KEY));
+      assert.ok(!cSnap._tomb[x.id], "前提：过期墓碑已裁掉");
+      assert.ok(cSnap._tombH >= raw._tomb[x.id].rev, "裁掉过期墓碑时视界推过它");
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.ok(!has(B, x.id), "视界外的缺席按删除处理");
+      assert.ok(!onDisk(storage, x.id), "盘上不复活 X");
+    }
+  }
+  ok("审查十三① 新格式快照缺席不再视为删除：别页覆盖写不含刚新增的任务时新增胜出并写回盘，删除只由墓碑决定，旧格式与墓碑视界外仍按缺席删除");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
