@@ -4547,6 +4547,44 @@ async function main() {
   }
   ok("审查十三④ 同 rev 墓碑确定性决胜：两页同一毫秒删除同一条时收敛到同一枚墓碑，不再无限互写");
 
+  /* ---- 审查十四① 同一写入的无链副本不再覆盖有链副本：B 先写 X，A 没见到也写 X（rA > rB），A 合并 B 的快照后
+     把 B 的写挂进 over 落盘。B 先读到带链版本，A 第一次写的迟到事件（同一写入、无链）随后到达——
+     平手时不得偏向这份无链回显、剥掉 over 写回盘，否则 A 撤销会退回 v0 抹掉 B 的编辑 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const textOf = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === id).text;
+    for (const same of [true, false]) {
+      const tag = same ? "同值" : "不同值";
+      const want = same ? "done" : "b";
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const B = loadApp({ storage });
+      await sleep(3);
+      const pre = storage.getItem(TODO_KEY);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: want }).ok, true);
+      const eB = storage.getItem(TODO_KEY);
+      storage.setItem(TODO_KEY, pre);                // A 没见到 B 的写
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: same ? "done" : "a" }).ok, true);
+      const sA = storage.getItem(TODO_KEY);
+      A.deliverStorage(TODO_KEY, eB);
+      const sA2 = storage.getItem(TODO_KEY);
+      assert.ok(JSON.parse(sA2).todos.find((t) => t.id === x.id)._fw.text.over, `${tag}：前提 A 合并后把 B 的写挂进 over 落盘`);
+      B.deliverStorage(TODO_KEY, sA2);
+      B.deliverStorage(TODO_KEY, sA);                // 同一写入的无链迟到回显
+      const after = storage.getItem(TODO_KEY);
+      if (after !== sA2) A.deliverStorage(TODO_KEY, after);
+      assert.ok(diskTodos(storage).find((t) => t.id === x.id)._fw.text.over, `${tag}：盘上仍保留 over 链`);
+      assert.equal(A.invoke("undo").ok, true);
+      assert.equal(textOf(A, x.id), want, `${tag}：A 撤销后内存露出 B 的编辑`);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, want, `${tag}：A 撤销后盘上露出 B 的编辑`);
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(textOf(B, x.id), want, `${tag}：B 同步后保持自己的编辑`);
+    }
+  }
+  ok("审查十四① 同一写入的无链副本不再覆盖有链副本：迟到的无链回显不剥掉 over，撤销本页那步保留别页的编辑");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

@@ -1769,10 +1769,20 @@ function overRev(st){
 function canAttachOver(ts, rs){
   return foreignStamp(rs) && stampVer(rs) > overRev(ts) && !isKnownWrite(ts, rs);
 }
-/* 远端这组的写是否比本地新：比整条链的最大版本（rev 与 mrev）；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端 */
+/* a 的链是否包含 b 链上的每一环（按身份，含 a 记下的 gone） */
+function chainCovers(a, b){
+  for (let o = b && b.over; o && o.st; o = o.st.over) if (!isKnownWrite(a, o.st)) return false;
+  return true;
+}
+/* 远端这组的写是否比本地新：比整条链的最大版本（rev 与 mrev）；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端。
+   同一次写的两份副本平手：链包含对方的一方胜——挂接远端写不推版本，无链的迟到回显不得剥掉别处挂上的 over（审查十四①） */
 function remoteStampWins(ts, rs){
   const ct = Math.max(stampVer(ts), overRev(ts)), cr = Math.max(stampVer(rs), overRev(rs));
   if (ct !== cr) return cr > ct;
+  if (sameWrite(ts, rs)){
+    const tc = chainCovers(ts, rs), rc = chainCovers(rs, ts);
+    if (tc !== rc) return rc;
+  }
   return !(stampVer(ts) < ct && stampVer(rs) === cr);
 }
 /* 系统字段独立合并：番茄计数单调取大；ClickUp 关联哪边有留哪边（taskId 一旦写入不会改） */
