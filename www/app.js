@@ -1601,7 +1601,15 @@ function payloadTombs(p){
   }
   return out;
 }
-function putTomb(map, id, tb){ const cur = map.get(id); if (!cur || tb.rev > cur.rev) map.set(id, tb); }
+/* 同 rev 的两枚墓碑（两页同一毫秒删除同一条）按 by、op、at 确定性决胜：各页取同一枚，
+   否则双方都认为盘上墓碑与内存不同而写回，互相触发 storage 事件无限互写 */
+function tombBeats(a, b){
+  if (a.rev !== b.rev) return a.rev > b.rev;
+  if (a.by !== b.by) return a.by > b.by;
+  if (a.op !== b.op) return a.op > b.op;
+  return (a.at || 0) > (b.at || 0);
+}
+function putTomb(map, id, tb){ const cur = map.get(id); if (!cur || tombBeats(tb, cur)) map.set(id, tb); }
 /* 审查十三①：新格式快照（_tomb 对象 + 数字 _tombH）里每次 rev 大于 _tombH 的删除都带墓碑，缺席条目没有墓碑
    只说明写入方没见过它（比如它读盘后、写盘前别页刚新增的）。旧格式（裸数组、无 _tomb 或无 _tombH，含十二轮写入方：
    它裁剪墓碑不记视界）返回 null，缺席仍按删除处理 */

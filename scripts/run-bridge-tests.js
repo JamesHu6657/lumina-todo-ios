@@ -4514,6 +4514,39 @@ async function main() {
   }
   ok("审查十三③ 撤销按已裁剪节点身份拒绝挂接：撤销时尚未到达的并发远端写仍挂进链，再次撤销露出它");
 
+  /* ---- 审查十三④ 同 rev 墓碑确定性决胜：A、B 同一毫秒删除同一条（rev 相同，by/op 不同）。
+     双方各自偏向自己那枚时，每次收到对方写盘都认为墓碑不同而写回，互相触发事件无限互写 ---- */
+  for (const otherBy of ["tabB", "0000"]) {   // 别页 by 比本页大 / 小：两种决胜方向
+    const tag = `别页 by=${otherBy}`;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X" }).todo;
+    A.invoke("add_todo", { text: "Y" });
+    const pre = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    const d = JSON.parse(storage.getItem(TODO_KEY));
+    const mine = d._tomb[x.id];
+    const forged = JSON.parse(pre);
+    forged.writer = otherBy; forged.rev = d.rev; forged.todos = forged.todos.filter((t) => t.id !== x.id);
+    forged._tomb = { [x.id]: { rev: mine.rev, by: otherBy, op: otherBy + "#7", at: mine.at } };
+    forged._tombH = d._tombH;
+    storage.setItem(TODO_KEY, JSON.stringify(forged));
+    const B = loadApp({ storage });              // B 内存里是它自己那枚墓碑
+    let writes = 0;
+    for (let i = 0; i < 6; i++) {
+      const before = storage.getItem(TODO_KEY);
+      (i % 2 ? B : A).deliverStorage(TODO_KEY, before);
+      if (storage.getItem(TODO_KEY) !== before) writes++;
+    }
+    assert.ok(writes <= 1, `${tag}：两页收敛到同一枚墓碑，不再互写（实际写盘 ${writes} 次）`);
+    const tb = JSON.parse(storage.getItem(TODO_KEY))._tomb[x.id];
+    assert.equal(tb.rev, mine.rev, `${tag}：墓碑版本不变`);
+    assert.equal(tb.by, otherBy > mine.by ? otherBy : mine.by, `${tag}：按 by 确定性决胜`);
+    assert.ok(!diskTodos(storage).some((t) => t.id === x.id), `${tag}：条目仍是删除状态`);
+    for (const P of [A, B]) assert.ok(!P.invoke("list_todos", { status: "all", limit: 50 }).todos.some((t) => t.id === x.id), `${tag}：两页内存都不复活`);
+  }
+  ok("审查十三④ 同 rev 墓碑确定性决胜：两页同一毫秒删除同一条时收敛到同一枚墓碑，不再无限互写");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
