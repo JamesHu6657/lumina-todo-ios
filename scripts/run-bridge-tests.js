@@ -4812,6 +4812,36 @@ async function main() {
   }
   ok("审查十四⑥ stampWrite 保留自身前值的链和 gone：迟到的旧事件不再挂到本页重写过的组上，撤销不露出已撤销或较旧的写");
 
+  /* ---- 审查十四⑦ 争议保留的任务插回原邻居位置：B 新增 X1、X2（置顶），A 交错写的快照没见过它们。
+     缺席争议里保留下来的条目不能追加到末尾——按 B 本地的前一个邻居插回，收到事件与下次操作读盘两条路径都一样，
+     写回盘后各页顺序一致 ---- */
+  {
+    const order = (list) => list.map((t) => t.text).join(",");
+    for (const deliverEvent of [true, false]) {
+      const tag = `deliverEvent=${deliverEvent}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const p = A.invoke("add_todo", { text: "P" }).todo;
+      A.invoke("add_todo", { text: "Q" });
+      const r = A.invoke("add_todo", { text: "R" }).todo;
+      const B = loadApp({ storage });
+      const s0 = storage.getItem(TODO_KEY);
+      B.invoke("add_todo", { text: "X1" });
+      B.invoke("add_todo", { text: "X2" });
+      assert.equal(order(B.invoke("list_todos", { status: "all", limit: 50 }).todos), "X2,X1,R,Q,P", `${tag}：前提 B 新增置顶`);
+      storage.setItem(TODO_KEY, s0);                   // A 读到的是 B 新增之前的盘
+      assert.equal(A.invoke("update_todo", { id: p.id, text: "P2" }).ok, true);
+      let want = "X2,X1,R,Q,P2";
+      if (deliverEvent) B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      else { assert.equal(B.invoke("update_todo", { id: r.id, text: "R2" }).ok, true); want = "X2,X1,R2,Q,P2"; }
+      assert.equal(order(B.invoke("list_todos", { status: "all", limit: 50 }).todos), want, `${tag}：B 保留的新增仍在原位置`);
+      assert.equal(order(diskTodos(storage)), want, `${tag}：写回盘的顺序`);
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(order(A.invoke("list_todos", { status: "all", limit: 50 }).todos), want, `${tag}：A 收到写回后顺序一致`);
+    }
+  }
+  ok("审查十四⑦ 争议保留的任务插回原邻居位置：缺席争议中保留的新增任务按本地前一个邻居插回，不再跳到列表末尾");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

@@ -1651,11 +1651,23 @@ function buryItems(items, op){
 }
 /* 审查十二③/十三①：条目集合跟盘/远端走时，本地有、对方快照 p 缺席的条目先不按缺席删——有墓碑的补回候选集合，
    由 dropBuried 统一比版本（本地在删除之后又写过 → 条目胜出）；新格式快照缺席且无墓碑的同样补回（见 keepAbsent）。
-   须在 adoptTombs 之后调用：对方快照带来的墓碑要先并进来 */
+   须在 adoptTombs 之后调用：对方快照带来的墓碑要先并进来。
+   补回的条目插在本地前一个邻居之后（没有就置顶），不追加到末尾——否则新增的置顶任务会跳到最后，且这个顺序落盘传给各页（审查十四⑦） */
 function addTombContested(list, local, p){
   const ids = new Set(list.map((t) => t.id));
-  const extra = local.filter((t) => !ids.has(t.id) && keepAbsent(p, t));
-  return extra.length ? list.concat(extra) : list;
+  const keep = new Set(local.filter((t) => !ids.has(t.id) && keepAbsent(p, t)).map((t) => t.id));
+  if (!keep.size) return list;
+  const out = list.slice();
+  for (let i = 0; i < local.length; i++){
+    if (!keep.has(local[i].id)) continue;
+    let pos = 0;
+    for (let j = i - 1; j >= 0; j--){
+      const k = out.findIndex((x) => x.id === local[j].id);
+      if (k >= 0){ pos = k + 1; break; }
+    }
+    out.splice(pos, 0, local[i]);
+  }
+  return out;
 }
 /* 按墓碑过滤合并结果；条目比墓碑新时墓碑作废 */
 function dropBuried(list){
