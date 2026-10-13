@@ -4585,6 +4585,44 @@ async function main() {
   }
   ok("审查十四① 同一写入的无链副本不再覆盖有链副本：迟到的无链回显不剥掉 over，撤销本页那步保留别页的编辑");
 
+  /* ---- 审查十四② mrev 只用于同一写入决胜：A 写 a，B 见到后盖成 b（链含 a），C 见到 b 后写 c（rC > rB）。
+     A 没见到 c 就撤销：当前值是 B 的，撤销跳过但裁剪 B 的链并盖 mrev=now（> rC）。
+     B 的写与 C 的写不是同一次写，不能拿裁剪时钟排序——三页与盘上都应收敛到 c，而不是较旧的 b ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const textOf = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === id).text;
+    for (const interleave of [false, true]) {
+      const tag = `interleave=${interleave}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "a" }).ok, true);
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "b" }).ok, true);
+      const eB = storage.getItem(TODO_KEY);
+      A.deliverStorage(TODO_KEY, eB);
+      C.deliverStorage(TODO_KEY, eB);
+      await sleep(3);
+      assert.equal(C.invoke("update_todo", { id: x.id, text: "c" }).ok, true);
+      const eC = storage.getItem(TODO_KEY);
+      if (interleave) storage.setItem(TODO_KEY, eB);   // A 撤销前没见到 c
+      else A.deliverStorage(TODO_KEY, eC);
+      await sleep(3);
+      const r = A.invoke("undo");
+      assert.ok(r.ok && (r.skipped || []).length === 1, `${tag}：前提 A 的撤销因值已属别页而跳过`);
+      const eA = storage.getItem(TODO_KEY);
+      if (interleave) { A.deliverStorage(TODO_KEY, eC); C.deliverStorage(TODO_KEY, eA); }
+      for (let i = 0; i < 4; i++) for (const P of [A, B, C]) P.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      for (const [name, P] of [["A", A], ["B", B], ["C", C]]) assert.equal(textOf(P, x.id), "c", `${tag}：${name} 保留 C 较新的编辑`);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "c", `${tag}：盘上保留 C 较新的编辑`);
+    }
+  }
+  ok("审查十四② mrev 只用于同一写入决胜：跳过的撤销裁剪别页链盖的 mrev 不再让较旧的写压过他人较新的并发编辑");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

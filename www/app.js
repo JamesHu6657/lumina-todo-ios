@@ -1484,8 +1484,8 @@ function foreignStamp(st){ return !!st && stampWriter(st) !== TAB_ID; }
 /* 值属于别页的操作（按值归属）：本页盖住它时要挂 over，那页之后撤销才能在链里找到自己 */
 function foreignOwner(st){ return !!st && st.by !== TAB_ID; }
 function stampRev(st){ return st && Number.isFinite(st.rev) ? st.rev : 0; }
-/* mrev：只改写入链（撤销裁剪）时盖的元数据版本，值归属（by/op/rev）不变。比较新旧一律用 stampVer——
-   否则裁剪前后的链 by/op/rev 完全相同，旧快照平手胜出，把已撤销的那环装回去 */
+/* mrev：只改写入链（撤销裁剪）时盖的元数据版本，值归属（by/op/rev）不变。同一次写的两份副本比新旧用 stampVer——
+   否则裁剪前后的链 by/op/rev 完全相同，旧快照平手胜出，把已撤销的那环装回去；不同的写之间只比 rev */
 function stampVer(st){ return Math.max(stampRev(st), st && Number.isFinite(st.mrev) ? st.mrev : 0); }
 /* 按 by/op/rev 重建戳时带上写入元数据：mrev 与写入者 wby */
 function withMrev(out, src){
@@ -1759,31 +1759,34 @@ function observePayload(p){
 }
 function snapshotList(p){ return Array.isArray(p) ? p : (p && Array.isArray(p.todos) ? p.todos : []); }
 /* 戳链见过的最大 rev：本页在三方合并里胜出时戳保留自己的 rev，但它盖住了链上（可能更新的）远端写 */
-function overRev(st){
+function overRev(st, ver = stampVer){
   let m = 0;
-  for (let o = st && st.over; o && o.st; o = o.st.over) m = Math.max(m, stampVer(o.st));
+  for (let o = st && st.over; o && o.st; o = o.st.over) m = Math.max(m, ver(o.st));
   return m;
 }
 /* 远端写 rs 能否挂成本地戳 ts 的 over：须比链上每一环都新，不是链上已有的写，也不是撤销/裁剪时已拿掉的写（gone）——
-   旧快照不得把它们重新引入；mrev 只参与新旧比较，不当「已见」截断，否则会误拦撤销时尚未到达的并发写 */
+   旧快照不得把它们重新引入；rs 与链上各环是不同的写，只比 rev——mrev 不当「已见」截断，否则会误拦撤销时尚未到达的并发写 */
 function canAttachOver(ts, rs){
-  return foreignStamp(rs) && stampVer(rs) > overRev(ts) && !isKnownWrite(ts, rs);
+  return foreignStamp(rs) && stampRev(rs) > overRev(ts, stampRev) && !isKnownWrite(ts, rs);
 }
 /* a 的链是否包含 b 链上的每一环（按身份，含 a 记下的 gone） */
 function chainCovers(a, b){
   for (let o = b && b.over; o && o.st; o = o.st.over) if (!isKnownWrite(a, o.st)) return false;
   return true;
 }
-/* 远端这组的写是否比本地新：比整条链的最大版本（rev 与 mrev）；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端。
+/* 远端这组的写是否比本地新：比整条链的最大版本；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端。
+   mrev 只在同一次写的两份副本之间决胜（裁剪过的链新于未裁剪的）；不同的写只比 rev——
+   裁剪时盖的 mrev 是撤销那一刻的时钟，不代表那次写更新，拿它排序会让被裁剪的旧写压过他人更新的编辑（审查十四②）。
    同一次写的两份副本平手：链包含对方的一方胜——挂接远端写不推版本，无链的迟到回显不得剥掉别处挂上的 over（审查十四①） */
 function remoteStampWins(ts, rs){
-  const ct = Math.max(stampVer(ts), overRev(ts)), cr = Math.max(stampVer(rs), overRev(rs));
+  const same = sameWrite(ts, rs), ver = same ? stampVer : stampRev;
+  const ct = Math.max(ver(ts), overRev(ts, ver)), cr = Math.max(ver(rs), overRev(rs, ver));
   if (ct !== cr) return cr > ct;
-  if (sameWrite(ts, rs)){
+  if (same){
     const tc = chainCovers(ts, rs), rc = chainCovers(rs, ts);
     if (tc !== rc) return rc;
   }
-  return !(stampVer(ts) < ct && stampVer(rs) === cr);
+  return !(ver(ts) < ct && ver(rs) === cr);
 }
 /* 系统字段独立合并：番茄计数单调取大；ClickUp 关联哪边有留哪边（taskId 一旦写入不会改） */
 function mergeSystemFields(ours, theirs){
@@ -1906,7 +1909,7 @@ function restoreFromRemote(s, r){
       setStamp(out, gi, sameWrite(ss, rs) || foreignStamp(rs) ? (remoteStampWins(ss, rs) ? rs : ss) : (ss || rs));
       return;
     }
-    if ((!ss && !rs) || stampVer(rs) >= stampVer(ss)){ copyGroup(out, r, gi); tookTheirs = true; return; }
+    if ((!ss && !rs) || stampRev(rs) >= stampRev(ss)){ copyGroup(out, r, gi); tookTheirs = true; return; }
     /* 没有基线可判：只有确是别页写的（带别页戳）才算被盖住的远端写；本页自己更早的落盘版不挂 over */
     if (ss && foreignStamp(rs)) setStamp(out, gi, withMrev(makeStamp(ss.by, ss.op, ss.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ss));
   });
