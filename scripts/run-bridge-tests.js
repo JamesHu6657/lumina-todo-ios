@@ -4623,6 +4623,44 @@ async function main() {
   }
   ok("审查十四② mrev 只用于同一写入决胜：跳过的撤销裁剪别页链盖的 mrev 不再让较旧的写压过他人较新的并发编辑");
 
+  /* ---- 审查十四③ 墓碑与 over 中的较新编辑比较：A 写失败期间改 X（rA），C 删除 X（墓碑 T > rA），
+     B 没见到删除、交错把 X 改成 b（rB > T）。A 恢复合并保留本页值、把 rB 挂进 over——
+     墓碑只和顶层戳 rA 比会删掉 X，可链上有比删除更新的编辑，X 应保留。两种投递顺序都要保留 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (const mirror of [false, true]) {
+      const tag = `mirror=${mirror}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      await sleep(3);
+      const pre = storage.getItem(TODO_KEY);
+      storage.failTodoWrites = true;
+      A.invoke("update_todo", { id: x.id, text: "a" });
+      storage.failTodoWrites = false;
+      await sleep(3);
+      assert.equal(C.invoke("delete_todo", { id: x.id }).ok, true);
+      const sC = storage.getItem(TODO_KEY);
+      storage.setItem(TODO_KEY, pre);                // B 没见到删除
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "b" }).ok, true);
+      const sB = storage.getItem(TODO_KEY);
+      for (const s of mirror ? [sB, sC] : [sC, sB]) A.deliverStorage(TODO_KEY, s);
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);   // 恢复写
+      const dx = diskTodos(storage).find((t) => t.id === x.id);
+      assert.ok(dx, `${tag}：链上有比删除更新的编辑，盘上保留 X`);
+      assert.equal(dx.text, "a", `${tag}：A 的值照常胜出`);
+      assert.equal(dx._fw.text.over.v.text, "b", `${tag}：B 的编辑留在 over 链上`);
+      assert.ok(!(JSON.parse(storage.getItem(TODO_KEY))._tomb || {})[x.id], `${tag}：墓碑作废`);
+      assert.ok(A.invoke("list_todos", { status: "all", limit: 50 }).todos.some((t) => t.id === x.id), `${tag}：A 内存保留 X`);
+    }
+  }
+  ok("审查十四③ 墓碑与 over 中的较新编辑比较：恢复合并保留本页值时，链上晚于删除的远端编辑让条目免于被较旧的删除删掉");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

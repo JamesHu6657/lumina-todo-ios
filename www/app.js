@@ -1572,9 +1572,13 @@ function observeStamps(list){
     }
   }
 }
+/* 含 over 链：本页在合并里保留自己较旧的值时，较新的远端写只留在链上——它同样晚于更早的删除（审查十四③） */
 function itemMaxStampRev(t){
   let m = 0;
-  for (let gi = 0; gi < FW_KEYS.length; gi++) m = Math.max(m, stampVer(stampOf(t, gi)));
+  for (let gi = 0; gi < FW_KEYS.length; gi++){
+    const st = stampOf(t, gi);
+    m = Math.max(m, stampVer(st), overRev(st));
+  }
   return m;
 }
 /* 审查十一④：删除墓碑。快照里缺一条分不清「没见到」还是「删了」，软合并只能 add-wins——迟到的旧快照会把
