@@ -35,19 +35,31 @@
   async function exportViaShare() {
     const inApp = !!window.Capacitor?.isNativePlatform?.();
     if (!inApp) return "fallback";
-    let todos = [];
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-      if (saved && Array.isArray(saved.todos)) todos = saved.todos;
-      else if (Array.isArray(saved)) todos = saved;
-    } catch {
-      toast("读取本地数据失败");
-      return "error";
-    }
     const day = new Date();
+    let snap = null;
+    // 与网页导出共用应用内存快照：写盘失败时界面里的最新改动只在内存里
+    try {
+      if (typeof window.__luminaExportSnapshot === "function") snap = window.__luminaExportSnapshot();
+    } catch {
+      snap = null;
+    }
+    if (!snap || !Array.isArray(snap.todos)) {
+      // 应用脚本没起来时才退回读盘
+      let todos = [];
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+        if (saved && Array.isArray(saved.todos)) todos = saved.todos;
+        else if (Array.isArray(saved)) todos = saved;
+      } catch {
+        toast("读取本地数据失败");
+        return "error";
+      }
+      snap = { v: 4, exportedAt: day.toISOString(), todos };
+    }
+    const todos = snap.todos;
     const pad = (n) => String(n).padStart(2, "0");
     const name = `todo-${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}.json`;
-    const json = JSON.stringify({ v: 4, exportedAt: day.toISOString(), todos }, null, 2);
+    const json = JSON.stringify(snap, null, 2);
     try {
       const file = new File([json], name, { type: "application/json" });
       if (navigator.canShare?.({ files: [file] })) {
@@ -118,6 +130,7 @@
             <button type="button" class="settings-btn ghost" id="setCuClear">清除</button>
           </div>
           <div class="settings-row">
+            <button type="button" class="settings-btn ghost" id="setCuRetryPending">重试待核对</button>
             <button type="button" class="settings-btn ghost" id="setCuClearFailed">清除失败记录</button>
           </div>
         </section>
@@ -192,6 +205,7 @@
             const pending = (st.pendingPush || 0) + (st.pendingPomo || 0);
             cuMask.textContent = `已保存 Token · 待同步 ${st.queue || 0}`
               + (pending ? ` · 待核对 ${pending}` : "")
+              + (st.pendingManual ? `（${st.pendingManual} 条长时间未确认，需手动重试）` : "")
               + (st.failed ? ` · 失败记录 ${st.failed}` : "")
               + (st.queueCorrupt ? " · 队列损坏已保全" : "");
           } else {
@@ -346,6 +360,39 @@
         toast("已清除 ClickUp Token");
       } else {
         toast(r?.error || "清除失败，Token 可能仍在设备上");
+      }
+      refreshMasks();
+    });
+    let retryPendingBusy = false;
+    document.getElementById("setCuRetryPending")?.addEventListener("click", async (ev) => {
+      // 执行期间禁用按钮；真正的互斥在 bridge/mobile-clickup（single-flight + 锁 + 版本校验）
+      if (retryPendingBusy) return;
+      const btn = ev?.currentTarget || document.getElementById("setCuRetryPending");
+      if (!confirm("重新核对长时间未确认的 ClickUp 记录？ClickUp 里仍查不到的番茄打卡会按原标记补传一次。")) return;
+      if (retryPendingBusy) return;
+      retryPendingBusy = true;
+      if (btn) {
+        btn.disabled = true;
+        btn.setAttribute?.("aria-busy", "true");
+      }
+      try {
+        const r = await window.luminaClickUp?.retryPending?.();
+        if (!r) toast("ClickUp 模块未加载");
+        else if (!r.ok) toast(r.pomo?.code === "LOOKUP_FAILED" ? "暂时查不到 ClickUp，稍后再试" : (r.error || "重试失败"));
+        else {
+          const found = (r.pomo?.reconciled || 0) + (r.push?.reconciled || 0);
+          const pushLeft = r.push?.needsManual || 0;
+          toast(`已核对：找到 ${found} 条，补传 ${r.pomo?.requeued || 0} 条`
+            + (pushLeft ? `；${pushLeft} 条待办请在该待办上点「重新上传」` : ""));
+        }
+      } catch (err) {
+        toast(err?.message || "重试失败");
+      } finally {
+        retryPendingBusy = false;
+        if (btn) {
+          btn.disabled = false;
+          btn.removeAttribute?.("aria-busy");
+        }
       }
       refreshMasks();
     });

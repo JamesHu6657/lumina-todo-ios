@@ -198,6 +198,76 @@ async function main() {
     console.log("✔ 原生 fetch 忽略 signal 时，complete 仍会超时且接住迟到失败");
   }
 
+  // 审查第二轮 #5：Factory 中转（droid exec）不支持采样参数，App 不得再发送 max_tokens/temperature
+  {
+    const bodies = [];
+    const capture = (provider) => async (_url, options) => {
+      bodies.push({ provider, body: JSON.parse(options.body) });
+      return completeResponse("ok");
+    };
+    const factory = loadBridge(store, capture("factory"));
+    const r = await within(factory.complete({
+      messages: [{ role: "user", content: "hi" }], temperature: 0.9, max_tokens: 900,
+    }));
+    assert.equal(r.ok, true);
+    const fb = bodies.find((b) => b.provider === "factory").body;
+    assert.equal("temperature" in fb, false, "Factory 请求不应携带 temperature");
+    assert.equal("max_tokens" in fb, false, "Factory 请求不应携带 max_tokens");
+    const other = makeLocalStorage();
+    other.setItem("lumina-api-provider", "opencode");
+    other.setItem("lumina-api-key", "sk-" + "o".repeat(30));
+    const oc = loadBridge(other, capture("opencode"));
+    await within(oc.complete({ messages: [{ role: "user", content: "hi" }], temperature: 0.9, max_tokens: 900 }));
+    const ob = bodies.find((b) => b.provider === "opencode").body;
+    assert.equal(ob.temperature, 0.9, "其他服务商仍发送 temperature");
+    assert.equal(ob.max_tokens, 900, "其他服务商仍发送 max_tokens");
+    const pv = await factory.providers();
+    const fp = pv.list.find((x) => x.id === "factory");
+    assert.equal(fp.samplingParams, false, "providers() 应声明 Factory 不支持采样参数");
+    console.log("✔ Factory 不再发送被中转忽略的 max_tokens/temperature，其他服务商不受影响");
+  }
+
+  // 审查三①：CapacitorHttp 缓冲整段中转 SSE（无 reader）同样按完整事件解析、失败关闭
+  {
+    const tool = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"delete_todo","arguments":"{}"}}]},"finish_reason":null}]}\n\n';
+    const buffered = (raw) => async () => ({ ok: true, status: 200, body: null, text: async () => raw });
+    for (const raw of [
+      tool + 'data: {"error":\ndata: {"message":"droid crashed"}}\n\n' + "data: [DONE]\n\n",
+      tool + 'event: error\ndata: {"message":"relay overloaded"}\n\n' + "data: [DONE]\n\n",
+      tool + "data: {broken\n\n" + "data: [DONE]\n\n",
+    ]) {
+      const r = await runChat(loadBridge(store, buffered(raw)));
+      assert.equal(r.done, undefined, "Factory 缓冲 SSE 的错误事件不得 onDone（工具不得执行）");
+      assert.ok(r.error);
+    }
+    const okRaw = 'data: {"choices":[{"index":0,\ndata: "delta":{"content":"中转好"},"finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n';
+    const good = await runChat(loadBridge(store, buffered(okRaw)));
+    assert.equal(good.error, undefined, String(good.error));
+    assert.equal(good.done.content, "中转好");
+    console.log("✔ Factory 缓冲 SSE：多行/事件型错误失败关闭，合法多行 data 正常组装");
+  }
+
+  // 审查五 B：Factory 中转流里显式 null 的参数片段不得让旧参数被执行（流式 reader 与缓冲 SSE）
+  {
+    const tool = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"delete_todo","arguments":"{\\"id\\":\\"t1\\"}"}}]},"finish_reason":null}]}\n\n';
+    const tail = 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n';
+    const enc = new TextEncoder();
+    for (const bad of ['{"index":0,"function":{"arguments":null}}', '{"index":0,"function":null}']) {
+      const raw = tool + 'data: {"choices":[{"index":0,"delta":{"tool_calls":[' + bad + ']},"finish_reason":null}]}\n\n' + tail;
+      const buf = await runChat(loadBridge(store, async () => ({ ok: true, status: 200, body: null, text: async () => raw })));
+      assert.equal(buf.done, undefined, "Factory 缓冲 SSE 显式 null 不得 onDone：" + bad);
+      assert.ok(buf.error);
+      const st = await runChat(loadBridge(store, async () => ({
+        ok: true, status: 200,
+        body: new ReadableStream({ start(c) { c.enqueue(enc.encode(raw)); c.close(); } }),
+        text: async () => raw,
+      })));
+      assert.equal(st.done, undefined, "Factory 流式显式 null 不得 onDone：" + bad);
+      assert.ok(st.error);
+    }
+    console.log("✔ Factory 中转：显式 null 的工具参数/函数片段失败关闭（流式/缓冲）");
+  }
+
   for (const stop of [true, false]) {
     const text = deferred();
     const bodyStarted = deferred();

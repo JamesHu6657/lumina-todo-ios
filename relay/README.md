@@ -11,7 +11,7 @@ HOST=127.0.0.1
 PORT=8787
 DROID_BIN=/usr/local/bin/droid
 DROID_MODEL=deepseek-v4.1-flash
-# ALLOWED_MODELS=deepseek-v4.1-flash
+# ALLOWED_MODELS=deepseek-v4.1-flash   # 必须包含 DROID_MODEL，否则启动失败
 # DROID_REASONING=high
 # MAX_CONCURRENCY=2
 # MAX_REQUESTS_PER_MINUTE=30   # 每分钟最多启动的 droid 次数，0 表示不限
@@ -23,6 +23,14 @@ DROID_MODEL=deepseek-v4.1-flash
 启用服务后可通过 `/healthz` 检查状态。`Caddyfile.example` 展示了反向代理配置；App 请求需在 `Authorization` 中携带 `Bearer <RELAY_TOKEN>`。
 
 本地运行测试：`node relay/test-relay.mjs`。
+
+## 模型与生成参数
+
+请求省略 `model` 或给出不在 `ALLOWED_MODELS` 里的模型时，回退到 `DROID_MODEL`；启动时会校验 `DROID_MODEL` 属于允许列表，回退目标不会越过列表。
+
+`droid exec` 只支持选择模型（`-m`）和推理强度（`-r`），没有 `temperature`、`max_tokens` 等采样参数，中转无法把它们传给上游。合法取值照常受理，但响应头 `X-Relay-Ignored-Params` 会列出本次被忽略的参数，`/v1/models` 的 `unsupported_params` 也声明了这一能力差异；取值非法（如 `max_tokens` 非正整数、`temperature` 超出 0–2、`n` 不为 1）返回 400。App 端的输出截断不等于上游的生成预算。
+
+客户端在请求体上传、临时目录与 prompt 准备期间断开时，中转不会再启动 droid，并立即释放并发槽。
 
 ## 提示词缓存
 

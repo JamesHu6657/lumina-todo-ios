@@ -379,6 +379,27 @@ let dirtyBase = null;          // localDirty 窗口起点时的盘基线
 let localDirty = false;        // 有改动还没落盘：内存领先于盘
 let lastDisk = null;           // syncTodosFromDisk 最近一次读到的完整 STORAGE payload
 const remoteIds = new Set();   // 当前版本由远端写入（流入过内存）的条目 id——undo 归因要用
+/* 审查九：撤销/合并改为「按字段组写入戳」判定（取代第五～八轮的冲突侧表 remoteFieldConflicts /
+   remoteDeletedLatest / refreshRemoteConflicts）。
+   · 每条待办带持久化的 _fw = { [组键]: { by: 写入页 TAB_ID, op: 操作 id, rev: 单调时钟, over? } }，
+     任何一页写某个用户字段组都会给这组盖上自己的戳；戳随条目落盘、随合并跟着胜出的值走。
+   · 撤销某一步：先合并盘上最新（脏窗口读不出盘就放弃），再逐组判定——只有当前这组的戳仍是这一步的戳
+     （没人再写过）才反做，否则原样保留最新值并报告跳过。不依赖 storage 事件的到达顺序。
+   · 三方合并里双方都改了同一组：值相同 → 采用远端的戳（远端独立写下了同值，撤销本页那步不得改回）；
+     值不同 → 本页胜出（策略不变），但在本页戳上挂 over={v:远端值, st:远端戳}：撤销本页这步时露出的是
+     被盖住的远端值，而不是历史 before。远端之后再写这组会整个换掉戳（over 随之作废），天然「始终最新」。
+   · 盘上 payload 带修订号 rev（写入取 max(盘, 已见, 已写)+1）。审查十③：它只是提示——交错写会写出同号快照、
+     盘上修订号也会回退，绝不据此整份丢弃快照；收到的快照一律逐组按写入戳合并，陈旧内容在戳比较里落败，
+     内存与撤销基准因此不会倒退。只有同号同内容的重复投递才直接跳过。 */
+const FW_KEYS = ["text", "completed", "priority", "category", "dueDate", "createdAt"];   // 与 USER_FIELD_GROUPS 一一对应
+let lastObservedRev = 0;       // 已合并进内存的盘快照中最高的修订号（写盘修订号取值、新旧提示）
+let lastWrittenRev = 0;        // 本页最近一次写盘用的修订号
+let stampClock = 0;            // 写入戳的单调时钟：max(Date.now(), 已见最大 rev + 1)
+const tombs = new Map();       // 删除墓碑 id → {rev, by, op, at}，随盘快照的 _tomb 传播
+let tombHorizon = 0;           // 墓碑视界（随快照的 _tombH 传播）：rev 不大于它的删除可能已无墓碑
+let opCounter = 0;
+let lastUndoSkipped = [];      // 最近一次撤销里因别人写过而保留最新值的字段组 [{id, field}]
+let undoSeq = 0;               // 撤销步序号
 /* 「出身」归因：远端新增的条目。本页改写只销版本标记（remoteIds.delete），
    不动出身——否则撤销更早的快照时，「远端加的、后来被本页碰过的条目」
    会被误判成本页新增，直接被撤掉并广播删除 */
@@ -586,6 +607,8 @@ function adoptSettledSegs(raw){
    undo 的三方合并靠它区分「我们改的」和「远端改了流进来的」——
    两者盘==内存且≠快照，全局标志分不清 */
 function markRemoteAdopted(prev, next){
+  /* 撤销步还没封口时流入的远端内容属于「操作前」：并进 before，免得被当成本地操作反做 */
+  rebaseOpenUndo(prev, next);
   const prevMap = new Map(prev.map((t) => [t.id, t]));
   const nextIds = new Set(next.map((t) => t.id));
   for (const t of next){
@@ -827,6 +850,8 @@ function logPomoToClickUp(endedAt, segmentMs){
     Promise.resolve(
       bridge.logPomo({
         title: task ? task.text : "",
+        // 已传过 ClickUp 的待办直接记到那个任务上，别按（可能被截断的）标题再找/新建
+        taskId: task && task.clickupTaskId ? task.clickupTaskId : undefined,
         minutes,
         endedAt: at,
         operationId,
@@ -911,8 +936,8 @@ function finishSegment(silentCatchUp, endedAtOverride){
     if (!dup && pomo.taskId){
       const t = todos.find((x) => x.id === pomo.taskId);
       if (t){
-        remoteIds.delete(t.id);    // 本页记账改写，当前版本不再是远端写的
-        t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); t.updatedAt = Date.now(); persist();
+        /* 番茄入账是系统字段回写：不动 remoteIds，免得撤销无关操作时把别页的编辑回滚掉 */
+        t.pomodoros = Math.min(999, (t.pomodoros || 0) + 1); persist();   // 系统回写不推 updatedAt
       }
     }
     /* 别页已结算的段不重复打卡（operationId 幂等兜底，但能省则省） */
@@ -955,8 +980,10 @@ function toggleRun(){
     if (pomo.leftMs != null && pomo.leftMs <= 0){ finishSegment(false); return; }
     const fresh = pomo.leftMs == null;
     const left = fresh ? durationOf(pomo.mode) : pomo.leftMs;
-    if (!(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
-      pomo.segmentMs = durationOf(pomo.mode);
+    /* 新的一段：计时和打卡时长必须来自同一个预设，一起锁定。
+       续跑：沿用本段开始时锁定的 segmentMs（缺失时才补当前预设） */
+    if (fresh || !(Number.isFinite(pomo.segmentMs) && pomo.segmentMs > 0)) {
+      pomo.segmentMs = fresh ? left : durationOf(pomo.mode);
     }
     pomo.running = true;
     pomo.endsAt = Date.now() + left;
@@ -1032,8 +1059,11 @@ function focusOnTask(id){
 function setPomoPreset(idx){
   if (!PRESETS[idx]) return null;
   pomo.presetIdx = idx;
-  if (!pomo.running){
-    pomo.leftMs = null;
+  /* 新预设只影响下一段：跑着或暂停着的当前段，剩余时间与锁定的 segmentMs 都不动，
+     否则「暂停→换预设→继续」会让倒计时按新时长重来，而打卡还按旧时长上传 */
+  const segmentInProgress = pomo.running || pomo.leftMs != null;
+  if (!segmentInProgress){
+    pomo.segmentMs = null;
     // 专注刚结束的 900ms 过渡中，要按照新预设重新决定短休息/长休息。
     if (segmentTransitionTimer){
       pomo.mode = pomo.round % preset().per === 0 ? "long" : "short";
@@ -1220,7 +1250,7 @@ function sanitizeTodo(raw, seen){
   // 有合法 taskId 但 url 脏：补官方 deep link，避免丢关联
   if (clickupTaskId && !clickupUrl) clickupUrl = "https://app.clickup.com/t/" + clickupTaskId;
 
-  return {
+  const out = {
     id, text, completed,
     priority: PRIORITIES.includes(raw.priority) ? raw.priority : "low",
     category: CATEGORIES.includes(raw.category) ? raw.category : "inbox",
@@ -1229,6 +1259,73 @@ function sanitizeTodo(raw, seen){
     clickupTaskId,
     clickupUrl,
   };
+  /* 审查九：字段组写入戳（旧版存档没有就不带，视为「来源未知」——撤销遇到无戳的组一律不动） */
+  const fw = sanitizeStamps(raw._fw);
+  if (fw) out._fw = fw;
+  return out;
+}
+/* 写入戳不可信（盘可被手改、来自别页）：逐项校验，坏的整项丢掉；over 的值按字段规则校验，坏了只丢 over */
+function sanitizeStamp(st, gi, depth){
+  if (!st || typeof st !== "object" || Array.isArray(st)) return null;
+  if (typeof st.by !== "string" || !st.by || st.by.length > 64) return null;
+  if (typeof st.op !== "string" || !st.op || st.op.length > 128) return null;
+  const rev = Number(st.rev);
+  if (!Number.isFinite(rev) || rev <= 0 || rev > Number.MAX_SAFE_INTEGER) return null;
+  const outSt = { by: st.by, op: st.op, rev };
+  if (typeof st.wby === "string" && st.wby && st.wby.length <= 64 && st.wby !== st.by) outSt.wby = st.wby;
+  const mrev = Number(st.mrev);
+  if (st.mrev != null && Number.isFinite(mrev) && mrev > 0 && mrev <= Number.MAX_SAFE_INTEGER) outSt.mrev = mrev;
+  const alive = Number(st.alive);
+  if (st.alive != null && Number.isFinite(alive) && alive > 0 && alive <= Number.MAX_SAFE_INTEGER) outSt.alive = alive;
+  if (Array.isArray(st.gone)){
+    const gone = st.gone.filter((g) => Array.isArray(g) && g.length === 3
+      && typeof g[0] === "string" && g[0] && g[0].length <= 64
+      && typeof g[1] === "string" && g[1] && g[1].length <= 128
+      && Number.isFinite(g[2]) && g[2] > 0 && g[2] <= Number.MAX_SAFE_INTEGER).map((g) => [g[0], g[1], g[2]]);
+    if (gone.length) outSt.gone = gone.slice(-MAX_GONE);
+  }
+  const o = st.over;
+  if (o && typeof o === "object" && !Array.isArray(o)){
+    if (depth >= MAX_OVER_DEPTH) outSt.cut = true;
+    else if (o.lost === true) outSt.over = { lost: true };
+    else if (o.v && typeof o.v === "object"){
+      const v = sanitizeGroupValue(o.v, gi);
+      if (v) outSt.over = { v, st: sanitizeStamp(o.st, gi, depth + 1) };
+    }
+  }
+  if (st.cut === true && !outSt.over) outSt.cut = true;
+  return outSt;
+}
+function sanitizeGroupValue(v, gi){
+  switch (FW_KEYS[gi]){
+    case "text": {
+      const t = typeof v.text === "string" ? v.text.trim().slice(0, MAX_TEXT) : "";
+      return t ? { text: t } : null;
+    }
+    case "completed": {
+      if (typeof v.completed !== "boolean") return null;
+      return { completed: v.completed, completedAt: v.completed ? safeTimestamp(v.completedAt, Date.now()) : null };
+    }
+    case "priority": return PRIORITIES.includes(v.priority) ? { priority: v.priority } : null;
+    case "category": return CATEGORIES.includes(v.category) ? { category: v.category } : null;
+    case "dueDate": return v.dueDate === null || isISODate(v.dueDate) ? { dueDate: v.dueDate } : null;
+    case "createdAt": {
+      const n = safeTimestamp(v.createdAt, 0);
+      return n ? { createdAt: n } : null;
+    }
+    default: return null;
+  }
+}
+function sanitizeStamps(fw){
+  if (!fw || typeof fw !== "object" || Array.isArray(fw)) return null;
+  const out = {};
+  for (const k of Object.keys(fw)){
+    const gi = FW_KEYS.indexOf(k);
+    if (gi < 0) continue;
+    const st = sanitizeStamp(fw[k], gi, 0);
+    if (st) out[k] = st;
+  }
+  return Object.keys(out).length ? out : null;
 }
 function sanitizeList(arr){
   if (!Array.isArray(arr)) return { todos:[], dropped:0 };
@@ -1250,9 +1347,12 @@ function loadState(){
       const parsed = JSON.parse(rawV2);
       const list = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.todos) ? parsed.todos : null;
       if (list){
-        const r = sanitizeList(list); todos = r.todos; recovered = r.dropped;
+        const r = sanitizeList(list); recovered = r.dropped;
+        adoptTombs(parsed);
+        todos = dropBuried(r.todos);
         /* 同步机制的两条基线：脏窗口恢复、结算标记采纳 */
         lastAppliedList = todos.map((t) => ({ ...t }));
+        observePayload(parsed); observeStamps(todos);
         if (!Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
       }
       else recovered = -1;
@@ -1275,23 +1375,69 @@ function loadState(){
 }
 
 /* ---------------------------------------------------------------- 写入 */
+/* 脏窗口的恢复写之前：先把窗口期间别页写进盘的内容按 dirtyBase 三方合并进内存。
+   否则这次写会直接盖掉别页的新增/编辑，而合并要等到下一次操作——
+   用户写完立刻关页或刷新，远端改动就永久丢了。
+   远端来源取「盘上的远端写」（最新）或攒着的 pendingExternal 快照。
+   返回内存是否因合并改变。 */
+function mergeRemoteBeforeRecoveryWrite(){
+  if (!localDirty || !Array.isArray(dirtyBase)) return false;
+  let remoteSrc = null;
+  try {
+    const disk = JSON.parse(store.get(STORAGE_KEY) || "null");
+    if (disk && !Array.isArray(disk) && disk.writer && disk.writer !== TAB_ID
+        && Array.isArray(disk.todos)) remoteSrc = disk;
+  } catch { /* 读不出盘就只用排队快照 */ }
+  const diskRemote = !!remoteSrc;
+  if (!remoteSrc && pendingExternal) remoteSrc = pendingExternal;
+  if (!remoteSrc){ pendingExternal = null; return false; }
+  const before = JSON.stringify(todos);
+  const adopted = mergeRemoteWindow(remoteSrc, dirtyBase, true);
+  /* 审查十③：盘上的远端写不一定包含排队快照的编辑（交错写同号/修订号回退）——再逐组按戳软合并 */
+  if (diskRemote && pendingExternal && !sameSnapshot(pendingExternal, remoteSrc)) mergeSoftRemote(pendingExternal);
+  /* 合并基线前移到「已采纳的远端版」：内存已包含它的全部改动。
+     恢复写若再次失败，下一次合并必须以它为基线——否则用户随后删掉的
+     远端条目会被当成远端新增再合回来（审查第二轮 #4） */
+  dirtyBase = adopted.map((t) => ({ ...t }));
+  lastAppliedList = adopted.map((t) => ({ ...t }));
+  pendingExternal = null;
+  return JSON.stringify(todos) !== before;
+}
+
 function persist(){
-  const savedAt = Date.now();
-  /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
-     比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
-  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, settledSegs:pomo.settledSegs, todos });
   if (!storageWritable){
     setPersistState("unavailable");
     if (!localDirty) dirtyBase = lastAppliedList;
     localDirty = true;
     return false;
   }
+  const wasDirty = localDirty;
+  const mergedRemote = mergeRemoteBeforeRecoveryWrite();
+  const savedAt = Date.now();
+  /* 审查九：单调盘修订号——取盘上现有修订号、本页已见/已写的最大值再 +1。
+     只记 lastWrittenRev，不推 lastObservedRev：这次写可能盖掉了一份本页还没合并过的远端写，
+     它的 storage 事件稍后到达时必须仍被当作「新的」去软合并救回 */
+  let diskRev = 0;
+  try { diskRev = payloadRev(JSON.parse(store.get(STORAGE_KEY) || "null")) || 0; } catch { /* 读不出就按 0 */ }
+  const rev = Math.max(diskRev, lastObservedRev, lastWrittenRev) + 1;
+  pruneTombs(todos);
+  /* settledSegs 随列表一起走：结算标记和「记账的那次列表写入」同源同落，
+     比 POMO_KEY 的 settled 可靠——后者的写顺序会被双方 savePomo 互相覆盖 */
+  const payload = JSON.stringify({ v:SCHEMA_VERSION, writer:TAB_ID, savedAt, rev, settledSegs:pomo.settledSegs, _tomb:tombsPayload(), _tombH:tombHorizon, todos });
   try {
     store.set(STORAGE_KEY, payload);
+    lastWrittenRev = rev;
     setPersistState("ok");
     flashSaved();
     localDirty = false;
     lastAppliedList = todos.map((t) => ({ ...t }));
+    /* 恢复写已经带上了合并结果：窗口基线和排队快照都用完了 */
+    if (wasDirty){ dirtyBase = null; pendingExternal = null; }
+    if (mergedRemote){
+      reconcilePomoTask();
+      /* 调用方通常已 render 过旧内存：合进来的远端条目要补一次上屏 */
+      setTimeout(() => { try { render(); } catch { /* ignore */ } }, 0);
+    }
     return true;
   } catch (err) {
     const quota = err && (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED" || err.code === 22);
@@ -1304,111 +1450,678 @@ function persist(){
 }
 
 /* ---------------------------------------------------------------- 撤销 */
+/* 用户可编辑的字段按组判定（撤销/合并只看这些）；系统回写字段：pomodoros、clickupTaskId、clickupUrl，独立合并、撤销从不碰。
+   updatedAt 只随用户编辑前进（系统回写不再推它），是无戳旧数据软合并判新旧的依据 */
+/* 字段组：同组字段语义上一起变（完成状态与完成时间），合并/撤销按组判定 */
+const USER_FIELD_GROUPS = [["text"], ["completed", "completedAt"], ["priority"], ["category"], ["dueDate"], ["createdAt"]];
+function sameField(a, b){
+  return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+}
+function groupEq(a, b, g){ return g.every((f) => sameField(a?.[f], b?.[f])); }
+function userEq(a, b){ return USER_FIELD_GROUPS.every((g) => groupEq(a, b, g)); }
+/* ---- 审查九：字段组写入戳 ---- */
+function makeStamp(by, op, rev, over){ return over ? { by, op, rev, over } : { by, op, rev }; }
+function stampOf(t, gi){ return (t && t._fw && t._fw[FW_KEYS[gi]]) || null; }
+/* 完整相等（含 over）：用于「这组相对基线变没变」——over 也是合并留下的信息，不能被当成没变丢掉 */
+function stampEq(a, b){ return sameField(a || null, b || null); }
+/* 值归属相等（只看 by+op，不看写入者 wby）：用于「这组当前的值是不是这一步写的」 */
+function stampIsOp(st, op){ return !!st && !!op && st.by === TAB_ID && (st.op === op || st.op === UNDO_OP_PREFIX + op); }
+/* 戳的两种身份：by/op = 当前值属于哪一步操作（撤销判定只看它）；rev/wby = 这一次落下的写（版本单调，wby 缺省即 by）。
+   撤销写回：值是还原的，rev 必须是新写（取当前单调时钟 +1，绝不回退）——否则迟到的回显快照凭旧 rev 复活已撤销的编辑；
+   但值仍属于被还原的那次写：by/op 原样保留（别页的也一样，wby 记成本页），那一步之后撤销时还认得出自己。
+   旧存档里本页撤销写回的 op 是 "undo>原 op"，stampIsOp 仍兼容 */
+const UNDO_OP_PREFIX = "undo>";
+function undoStamp(restored, undone){
+  /* 撤销消费掉的写：刚撤销的那次、以及换成新 rev 的还原值原来那次——迟到快照不得把它们重新挂回链上 */
+  const gone = goneList([undone && undone.gone, restored && restored.gone], [undone, restored]);
+  if (!restored) return withGone(makeStamp(TAB_ID, "undo", nextStampRev()), gone);
+  const st = { ...makeStamp(restored.by, restored.op, nextStampRev()), over: restored.over, cut: restored.cut, gone };
+  if (restored.by !== TAB_ID) st.wby = TAB_ID;
+  /* 还原值底下的写入链照带：链上更早的写（含别页的）之后撤销时还要靠它找到自己、露出它盖住的值 */
+  return chainStamp(st, 0);
+}
+function stampWriter(st){ return (st && (st.wby || st.by)) || null; }
+/* 别页落下的写（按写入者：本页自己更早的写——含本页还原的别页值——回显回来不算「远端写」，合并时不能挂成 over） */
+function foreignStamp(st){ return !!st && stampWriter(st) !== TAB_ID; }
+/* 值属于别页的操作（按值归属）：本页盖住它时要挂 over，那页之后撤销才能在链里找到自己 */
+function foreignOwner(st){ return !!st && st.by !== TAB_ID; }
+function stampRev(st){ return st && Number.isFinite(st.rev) ? st.rev : 0; }
+/* mrev：只改写入链（撤销裁剪）时盖的元数据版本，值归属（by/op/rev）不变。同一次写的两份副本比新旧用 stampVer——
+   否则裁剪前后的链 by/op/rev 完全相同，旧快照平手胜出，把已撤销的那环装回去；不同的写之间只比 rev。
+   alive：撤销删除时盖的「条目在此版本仍存活」标记（见 reviveItem），同样不改值归属；带它的副本也新于不带的 */
+function stampAlive(st){ return st && Number.isFinite(st.alive) ? st.alive : 0; }
+function stampVer(st){ return Math.max(stampRev(st), st && Number.isFinite(st.mrev) ? st.mrev : 0, stampAlive(st)); }
+/* 按 by/op/rev 重建戳时带上写入元数据：mrev、alive 与写入者 wby */
+function withMrev(out, src){
+  if (src && Number.isFinite(src.mrev)) out.mrev = src.mrev;
+  if (src && Number.isFinite(src.alive)) out.alive = src.alive;
+  if (src && src.wby && src.wby !== out.by) out.wby = src.wby;
+  return withGone(out, src && src.gone);
+}
+/* gone：撤销/裁剪时实际从链上拿掉的写的身份 [by, op, rev]（有上限）。挂接远端写时只拒绝这些身份——
+   不能拿版本号代表「已见」：撤销那一刻还没到达的并发远端写版本可能更小，它仍要挂进链，之后撤销才露得出来 */
+const MAX_GONE = 16;
+function withGone(out, gone){
+  if (gone && gone.length) out.gone = gone;
+  return out;
+}
+function goneList(lists, sts){
+  const out = [];
+  const push = (g) => { if (!out.some((x) => x[0] === g[0] && x[1] === g[1] && x[2] === g[2])) out.push(g); };
+  for (const l of lists) if (l) l.forEach(push);
+  for (const s of sts) if (s) push([s.by, s.op, s.rev]);
+  return out.slice(-MAX_GONE);
+}
+/* 远端写 rs 是否已在 ts 的链上（ts 自己或某一环），或是 ts/链上各环记下的已撤销/已裁剪的写 */
+function isKnownWrite(ts, rs){
+  for (let s = ts; s; s = s.over && s.over.st){
+    if (s.by === rs.by && s.op === rs.op && s.rev === rs.rev) return true;
+    if (s.gone && s.gone.some((g) => g[0] === rs.by && g[1] === rs.op && g[2] === rs.rev)) return true;
+  }
+  return false;
+}
+function sameWrite(a, b){ return !!a && !!b && a.by === b.by && a.op === b.op && a.rev === b.rev && stampWriter(a) === stampWriter(b); }
+/* over 链：每一环 = 被盖住的那次写（值 v + 它自己的戳 st，st 可再带 over）。撤销要沿链找「最近一个仍有效的写」，
+   所以链必须完整保留；只截到 MAX_OVER_DEPTH 环，截断处标 cut。
+   { lost: true } = 这一环的写已被撤销、但它盖住的值已不可知 → 撤销到这里时不动该组，绝不退回更早的历史值 */
+const MAX_OVER_DEPTH = 8;
+function chainStamp(st, depth){
+  if (!st) return null;
+  const out = withMrev(makeStamp(st.by, st.op, st.rev), st);
+  const o = st.over;
+  if (o && depth >= MAX_OVER_DEPTH) out.cut = true;
+  else if (o) out.over = o.lost ? { lost: true } : { v: o.v, st: chainStamp(o.st, depth + 1) };
+  else if (st.cut) out.cut = true;
+  return out;
+}
+/* 本页这一步（op）撤销时，当前戳已是别处的写：在当前戳的 over 链里找这一步那一环，换成它盖住的值
+   （它自己的 over；没有就是撤销步的 before），之后链上更晚的写被撤销时才不会把已撤销的值露出来。
+   base：before 里这一组 { v, st }。找不到返回 null */
+function spliceUndoneLink(st, op, base){
+  const o = st && st.over;
+  if (!o || o.lost) return null;
+  let link;
+  if (stampIsOp(o.st, op)) link = o.st.over || (!o.st.cut && base) || { lost: true };
+  else {
+    const deeper = spliceUndoneLink(o.st, op, base);
+    if (!deeper) return null;
+    link = { v: o.v, st: deeper };
+  }
+  return { ...st, over: link };
+}
+/* 链上属于本页这一步（op）的那一环的戳（spliceUndoneLink 换掉的就是它） */
+function opLinkStamp(st, op){
+  for (let o = st && st.over; o && o.st; o = o.st.over) if (stampIsOp(o.st, op)) return o.st;
+  return null;
+}
+/* 写时复制：_fw 在浅拷贝的条目之间共享引用，绝不原地改 */
+function setStamp(t, gi, st){
+  const fw = { ...(t._fw || {}) };
+  if (st) fw[FW_KEYS[gi]] = st; else delete fw[FW_KEYS[gi]];
+  if (Object.keys(fw).length) t._fw = fw; else delete t._fw;
+}
+function copyGroup(out, src, gi){
+  for (const f of USER_FIELD_GROUPS[gi]) out[f] = src[f];
+  setStamp(out, gi, stampOf(src, gi));
+}
+/* 这组相对基线变过：值变了，或戳变了（有人写过，哪怕写成同值） */
+function groupChanged(x, base, gi){
+  return !groupEq(x, base, USER_FIELD_GROUPS[gi]) || !stampEq(stampOf(x, gi), stampOf(base, gi));
+}
+function nextStampRev(){ stampClock = Math.max(Date.now(), stampClock + 1); return stampClock; }
+function observeStamps(list){
+  for (const t of list || []){
+    if (!t || !t._fw) continue;
+    for (const k of Object.keys(t._fw)){
+      for (let st = t._fw[k]; st; st = st.over && st.over.st) stampClock = Math.max(stampClock, stampVer(st));
+    }
+  }
+}
+/* 含 over 链：本页在合并里保留自己较旧的值时，较新的远端写只留在链上——它同样晚于更早的删除（审查十四③）。
+   只比真正的写（rev）与撤销删除的 alive：跳过的撤销裁剪链时盖的 mrev 是那一刻的时钟，值没变，
+   拿它和墓碑比会让已删条目凭一次无效撤销复活（审查十五①） */
+function itemMaxStampRev(t){
+  let m = 0;
+  for (let gi = 0; gi < FW_KEYS.length; gi++){
+    const st = stampOf(t, gi);
+    m = Math.max(m, stampRev(st), stampAlive(st), overRev(st, stampRev));
+  }
+  return m;
+}
+/* 审查十一④：删除墓碑。快照里缺一条分不清「没见到」还是「删了」，软合并只能 add-wins——迟到的旧快照会把
+   已删条目补回并写回盘。所以删除本身也要有版本：rev 取写入戳同一个单调时钟，随盘快照（_tomb）传播、按 rev 取大合并。
+   与条目比版本：墓碑 rev 大于条目全部字段戳的最大版本 → 删除胜出；条目在墓碑之后又被写过（撤销删除、别页编辑）→
+   条目胜出、墓碑作废。只保留 30 天、最多 500 条：更老的快照迟到到这种程度，退回 add-wins */
+const TOMB_KEEP = 500;
+const TOMB_TTL_MS = 30 * DAY_MS;
+function sanitizeTomb(tb){
+  if (!tb || typeof tb !== "object" || Array.isArray(tb)) return null;
+  const rev = Number(tb.rev), at = Number(tb.at);
+  if (!Number.isFinite(rev) || rev <= 0 || rev > Number.MAX_SAFE_INTEGER) return null;
+  const str = (s) => (typeof s === "string" && s.length <= 128 ? s : "");
+  return { rev, by: str(tb.by), op: str(tb.op), at: Number.isFinite(at) && at > 0 && at <= MAX_JS_TIME ? at : 0 };
+}
+function payloadTombs(p){
+  const src = p && !Array.isArray(p) ? p._tomb : null;
+  if (!src || typeof src !== "object" || Array.isArray(src)) return [];
+  const out = [];
+  for (const id of Object.keys(src).slice(0, TOMB_KEEP * 2)){
+    if (!id || id.length > 64) continue;
+    const tb = sanitizeTomb(src[id]);
+    if (tb) out.push([id, tb]);
+  }
+  return out;
+}
+/* 同 rev 的两枚墓碑（两页同一毫秒删除同一条）按 by、op、at 确定性决胜：各页取同一枚，
+   否则双方都认为盘上墓碑与内存不同而写回，互相触发 storage 事件无限互写 */
+function tombBeats(a, b){
+  if (a.rev !== b.rev) return a.rev > b.rev;
+  if (a.by !== b.by) return a.by > b.by;
+  if (a.op !== b.op) return a.op > b.op;
+  return (a.at || 0) > (b.at || 0);
+}
+function putTomb(map, id, tb){ const cur = map.get(id); if (!cur || tombBeats(tb, cur)) map.set(id, tb); }
+/* 审查十三①：新格式快照（_tomb 对象 + 数字 _tombH）里每次 rev 大于 _tombH 的删除都带墓碑，缺席条目没有墓碑
+   只说明写入方没见过它（比如它读盘后、写盘前别页刚新增的）。旧格式（裸数组、无 _tomb 或无 _tombH，含十二轮写入方：
+   它裁剪墓碑不记视界）返回 null，缺席仍按删除处理 */
+function payloadTombHorizon(p){
+  if (!p || Array.isArray(p) || !p._tomb || typeof p._tomb !== "object" || Array.isArray(p._tomb)) return null;
+  const h = p._tombH;
+  return typeof h === "number" && Number.isFinite(h) && h >= 0 && h <= Number.MAX_SAFE_INTEGER ? h : null;
+}
+function raiseTombHorizon(rev){ if (rev > tombHorizon) tombHorizon = Math.min(rev, Number.MAX_SAFE_INTEGER); }
+/* 旧数据没有 _tomb：不采纳墓碑。旧格式写入方的删除不留墓碑，把视界推到当前时钟——
+   之后本页写出的快照里缺席的旧条目仍按删除处理，别页不会凭本页快照复活旧格式写入方删掉的条目 */
+function adoptTombs(p){
+  for (const [id, tb] of payloadTombs(p)){
+    putTomb(tombs, id, tb);
+    stampClock = Math.max(stampClock, tb.rev);   // 之后的写（撤销删除）必须比见过的删除新
+  }
+  const h = payloadTombHorizon(p);
+  raiseTombHorizon(h == null ? Math.max(stampClock, Date.now()) : h);
+}
+/* 本地有、快照 p 缺席的条目是否保留：有墓碑 → 保留为候选，由 dropBuried 比版本；新格式且条目写入版本不低于
+   视界 → 保留（写入方没见过它，新增胜出）；否则（旧格式 / 视界外）缺席即删除，视界推过该条目，
+   本页之后的快照照样把它的缺席当删除传下去 */
+function keepAbsent(p, t){
+  if (tombs.has(t.id)) return true;
+  const h = payloadTombHorizon(p), m = itemMaxStampRev(t);
+  if (h != null && m >= h) return true;
+  raiseTombHorizon(m + 1);
+  return false;
+}
+function buryItems(items, op){
+  if (!items.length) return;
+  observeStamps(items);
+  const tb = { rev: nextStampRev(), by: TAB_ID, op: op || "delete", at: Date.now() };
+  for (const t of items) tombs.set(t.id, { ...tb });
+}
+/* 审查十二③/十三①：条目集合跟盘/远端走时，本地有、对方快照 p 缺席的条目先不按缺席删——有墓碑的补回候选集合，
+   由 dropBuried 统一比版本（本地在删除之后又写过 → 条目胜出）；新格式快照缺席且无墓碑的同样补回（见 keepAbsent）。
+   须在 adoptTombs 之后调用：对方快照带来的墓碑要先并进来。
+   补回的条目插在本地前一个邻居之后（没有就置顶），不追加到末尾——否则新增的置顶任务会跳到最后，且这个顺序落盘传给各页（审查十四⑦） */
+function addTombContested(list, local, p){
+  const ids = new Set(list.map((t) => t.id));
+  const keep = new Set(local.filter((t) => !ids.has(t.id) && keepAbsent(p, t)).map((t) => t.id));
+  return keep.size ? insertAtNeighbors(list, local, keep) : list;
+}
+/* 把 ref 里 id 属于 keep 的条目插进 list：放在 ref 中离它最近、已在结果里的前一个邻居之后（没有就置顶）。
+   按 ref 顺序逐条插，先插回的条目也能当后面条目的邻居 */
+function insertAtNeighbors(list, ref, keep){
+  const out = list.slice();
+  for (let i = 0; i < ref.length; i++){
+    if (!keep.has(ref[i].id)) continue;
+    let pos = 0;
+    for (let j = i - 1; j >= 0; j--){
+      const k = out.findIndex((x) => x.id === ref[j].id);
+      if (k >= 0){ pos = k + 1; break; }
+    }
+    out.splice(pos, 0, ref[i]);
+  }
+  return out;
+}
+/* 按墓碑过滤合并结果；条目比墓碑新时墓碑作废 */
+function dropBuried(list){
+  if (!tombs.size) return list;
+  return list.filter((t) => {
+    const tb = tombs.get(t.id);
+    if (!tb) return true;
+    if (tb.rev > itemMaxStampRev(t)) return false;
+    tombs.delete(t.id);
+    return true;
+  });
+}
+function pruneTombs(list){
+  const live = new Map(list.map((t) => [t.id, t]));
+  const cutoff = Date.now() - TOMB_TTL_MS;
+  for (const [id, tb] of tombs){
+    const t = live.get(id);
+    if (t && tb.rev <= itemMaxStampRev(t)) tombs.delete(id);   // 作废：条目更新，不是删除
+    else if (tb.at && tb.at < cutoff){ tombs.delete(id); raiseTombHorizon(tb.rev); }   // 过期：删除仍成立，记进视界
+  }
+  if (tombs.size > TOMB_KEEP){
+    const sorted = [...tombs].sort((a, b) => b[1].rev - a[1].rev);
+    tombs.clear();
+    for (const [id, tb] of sorted.slice(0, TOMB_KEEP)) tombs.set(id, tb);
+    for (const [, tb] of sorted.slice(TOMB_KEEP)) raiseTombHorizon(tb.rev);
+  }
+}
+/* 没有墓碑也写空对象：_tomb + _tombH 是新格式标记（见 payloadTombHorizon） */
+function tombsPayload(){ return Object.fromEntries(tombs); }
+/* 审查十二④：内存墓碑与盘上不同（新增、版本更新、作废）也算待落盘的变化——只合并了墓碑、列表与盘相同时不写，
+   重开页面后墓碑就丢了，迟到的新增快照会复活已删条目。先按 persist 的规则裁剪再比，免得过期墓碑引发无谓写盘 */
+function tombsDifferFrom(p){
+  pruneTombs(todos);
+  const sig = (entries) => JSON.stringify(entries.map(([id, tb]) => [id, tb.rev, tb.by, tb.op, tb.at])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+  return sig([...tombs]) !== sig(payloadTombs(p)) || payloadTombHorizon(p) !== tombHorizon;
+}
+/* 撤销删除插回的条目：只给一枚戳盖 alive（值归属 by/op/rev 不变），让它比删除墓碑新——否则持有墓碑的页面会再次删掉它 */
+const REVIVE_GROUP = FW_KEYS.indexOf("createdAt");
+function reviveItem(t){
+  const out = { ...t };
+  const rev = nextStampRev();
+  const gi = stampOf(out, REVIVE_GROUP) ? REVIVE_GROUP : ALL_GROUPS.find((g) => stampOf(out, g));
+  if (gi == null) setStamp(out, REVIVE_GROUP, makeStamp(TAB_ID, "revive", rev));
+  else setStamp(out, gi, { ...stampOf(out, gi), alive: rev });
+  return out;
+}
+function newOpId(){ return TAB_ID + "#" + (++opCounter); }
+/* 当前写入归属的操作：未封口的撤销步（mutator 刚 snapshot 过）就用它的 op，否则另起一个 */
+function currentOpId(){ return openUndoEntry && !openUndoEntry.after ? openUndoEntry.op : newOpId(); }
+/* 本页写了条目 t 的这些字段组：盖同一个戳（同一次写入共享 rev） */
+function stampWrite(t, gis, op){
+  if (!gis.length) return;
+  const st = makeStamp(TAB_ID, op || currentOpId(), nextStampRev());
+  const e = openUndoEntry;
+  const own = e && !e.after && e.op === st.op;
+  /* 被盖住的那次写（值 + 完整戳链）。值取撤销步的 before，只有 before 的戳就是被盖住的那枚时才可信
+     （before 之后会被 rebase，所以在写入这一刻定下来）。
+     盖住的是别页的写 → 挂成 over：那页之后撤销时据此在链里换掉自己那一环，本页再撤销才不会露出别页已撤销的值。
+     盖住本页更早的写同样挂 over：它的链与 gone 记着已见/已撤销的写，丢掉后迟到的旧事件会凭 overRev=0 挂上来，
+     撤销时露出已撤销或较旧的值（审查十四⑥）。但本页自己的前值不带链/gone/cut 时挂上去不增加信息——不挂 over，
+     撤销照样从 before 还原同一个值与戳；否则每次自写都嵌套整份前值，存储膨胀数倍（审查十五②）。
+     没有可信基线（或不挂）时至少带上前值的 gone */
+  const s = own ? e.todos.find((x) => x.id === t.id) : null;
+  if (own && !e.wrote) e.wrote = new Map();
+  if (own && !e.wroteBase) e.wroteBase = new Map();
+  for (const gi of gis){
+    const prev = stampOf(t, gi);
+    const key = t.id + "\u0000" + gi;
+    const base = s && stampEq(stampOf(s, gi), prev) ? { v: pickGroup(s, USER_FIELD_GROUPS[gi]), st: prev } : null;
+    const nest = base && prev && (foreignOwner(prev) || prev.over || prev.gone || prev.cut) ? base : null;
+    const over = nest || (prev && prev.by === TAB_ID && prev.op === st.op ? prev.over : null);
+    const gone = nest ? null : prev && prev.gone;
+    setStamp(t, gi, over ? chainStamp({ ...st, over, gone }, 0) : withGone({ ...st }, gone));
+    /* 记到未封口的撤销步上：撤销只反做「这一步亲手写过」的组。
+       不能靠 before/after 之差——同步连续操作时 after 要到下一次 snapshot/撤销才封口，
+       期间合并进来的远端写会混进 after */
+    if (own){
+      if (!e.wroteBase.has(key)) e.wroteBase.set(key, base);   // 同一步多次写同一组：以第一次盖住的为准
+      e.wrote.set(key, st);
+    }
+  }
+}
+const ALL_GROUPS = USER_FIELD_GROUPS.map((_, gi) => gi);
+/* 盘快照的修订号（旧版没有 → null） */
+function payloadRev(p){ return p && !Array.isArray(p) && Number.isFinite(p.rev) ? p.rev : null; }
+/* 审查十③：全局修订号只是提示，绝不据此整份丢弃快照——两页交错「读-改-写」会写出同号快照，盘上修订号也会回退，
+   按号丢弃会吞掉含未合并编辑的那份。只有「同号、同写入页、同内容」（同一份 payload 重复投递）才算已合并而跳过；
+   其余一律逐组按写入戳合并，陈旧内容在戳比较里自然落败。
+   内容含墓碑（_tomb/_tombH）：合成快照可能与盘上那份同号同写入页同列表、只多带别页的删除，不能当成同一份跳过（审查十四⑤） */
+const MERGED_SNAPSHOT_KEEP = 32;
+const mergedSnapshotKeys = [];
+function hashStr(s){
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36) + ":" + s.length;
+}
+function snapshotKey(p){
+  const r = payloadRev(p);
+  if (r == null || !Array.isArray(p.todos)) return null;
+  return r + "\u0000" + (p.writer || "") + "\u0000" + hashStr(JSON.stringify([p.todos, p._tomb ?? null, p._tombH ?? null]));
+}
+function sameSnapshot(a, b){ const k = snapshotKey(a); return k != null && k === snapshotKey(b); }
+function isMergedSnapshot(p){ const k = snapshotKey(p); return k != null && mergedSnapshotKeys.includes(k); }
+function observePayload(p){
+  const r = payloadRev(p);
+  if (r != null && r > lastObservedRev) lastObservedRev = r;
+  const k = snapshotKey(p);
+  if (k == null || mergedSnapshotKeys.includes(k)) return;
+  mergedSnapshotKeys.push(k);
+  if (mergedSnapshotKeys.length > MERGED_SNAPSHOT_KEEP) mergedSnapshotKeys.shift();
+}
+function snapshotList(p){ return Array.isArray(p) ? p : (p && Array.isArray(p.todos) ? p.todos : []); }
+/* 戳链见过的最大 rev：本页在三方合并里胜出时戳保留自己的 rev，但它盖住了链上（可能更新的）远端写 */
+function overRev(st, ver = stampVer){
+  let m = 0;
+  for (let o = st && st.over; o && o.st; o = o.st.over) m = Math.max(m, ver(o.st));
+  return m;
+}
+/* 远端写 rs 能否挂成本地戳 ts 的 over：须比链上每一环都新，不是链上已有的写，也不是撤销/裁剪时已拿掉的写（gone）——
+   旧快照不得把它们重新引入；rs 与链上各环是不同的写，只比 rev——mrev 不当「已见」截断，否则会误拦撤销时尚未到达的并发写 */
+function canAttachOver(ts, rs){
+  return foreignStamp(rs) && stampRev(rs) > overRev(ts, stampRev) && !isKnownWrite(ts, rs);
+}
+/* a 的链是否包含 b 链上的每一环（按身份，含 a 记下的 gone） */
+function chainCovers(a, b){
+  for (let o = b && b.over; o && o.st; o = o.st.over) if (!isKnownWrite(a, o.st)) return false;
+  return true;
+}
+/* 远端这组的写是否比本地新：比整条链的最大版本；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端。
+   mrev 只在同一次写的两份副本之间决胜（裁剪过的链新于未裁剪的）；不同的写只比 rev——
+   裁剪时盖的 mrev 是撤销那一刻的时钟，不代表那次写更新，拿它排序会让被裁剪的旧写压过他人更新的编辑（审查十四②）。
+   同一次写的两份副本平手：链包含对方的一方胜——挂接远端写不推版本，无链的迟到回显不得剥掉别处挂上的 over（审查十四①） */
+function remoteStampWins(ts, rs){
+  const same = sameWrite(ts, rs), ver = same ? stampVer : stampRev;
+  const ct = Math.max(ver(ts), overRev(ts, ver)), cr = Math.max(ver(rs), overRev(rs, ver));
+  if (ct !== cr) return cr > ct;
+  if (same){
+    const tc = chainCovers(ts, rs), rc = chainCovers(rs, ts);
+    if (tc !== rc) return rc;
+  }
+  return !(ver(ts) < ct && ver(rs) === cr);
+}
+/* 同一次写的两份副本相遇：over 链按 remoteStampWins 取更完整的一份，写入元数据合并——alive、mrev 取大，gone 取并集。
+   整份取一边会丢另一边的标记：撤销删除盖了 alive 的副本输给 mrev 更大的裁剪副本时 alive 丢失，
+   持有墓碑的页面会再次删掉已撤销删除的条目（审查十六①） */
+function mergeSameWrite(ts, rs){
+  const base = remoteStampWins(ts, rs) ? rs : ts, other = base === rs ? ts : rs;
+  /* 键序与 sanitizeStamp 一致：stampEq 按 JSON 比较，合并结果与读回的盘上副本才判得相等，不会反复写盘 */
+  const out = makeStamp(base.by, base.op, base.rev);
+  if (base.wby) out.wby = base.wby;
+  const mrev = Math.max(Number.isFinite(base.mrev) ? base.mrev : 0, Number.isFinite(other.mrev) ? other.mrev : 0);
+  const alive = Math.max(stampAlive(base), stampAlive(other));
+  if (mrev > 0) out.mrev = mrev;
+  if (alive > 0) out.alive = alive;
+  const gone = goneList([base.gone, other.gone], []);
+  if (gone.length) out.gone = gone;
+  if (base.over) out.over = base.over;
+  else if (base.cut) out.cut = true;
+  return stampEq(out, base) ? base : out;
+}
+/* 远端条目 r 整条采纳时，并入本地 t 里同一次写副本的元数据 */
+function withSameWriteMeta(r, t){
+  let out = null;
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    const ts = stampOf(t, gi), rs = stampOf(r, gi);
+    if (!sameWrite(ts, rs) || stampEq(ts, rs) || !groupEq(t, r, g)) return;
+    const m = mergeSameWrite(ts, rs);
+    if (!stampEq(m, rs)){ if (!out) out = { ...r }; setStamp(out, gi, m); }
+  });
+  return out || r;
+}
+/* 系统字段独立合并：番茄计数单调取大；ClickUp 关联哪边有留哪边（taskId 一旦写入不会改） */
+function mergeSystemFields(ours, theirs){
+  const link = ours.clickupTaskId ? ours : (theirs.clickupTaskId ? theirs : ours);
+  return {
+    pomodoros: Math.max(ours.pomodoros || 0, theirs.pomodoros || 0),
+    clickupTaskId: link.clickupTaskId || null,
+    clickupUrl: link.clickupTaskId ? (link.clickupUrl || null) : (ours.clickupUrl || theirs.clickupUrl || null),
+  };
+}
+
+/* 撤销 = 操作级逆操作，不是整条快照回滚。
+   每个撤销步记下操作前（before）、操作刚完成时（after）两份内存，以及这一步亲手写过的
+   字段组（wrote，写入时盖的戳，审查九）。撤销时字段编辑只看写入戳：当前戳仍是这一步的组才反做，
+   之后合并进来的远端编辑、系统回写（番茄/ClickUp 关联）一律原样保留；after 只用于顺序与删除。
+   before 在 snapshot 时拍；after 在当轮微任务、下一次 snapshot 或 undo 时封口。
+   封口前流进内存的任何远端内容（mutator 内部的 syncTodosFromDisk、persist 里的
+   恢复合并、同步投递的 storage 事件）都由 rebaseOpenUndo 按字段组并进 before，
+   保证差值里只有本地操作。 */
+let openUndoEntry = null;
+function cloneList(list){ return list.map((t) => ({ ...t })); }
+function closeUndoEntry(entry){
+  if (!entry) return;
+  if (!entry.after) entry.after = cloneList(todos);
+  if (openUndoEntry === entry) openUndoEntry = null;
+}
+/* 撤销步封口前有远端内容流进内存（storage 事件、mutator 内的 syncTodosFromDisk、
+   persist 里的恢复合并）：把远端那部分按字段组并进 before，使 before→after 的差值
+   只剩本地操作本身。远端没改的字段组保持 before 原值（本地操作可能已改过它）。 */
+function rebaseOpenUndo(prev, next){
+  const e = openUndoEntry;
+  if (!e || e.after) return;
+  const prevMap = new Map(prev.map((t) => [t.id, t]));
+  const nextMap = new Map(next.map((t) => [t.id, t]));
+  const sIds = new Set(e.todos.map((t) => t.id));
+  let base = [];
+  for (const s of e.todos){
+    const p = prevMap.get(s.id), n = nextMap.get(s.id);
+    if (p && !n) continue;                       // 远端删了
+    if (!p || !n){ base.push(s); continue; }     // 本地操作已删掉的条目：留在 before 里
+    const out = { ...s };
+    USER_FIELD_GROUPS.forEach((g, gi) => {
+      if (!groupChanged(n, p, gi)) return;       // 远端没动这组（值与写入戳都没变）
+      if (stampIsOp(stampOf(n, gi), e.op)) return;   // 仍是本步自己写的值（合并只给它挂了 over）：before 保持操作前原值
+      copyGroup(out, n, gi);                     // 值连同远端的戳一起并进 before
+    });
+    for (const f of ["pomodoros", "clickupTaskId", "clickupUrl"]) out[f] = n[f];
+    if (!sameField(p.updatedAt, n.updatedAt)) out.updatedAt = n.updatedAt;
+    base.push(out);
+  }
+  for (const n of next){
+    if (!prevMap.has(n.id) && !sIds.has(n.id)) base.push({ ...n });   // 远端新增
+  }
+  /* 顺序：本地操作还没改过相对顺序时，before 跟随远端的新顺序 */
+  const commonPrev = prev.filter((t) => sIds.has(t.id)).map((t) => t.id).join("\u0000");
+  const commonS = e.todos.filter((t) => prevMap.has(t.id)).map((t) => t.id).join("\u0000");
+  if (commonPrev === commonS){
+    const byId = new Map(base.map((t) => [t.id, t]));
+    const ordered = next.filter((t) => byId.has(t.id)).map((t) => byId.get(t.id));
+    const placed = new Set(ordered.map((t) => t.id));
+    for (let i = 0; i < base.length; i++){
+      const t = base[i];
+      if (placed.has(t.id)) continue;
+      let pos = 0;
+      for (let j = i - 1; j >= 0; j--){
+        const k = ordered.findIndex((x) => x.id === base[j].id);
+        if (k >= 0){ pos = k + 1; break; }
+      }
+      ordered.splice(pos, 0, t);
+      placed.add(t.id);
+    }
+    base = ordered;
+  }
+  e.todos = base;
+}
 function snapshot(label){
-  undoStack.push({ label, todos: todos.map((t) => ({ ...t })), pomoTaskId:pomo.taskId });
+  if (openUndoEntry) closeUndoEntry(openUndoEntry);
+  const entry = { label, todos: cloneList(todos), pomoTaskId:pomo.taskId, after:null, seq: ++undoSeq, op: newOpId() };
+  undoStack.push(entry);
+  openUndoEntry = entry;
+  /* 同步 mutator 在本轮内改完内存；没走 persist 的路径由微任务封口 */
+  Promise.resolve().then(() => closeUndoEntry(entry));
   if (undoStack.length > UNDO_DEPTH) undoStack.shift();
   syncUndoBtn();
 }
+/* 审查七①（沿用）：当前已不在内存里的条目 id 是哪一个撤销步删掉的（栈顶往下第一个 before 有、after 无的步）。
+   中途遇到 after 里仍有它的步 → 是非撤销路径删的，返回 null */
+function ownerStepForDelete(id){
+  for (let i = undoStack.length - 1; i >= 0; i--){
+    const e = undoStack[i];
+    const s = e.todos.some((t) => t.id === id);
+    const a = (e.after || todos).some((t) => t.id === id);
+    if (a) return null;
+    if (s) return e;
+  }
+  return null;
+}
+/* 审查九：本页删掉的条目在合并时看到远端仍有（且相对基线改过）的版本 → 挂在删掉它的那一步上
+   （不是全局侧表：随撤销步出栈而消失，跨代天然不复用）。同一步内只接受写入戳不比已记录版本旧的，
+   陈旧快照不能让它倒退 */
+function noteDeletedRemote(r){
+  const e = ownerStepForDelete(r.id);
+  if (!e) return;
+  if (!e.deletedRemote) e.deletedRemote = new Map();
+  const prev = e.deletedRemote.get(r.id);
+  if (!prev || itemMaxStampRev(r) >= itemMaxStampRev(prev)) e.deletedRemote.set(r.id, { ...r });
+}
+/* 审查九：撤销删除时的恢复版本——本页删除前快照 s 与远端最新版 r 逐组取「更新的那次写」：
+   戳相同 → 同一次写；值相同戳不同 → 采用远端戳（远端独立写过）；否则 rev 大者胜，平手偏向远端。
+   本页胜出且远端值不同 → 挂 over，之后撤销本页更早那步时露出远端值而不是历史 before。
+   两边都没戳（旧数据）且值不同 → 取远端（拿不准时绝不把旧值写回盖掉远端） */
+function restoreFromRemote(s, r){
+  const out = { ...s };
+  let tookTheirs = false;
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    const ss = stampOf(s, gi), rs = stampOf(r, gi);
+    if (stampEq(ss, rs) && groupEq(s, r, g)) return;
+    if (groupEq(s, r, g)){
+      /* 同值也比完整写入版本：远端同值的旧写不得盖掉本页较新的戳 */
+      setStamp(out, gi, sameWrite(ss, rs) ? mergeSameWrite(ss, rs) : foreignStamp(rs) ? (remoteStampWins(ss, rs) ? rs : ss) : (ss || rs));
+      return;
+    }
+    if ((!ss && !rs) || stampRev(rs) >= stampRev(ss)){ copyGroup(out, r, gi); tookTheirs = true; return; }
+    /* 没有基线可判：只有确是别页写的（带别页戳）才算被盖住的远端写；本页自己更早的落盘版不挂 over */
+    if (ss && foreignStamp(rs)) setStamp(out, gi, withMrev(makeStamp(ss.by, ss.op, ss.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ss));
+  });
+  Object.assign(out, mergeSystemFields(s, r));
+  if (tookTheirs) out.updatedAt = Math.max(s.updatedAt || 0, r.updatedAt || 0);
+  return out;
+}
+function pickGroup(o, g){ return Object.fromEntries(g.map((f) => [f, o?.[f]])); }
+/* （审查九）除推进写入戳时钟外无副作用：把 entry 描述的操作在 current（已合并盘上最新）上逆向应用。
+   只看写入戳：这一步写过的组，当前戳仍是这一步的 → 反做（有 over 就露出被盖住的远端值，否则还原 before
+   的值与戳）；戳已换人 → 保留最新值，记进 skipped。与 storage 事件到没到、按什么顺序到无关。
+   diskMap：撤销时盘上的条目（撤销删除时找远端最新版用）。返回 { list, skipped } */
+function invertUndoEntry(entry, current, diskMap){
+  const op = entry.op || null;
+  const skipped = [];
+  const S = entry.todos;
+  const A = entry.after || entry.todos;
+  const sMap = new Map(S.map((t) => [t.id, t]));
+  const aMap = new Map(A.map((t) => [t.id, t]));
+  let out = current.map((t) => ({ ...t }));
+  const wrote = entry.wrote || new Map();
+  const wroteGroup = (id, gi) => wrote.has(id + "\u0000" + gi);
+  /* ① 本操作新增的（before 无、这一步给它盖过戳）：每个用户字段组的当前戳都仍是这一步的、且没挂 over
+     （没有任何一页再写过，哪怕写成同值）才移除；别页写过就保留别人的工作 */
+  out = out.filter((t) => {
+    if (sMap.has(t.id) || !ALL_GROUPS.some((gi) => wroteGroup(t.id, gi))) return true;
+    const untouched = ALL_GROUPS.every((gi) => { const cs = stampOf(t, gi); return stampIsOp(cs, op) && !cs.over; });
+    if (!untouched) skipped.push({ id: t.id, field: "*", reason: "edited-elsewhere" });
+    return !untouched;
+  });
+  /* ② 本操作写过的字段组：当前戳仍是这一步的才反做；系统字段从不碰 */
+  out = out.map((t) => {
+    const s = sMap.get(t.id);
+    if (!s) return t;
+    let next = t, reverted = false;
+    USER_FIELD_GROUPS.forEach((g, gi) => {
+      if (!wroteGroup(t.id, gi)) return;
+      const cs = stampOf(t, gi);
+      if (!stampIsOp(cs, op)){
+        skipped.push({ id: t.id, field: FW_KEYS[gi], reason: "written-elsewhere" });
+        /* 值留给后来的写，但这一步在它的 over 链里那一环必须换掉：否则那次写撤销时会露出本步已撤销的值 */
+        const spliced = spliceUndoneLink(cs, op, (entry.wroteBase && entry.wroteBase.get(t.id + "\u0000" + gi)) || null);
+        if (spliced){
+          if (next === t) next = { ...t };
+          setStamp(next, gi, chainStamp({ ...spliced, mrev: nextStampRev(), gone: goneList([spliced.gone], [opLinkStamp(cs, op)]) }, 0));
+        }
+        return;
+      }
+      /* 盖住的写已撤销、它底下的值又因链截断不可知：宁可不动，也不退回更早的历史值 */
+      if (cs.over && cs.over.lost){ skipped.push({ id: t.id, field: FW_KEYS[gi], reason: "undo-base-lost" }); return; }
+      if (next === t) next = { ...t };
+      reverted = true;
+      if (cs.over){
+        for (const f of g) next[f] = cs.over.v[f];
+        setStamp(next, gi, undoStamp(cs.over.st || null, cs));
+      } else {
+        for (const f of g) next[f] = s[f];
+        setStamp(next, gi, undoStamp(stampOf(s, gi), cs));   // 新 rev；op 仍指向 before 那步，更早那步的撤销认得出自己
+      }
+    });
+    if (reverted) next.updatedAt = Math.max(t.updatedAt || 0, Date.now());
+    return next;
+  });
+  /* ③ 顺序：本操作改了共同条目的相对顺序、且之后没人再排过，才按 before 的顺序排回 */
+  const common = (list) => list.filter((t) => sMap.has(t.id) && aMap.has(t.id)).map((t) => t.id);
+  const sOrder = common(S), aOrder = common(A), cur = out.filter((t) => sMap.has(t.id) && aMap.has(t.id));
+  const curIds = new Set(cur.map((t) => t.id));
+  const proj = (ids) => ids.filter((id) => curIds.has(id)).join("\u0000");
+  const curOrder = cur.map((t) => t.id).join("\u0000");
+  if (proj(sOrder) !== proj(aOrder) && curOrder === proj(aOrder)){
+    const byId = new Map(cur.map((t) => [t.id, t]));
+    const wanted = sOrder.filter((id) => curIds.has(id)).map((id) => byId.get(id));
+    let k = 0;
+    out = out.map((t) => (curIds.has(t.id) ? wanted[k++] : t));
+  }
+  /* ④ 本操作删掉的（before 有、after 无）：现在仍不在就按原位插回（快照里的下一个幸存邻居之前）。
+     远端在删除之后写过它（盘上仍有它、或合并时挂在本步上的远端版）→ 与删除前快照逐组取更新的写，
+     绝不把删除前的历史快照写回盖掉别页的编辑 */
+  const outIds = new Set(out.map((t) => t.id));
+  for (let i = 0; i < S.length; i++){
+    const s = S[i];
+    if (aMap.has(s.id) || outIds.has(s.id)) continue;
+    let pos = out.length;
+    for (let j = i + 1; j < S.length; j++){
+      const p = out.findIndex((t) => t.id === S[j].id);
+      if (p >= 0){ pos = p; break; }
+    }
+    const cands = [entry.deletedRemote && entry.deletedRemote.get(s.id), diskMap && diskMap.get(s.id)].filter(Boolean);
+    let restored = { ...s };
+    for (const c of cands) restored = restoreFromRemote(restored, c);   // 逐组取最新的那次写
+    restored = reviveItem(restored);   // 审查十一④：比本步删除写下的墓碑新
+    out.splice(pos, 0, restored);
+    outIds.add(s.id);
+  }
+  return { list: out, skipped };
+}
+/* 审查四①：脏窗口里撤销前必须先把盘上最新的远端写按 dirtyBase 合进内存并前移基线，
+   再在「最新状态」上做逆操作。否则逆操作基于旧内存，随后的恢复写会把别页对同一条的
+   编辑盖掉（撤销新增时甚至会删掉别页刚编辑过的条目）。
+   读不到/解析不了盘就放弃本次撤销（撤销步留在栈里），绝不拿旧内存去覆盖。
+   返回 true=已合并或无需合并，false=无法确认最新状态 */
+function mergeLatestBeforeDirtyUndo(){
+  if (!localDirty || !storageWritable) return true;   // 不脏走常规 sync；存储不可用时没有别页能写
+  let raw = null;
+  try { raw = localStorage.getItem(STORAGE_KEY); } catch { return false; }
+  let disk = null;
+  if (raw != null){
+    try { disk = JSON.parse(raw); } catch { return false; }
+    if (!disk || typeof disk !== "object") return false;
+    const list = Array.isArray(disk) ? disk : disk.todos;
+    if (!Array.isArray(list)) return false;
+  } else if (Array.isArray(dirtyBase) && dirtyBase.length) {
+    return false;   // 窗口前盘上明明有数据，现在却读成空：当作读失败
+  }
+  if (!Array.isArray(dirtyBase)) dirtyBase = lastAppliedList.map((t) => ({ ...t }));
+  mergeRemoteBeforeRecoveryWrite();   // 盘上是别页写就用它，否则用排队快照；内部前移 dirtyBase
+  return true;
+}
 function undo(){
+  if (!undoStack.length){ syncUndoBtn(); toast("没有可以撤销的操作了"); return false; }
+  if (!mergeLatestBeforeDirtyUndo()){
+    toast("暂时读不到最新数据，为避免覆盖其他页面的改动，这次没有撤销");
+    return false;
+  }
   const snap = undoStack.pop();
   syncUndoBtn();
-  if (!snap){ toast("没有可以撤销的操作了"); return; }
-  /* 与其它 mutator 一样先灌盘上最新内容：远端写可能还排在 storage 事件
-     队列里没投递，不先采纳的话 remoteIds 对它失明——三方合并会把远端
-     删的条目复活、把远端对本页新增条目的编辑当本地改动丢掉 */
+  closeUndoEntry(snap);
+  /* 与其它 mutator 一样先灌盘上最新内容（远端写可能还排在 storage 事件队列里）。
+     不脏时它把盘上内容（含结算标记）采纳进内存；脏窗口里内存领先，远端改动攒在
+     pendingExternal，随后的 persist 会按 dirtyBase 三方合并——两种情况下
+     撤销都只在「当前内存」上做操作级逆操作，不会整条回滚任何已合入的远端字段 */
   syncTodosFromDisk();
-  /* 不整体回滚：先读盘，盘上被别页动过就走三方合并——
-     S=快照、M=内存、D=盘，逐条归因 */
-  let diskList = null;
-  if (!localDirty){
-    try {
-      const d = JSON.parse(store.get(STORAGE_KEY) || "null");
-      const l = d && (Array.isArray(d) ? d : d.todos);
-      if (Array.isArray(l)) diskList = sanitizeList(l).todos;
-      /* 盘上的结算标记一并采纳：undo 后的 persist 会把当前 settledSegs
-         写回去，不先并进来就可能把别页刚记的标记盖掉 */
-      if (d && !Array.isArray(d)) adoptSettledSegs(d.settledSegs || d.settledSeg);
-    } catch { /* 读不出就走纯快照恢复 */ }
+  /* 撤销删除要看盘上是否仍有远端版本（本页删除尚未落盘时，别页的编辑就在盘上） */
+  let diskMap = null;
+  try {
+    const d = JSON.parse(store.get(STORAGE_KEY) || "null");
+    const dl = d && (Array.isArray(d) ? d : d.todos);
+    if (Array.isArray(dl)) diskMap = new Map(sanitizeList(dl).todos.map((t) => [t.id, t]));
+  } catch { diskMap = null; }
+  const inv = invertUndoEntry(snap, todos, diskMap);
+  const next = inv.list;
+  lastUndoSkipped = inv.skipped;
+  const nextIds = new Set(next.map((t) => t.id));
+  buryItems(todos.filter((t) => !nextIds.has(t.id)), UNDO_OP_PREFIX + snap.op);   // 撤销新增/导入也是删除
+  for (const t of next){
+    const prev = todos.find((x) => x.id === t.id);
+    if (!prev || !userEq(prev, t)) remoteIds.delete(t.id);   // 撤销写出的版本是本页的
   }
-  const liveMap = new Map(todos.map((t) => [t.id, t]));
-  /* pomodoros/ClickUp 关联都是系统侧写入不是用户编辑（pushTodoToClickUp
-     回写不压快照）：恢复快照时绝不用旧值盖新值，哪边有留哪边 */
-  const restore = (t) => {
-    const l = liveMap.get(t.id);
-    if (!l) return t;
-    return { ...t,
-      pomodoros: Math.max(l.pomodoros || 0, t.pomodoros || 0),
-      clickupTaskId: l.clickupTaskId || t.clickupTaskId,
-      clickupUrl: l.clickupUrl || t.clickupUrl };
-  };
-  if (diskList){
-    /* 归因靠 remoteIds（条目级）：远端版本流入内存时登记，本页改写时销记——
-       「盘==内存且≠快照」可能是我方编辑也可能是远端编辑流入，全局标志分不清 */
-    const S = new Map(snap.todos.map((t) => [t.id, t]));
-    const M = new Map(todos.map((t) => [t.id, t]));
-    const diskIds = new Set(diskList.map((t) => t.id));
-    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-    let merged = [];
-    for (const d of diskList){
-      const s = S.get(d.id), m = M.get(d.id);
-      if (!s){
-        /* 盘有快照没有：远端内容才保留——版本登记过的、出身是远端的、
-           根本没进过内存的、或盘上版本与内存不同（远端编辑还卡在事件
-           队列没流入）。进内存的都顺手登记为远端；
-           在内存里见过、与盘一致、又没被标 → 我们加的，撤销就该移除 */
-        if (!m || remoteIds.has(d.id) || remoteOriginIds.has(d.id) || !eq(d, m)){
-          remoteIds.add(d.id);
-          if (!m) remoteOriginIds.add(d.id);   // 没进过内存的盘条目：远端新增
-          merged.push(d);
-        }
-        continue;
-      }
-      /* 三方共有：盘≠内存说明远端版较新（远端赢）；盘==内存且≠快照时，
-         登记过的是远端流入（远端赢），没登记的是我方改动（回滚到快照） */
-      if (!m || !eq(d, m) || eq(m, s) || remoteIds.has(d.id)) merged.push(d);
-      else merged.push(s);
-    }
-    /* 快照有而盘没有：登记过的是远端删的（不复活），没登记的是我们删的
-       （按原位插回——找「快照里的下一个幸存邻居」） */
-    const mergedIds = new Set(merged.map((t) => t.id));
-    for (let i = 0; i < snap.todos.length; i++){
-      const s = snap.todos[i];
-      if (mergedIds.has(s.id) || diskIds.has(s.id) || remoteIds.has(s.id)) continue;
-      let at = merged.length;
-      for (let j = i + 1; j < snap.todos.length; j++){
-        const pos = merged.findIndex((t) => t.id === snap.todos[j].id);
-        if (pos >= 0){ at = pos; break; }
-      }
-      merged.splice(at, 0, s);
-      mergedIds.add(s.id);
-    }
-    /* 撤销纯排序：merged 按盘序输出会让「撤销调整顺序」变成无声空操作——
-       合并结果与快照同集合、同内容时，按快照顺序排回 */
-    const byId = new Map(merged.map((t) => [t.id, t]));
-    if (merged.length === snap.todos.length
-        && snap.todos.every((t) => { const g = byId.get(t.id); return g && eq(g, t); })){
-      merged = snap.todos.map((t) => byId.get(t.id));
-    }
-    todos = merged.map(restore);
-    /* 合并态下有 dirtyBase 时 pendingExternal 还要留给恢复合并用，不能清 */
-    if (!dirtyBase) pendingExternal = null;
-  } else {
-    /* 快照恢复兜底（读不出盘/脏窗口）：remoteIds/remoteOriginIds 标记的
-       内存条目是远端内容——可能刚从 pendingExternal 合进来而快照里没有，
-       无脑恢复快照会把它们从内存抹掉（pendingExternal 已被消费时就是
-       永久丢失）。合不进去的就别丢：追加到末尾 */
-    const snapIds = new Set(snap.todos.map((t) => t.id));
-    const remoteOnly = todos.filter((t) =>
-      !snapIds.has(t.id) && (remoteIds.has(t.id) || remoteOriginIds.has(t.id)));
-    /* 对称的一侧也不能漏：快照里有、内存里没有、还带着远端标记的——
-       那是远端删的（标记来源只剩 markRemoteAdopted 的删除登记），
-       无脑恢复等于复活并广播僵尸。注意不能只看标记：远端改过的条目
-       也在 remoteIds 里但仍在内存，得用 liveIds 区分 */
-    const liveIds = new Set(todos.map((t) => t.id));
-    todos = snap.todos
-      .filter((s) => !remoteIds.has(s.id) || liveIds.has(s.id))
-      .map(restore).concat(remoteOnly);
-  }
+  todos = next;
   /* 绑定待办：快照里记过且现在仍有效（在、未完成）就还原；
      否则当前绑定还有效就留着，再不行清掉防悬挂 */
   const restorable = (id) => id && todos.some((t) => t.id === id && !t.completed);
@@ -1418,6 +2131,7 @@ function undo(){
   persist(); render();
   play("r-nod");
   toast(`已撤销：${snap.label}`);
+  return true;
 }
 
 /* ------------------------------------------------------------ 存储提示 */
@@ -1994,6 +2708,7 @@ function addTodo(text, priority, category, dueDate){
     createdAt: now, updatedAt: now, completedAt: null, pomodoros: 0,
     clickupTaskId: null, clickupUrl: null,
   });
+  stampWrite(todos[0], ALL_GROUPS);   // 审查九：新条目的全部用户字段组都是这一步写的
   render(); persist();
   say("add");
 }
@@ -2057,7 +2772,7 @@ function findClickUpBtn(todoId){
  * UI 按钮与 AI Agent 共用。永远 resolve，不 throw。
  * @returns {Promise<{ok:boolean, message?:string, error?:string, code?:string, taskId?:string, url?:string, already?:boolean}>}
  */
-async function pushTodoToClickUp(id, btnEl){
+async function pushTodoToClickUp(id, btnEl, pushOpts){
   const t = todos.find((x) => x.id === id);
   if (!t){
     return { ok:false, code:"NOT_FOUND", error:"找不到该待办", message:"找不到该待办" };
@@ -2100,13 +2815,27 @@ async function pushTodoToClickUp(id, btnEl){
     dueDate: t.dueDate || null,
     todoId: t.id,
   };
+  /* 只有用户在「长时间未确认」提示上点了「重新上传」才允许重建 */
+  if (pushOpts && pushOpts.manualRetry === true) payload.manualRetry = true;
   const snapDue = payload.dueDate;
 
   try {
     const r = await bridge.pushTodo(payload);
     if (!r || !r.ok){
       const err = (r && r.error) || "传到 ClickUp 失败";
-      toast(err);
+      if (r && r.code === "NEEDS_MANUAL_RETRY"){
+        /* 上次提交长时间未确认：不自动重建，把决定交给用户 */
+        toast(err, {
+          label: "重新上传",
+          run: () => {
+            if (confirm("ClickUp 里确实没有这条任务吗？重新上传会再查一次，仍查不到才创建。")){
+              pushTodoToClickUp(id, null, { manualRetry:true });
+            }
+          },
+        });
+      } else {
+        toast(err);
+      }
       console.warn("[clickup] pushTodo 失败：", r);
       return {
         ok:false,
@@ -2169,10 +2898,11 @@ async function pushTodoToClickUp(id, btnEl){
       console.warn("[clickup] pushTodo 回包 id 非法：", r);
       return { ok:false, code:"BAD_RESPONSE", error: msg, message: msg };
     }
-    remoteIds.delete(id);        // 本页回写 taskId，当前版本不再是远端写的
+    /* 系统字段回写不改编辑归因：不动 remoteIds。若这条刚流入了别页的编辑，
+       它仍算远端版本，撤销本页无关操作时不会被回滚成旧正文 */
+    /* updatedAt 是用户编辑时间：系统回写不推它，否则软合并会把本页旧正文当成更新版 */
     live.clickupTaskId = taskId;
     live.clickupUrl = safeUrl || ("https://app.clickup.com/t/" + taskId);
-    live.updatedAt = Date.now();
     persist();
     render();
     const msg = "已传到 ClickUp · " + scheduleHint;
@@ -2209,7 +2939,23 @@ function toggleTodo(id, checkEl){
   syncTodosFromDisk();
   const t = todos.find((x) => x.id === id);
   if (!t) return;
-  const willComplete = !t.completed;
+  applyCompleted(t, !t.completed, rect);
+}
+
+/* 显式设置完成状态（Agent 工具用）：先同步再按目标值写，绝不 toggle——
+   别页刚改过状态而本页还没收到事件时，toggle 会做成相反的操作。
+   返回 null=找不到，"unchanged"=已是目标状态，"changed"=已改 */
+function setCompleted(id, completed){
+  syncTodosFromDisk();
+  const t = todos.find((x) => x.id === id);
+  if (!t) return null;
+  if (t.completed === Boolean(completed)) return "unchanged";
+  applyCompleted(t, Boolean(completed), null);
+  return "changed";
+}
+
+function applyCompleted(t, willComplete, rect){
+  const id = t.id;
   if (willComplete && rect) burst(rect.left + rect.width / 2, rect.top + rect.height / 2);
   snapshot(willComplete ? "标记完成" : "取消完成");
   remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
@@ -2217,6 +2963,7 @@ function toggleTodo(id, checkEl){
   t.completed = willComplete;
   t.completedAt = willComplete ? now : null;
   t.updatedAt = now;
+  stampWrite(t, [USER_FIELD_GROUPS.findIndex((g) => g[0] === "completed")]);
   /* 正在专注的那件事被勾掉了，解绑但不打断计时 */
   if (willComplete && pomo.taskId === id){ pomo.taskId = null; savePomo(); }
   render(); persist();
@@ -2236,7 +2983,10 @@ function updateTodo(id, patch){
   const t = todos.find((x) => x.id === id);
   if (!t) return null;
   remoteIds.delete(id);          // 本页改写后，当前版本不再是远端写的
+  const prevVals = { ...t };
   Object.assign(t, patch, { updatedAt: Date.now() });
+  /* 审查九：只给值真的变了的字段组盖戳（同值的 patch 不算一次写） */
+  stampWrite(t, ALL_GROUPS.filter((gi) => !groupEq(prevVals, t, USER_FIELD_GROUPS[gi])));
   render();
   persist();
   return t;
@@ -2249,7 +2999,7 @@ function removeTodo(id){
   if (idx < 0) return; // 幂等，连点两次不会重复提示
   snapshot("删除待办");
   remoteIds.delete(id);          // 我们的删除：undo 恢复时别误判成远端删的
-  todos.splice(idx, 1);
+  buryItems(todos.splice(idx, 1), currentOpId());
   if (pomo.taskId === id){ pomo.taskId = null; savePomo(); }
   persist(); updateStats();
 
@@ -2272,6 +3022,7 @@ function clearCompleted(){
   if (n === 0){ toast("还没有已完成的待办"); return; }
   snapshot(`清除 ${n} 件已完成`);
   for (const t of todos) if (t.completed) remoteIds.delete(t.id);   // 我们的清除
+  buryItems(todos.filter((t) => t.completed), currentOpId());
   todos = todos.filter((t) => !t.completed);
   render(); persist();
   play("r-shake");
@@ -2360,8 +3111,14 @@ function attachDrag(node, id){
 }
 
 /* ----------------------------------------------------------- 导入/导出 */
+/* 导出永远取应用内存：写盘失败时内存才是最新的（盘上可能是旧版本）。
+   网页导出和 iOS 分享导出（mobile-settings.js）共用这一份快照 */
+function exportSnapshot(){
+  /* 审查九：写入戳是同步内部状态，不进用户备份 */
+  return { v:SCHEMA_VERSION, exportedAt:new Date().toISOString(), todos: todos.map((t) => { const c = { ...t }; delete c._fw; return c; }) };
+}
 function exportJSON(){
-  const blob = new Blob([JSON.stringify({ v:SCHEMA_VERSION, exportedAt:new Date().toISOString(), todos }, null, 2)], { type:"application/json" });
+  const blob = new Blob([JSON.stringify(exportSnapshot(), null, 2)], { type:"application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = `todo-${todayStr()}.json`; a.click();
@@ -2384,6 +3141,11 @@ function importJSON(file){
     syncTodosFromDisk();   // 导入覆盖整张表，更不能拿旧内存垫在底下
     snapshot("导入数据");
     remoteIds.clear(); remoteOriginIds.clear();   // 整张表都是本页写的，远端归因全部作废
+    /* 审查九：导入是本页对整张表的一次写——丢掉文件里带的戳，全部盖上这一步的戳 */
+    const importOp = currentOpId();
+    for (const t of clean){ delete t._fw; stampWrite(t, ALL_GROUPS, importOp); }
+    const importedIds = new Set(clean.map((t) => t.id));
+    buryItems(todos.filter((t) => !importedIds.has(t.id)), importOp);   // 整表替换：旧条目算删除
     todos = clean;
     reconcilePomoTask();
     render(); persist();
@@ -2417,11 +3179,16 @@ function syncTodosFromDisk(){
      persist 再失败就直接退：merged 留在内存，且 persist 会把 dirtyBase
      改记为恢复写（=当前盘内容）——下一个脏窗口的基线本就该是它 */
   if (dirtyBase && pendingExternal){
-    let remoteSrc = pendingExternal;
-    if (parsed && !Array.isArray(parsed) && parsed.writer && parsed.writer !== TAB_ID
-        && Array.isArray(parsed.todos)) remoteSrc = parsed;   // 盘上这份是远端写的，必然 ≥ 排队快照
-    mergeRemoteWindow(remoteSrc, dirtyBase, true);
+    const diskRemote = !!(parsed && !Array.isArray(parsed) && parsed.writer && parsed.writer !== TAB_ID
+        && Array.isArray(parsed.todos));
+    const adopted = mergeRemoteWindow(diskRemote ? parsed : pendingExternal, dirtyBase, true);
+    /* 审查十③：盘上的远端写不一定包含排队快照的全部编辑（交错写可能同号或修订号回退）——再逐组按戳软合并一次 */
+    if (diskRemote && !sameSnapshot(pendingExternal, parsed)) mergeSoftRemote(pendingExternal);
     pendingExternal = null;
+    /* 盘上就是这份远端版：persist 失败时 dirtyBase 取 lastAppliedList，
+       基线必须包含已采纳的远端条目，否则之后删掉它们会被再次合回 */
+    lastAppliedList = adopted.map((t) => ({ ...t }));
+    dirtyBase = null;
     if (!persist()) return false;
     try { parsed = JSON.parse(store.get(STORAGE_KEY) || "null"); } catch { parsed = null; }
     mergedFromDirty = true;
@@ -2435,22 +3202,30 @@ function syncTodosFromDisk(){
      「别页结算+persist」的本地写入会把盘上标记抹掉，给重复记账开窗。
      并集采纳：标记只增，旧写入无法让集合回退 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  /* 只把别页写的快照记为「已合并」：盘上是本页自己的写时，它可能刚盖掉一份本页还没见过的远端写，
+     那份远端写的 storage 事件稍后到达必须仍能被软合并救回，不能被当成陈旧快照丢掉 */
+  if (parsed && !Array.isArray(parsed) && parsed.writer !== TAB_ID) observePayload(parsed);
+  observeStamps(clean);
   lastAppliedList = clean.map((t) => ({ ...t }));   // 盘上内容的最后已知形态：恢复/软合并的基线
-  const same = JSON.stringify(clean) === JSON.stringify(todos);
-  if (!same){ markRemoteAdopted(todos, clean); todos = clean; }   // 外部内容流进内存：undo 归因要登记
-  /* 盘上是我方写却攒着远端快照：那次远端写被我们的 persist 覆盖了，
-     事件快照是唯一幸存副本——软合并把远端新增和较新编辑救回来。
-     （盘上是远端写则快照只可能更旧或已并入，直接丢） */
+  const before = JSON.stringify(todos);
+  adoptTombs(parsed);
+  /* 审查十③：条目集合跟盘走，用户字段逐组按写入戳——本地更新的组（被交错写/修订号回退的盘写冲掉的）保留。
+     盘上条目也要过墓碑：写盘的那页可能还没见过这次删除。盘上缺席但有墓碑的本地条目同样进候选、按版本比墓碑；
+     新格式盘快照缺席且无墓碑的本地条目保留，下面随内存与盘不同一起写回 */
+  const adopted = dropBuried(addTombContested(keepNewerLocalGroups(clean, todos), todos, parsed));
+  if (JSON.stringify(adopted) !== before){ markRemoteAdopted(todos, adopted); todos = adopted; }   // 外部内容流进内存：undo 归因要登记
+  /* 攒着的远端快照不论盘上是谁写的都逐组软合并：盘上是我方写时它可能被覆盖了（快照是唯一幸存副本）；
+     盘上是远端写时也不一定包含它——两页交错写会写出同号快照，修订号也会回退。陈旧内容在戳比较里落败 */
   if (pendingExternal){
-    if (parsed && !Array.isArray(parsed) && parsed.writer === TAB_ID){
-      const before = JSON.stringify(todos);
-      mergeSoftRemote(pendingExternal);
-      if (JSON.stringify(todos) !== before){
-        if (!persist()){ pendingExternal = null; return false; }   // merged 在内存，内容没丢
-        mergedFromDirty = true;
-      }
-    }
+    if (!sameSnapshot(pendingExternal, parsed)) mergeSoftRemote(pendingExternal);
     pendingExternal = null;
+  }
+  const same = JSON.stringify(todos) === before;
+  /* 内存比盘多了编辑：读过最新盘、合并后再写回（persist 的修订号取 max(盘, 已见, 已写)+1，单调）。
+     墓碑同样算：读盘合并、攒着的快照软合并都可能只带来墓碑；恢复写之后 parsed 是重读的盘，墓碑一致不会再写 */
+  if (JSON.stringify(todos) !== JSON.stringify(clean) || tombsDifferFrom(parsed)){
+    if (!persist()) return false;   // merged 在内存，内容没丢
+    if (!same) mergedFromDirty = true;
   }
   reconcilePomoTask();
   /* 外部变更立刻上屏：mutator 入口的早退路径（目标已被别页删了）也必须
@@ -2460,6 +3235,49 @@ function syncTodosFromDisk(){
   return (same && !mergedFromDirty) ? "same" : "applied";
 }
 
+/* 双方都改过同一条时的三方合并：用户字段与系统字段分开判定。
+   · 用户字段逐组：本页这组没动（==基线）→ 取远端；本页动过 → 本页为准。
+     只有系统字段回写（ClickUp taskId/url、番茄入账）的本页版本，用户字段
+     全等于基线，于是远端的正文/状态编辑全部胜出——系统回写绝不给旧正文撑腰。
+   · 系统字段：番茄取大、ClickUp 关联哪边有留哪边。
+   · updatedAt（用户编辑时间）：取实际胜出的用户字段来源中较新的那个 */
+function mergeThreeWay(ours, base, theirs){
+  const out = { ...ours };
+  let tookTheirs = false, keptOurs = false;
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    const oc = groupChanged(ours, base, gi), tc = groupChanged(theirs, base, gi);
+    if (!oc){
+      if (tc) tookTheirs = true;
+      copyGroup(out, theirs, gi);                // 值连同远端戳
+      return;
+    }
+    keptOurs = true;
+    if (!tc) return;                             // 只有本页写过：本页值与戳
+    /* 审查九：双方都写过这组 */
+    const os = stampOf(ours, gi), ts = stampOf(theirs, gi);
+    if (groupEq(ours, theirs, g)){
+      /* 同值：远端独立写下了它——采用远端戳，撤销本页那步不得把它改回 before（审查九①） */
+      if (sameWrite(os, ts)) setStamp(out, gi, mergeSameWrite(os, ts));   // 同一次写、只差写入链：链取更完整者，元数据合并
+      else if (foreignStamp(ts)){   // 同值也比完整写入版本：盘上同值旧写不得盖掉本页较新的戳
+        if (remoteStampWins(os, ts)) setStamp(out, gi, ts);
+        /* 本页戳胜出：远端这次同值写仍是独立编辑，照样挂进 over——撤销本页那步时保留它，而不是退回 before（审查十三②） */
+        else if (os && canAttachOver(os, ts)) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
+      }
+      else if (!ts && os) setStamp(out, gi, makeStamp("remote", "unknown", stampRev(os)));   // 远端是无戳旧版：标成「非本页」
+      /* ts 是本页自己更早的戳（回显）：没有别页写过，保留本页戳 */
+      return;
+    }
+    /* 值不同：本页胜出（策略不变），被盖住的远端值挂在本页戳的 over 上——撤销本页这步时露出它。
+       比链上已有各环都新、且不是撤销/裁剪已拿掉（gone）的远端写才覆盖 over，远端之后的独立写也会换掉整枚戳，所以它始终是最新的 */
+    /* 远端这份是本页自己更早写的（带本页戳的回显）：不是别页的写，不挂 over */
+    if (os && (!ts || canAttachOver(os, ts))) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
+  });
+  Object.assign(out, mergeSystemFields(ours, theirs));
+  const ou = ours.updatedAt || 0, tu = theirs.updatedAt || 0;
+  out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
+  return out;
+}
+
 /* 三方合并远端内容进内存：base=参照基线（脏窗口前的盘 或 刚采纳的盘）、
    ours=内存、theirs=远端快照。逐条判定——
    · 我们没碰过的基线条目（ours==base）→ 取远端版（远端编辑/番茄入账要活下来）
@@ -2467,73 +3285,198 @@ function syncTodosFromDisk(){
    · 双方都改过的 → 本页为准，但 pomodoros 单调计数取大（远端记的番茄不能丢）
    · 双方各自新增的 → 都保留
    followDeletes=true（脏窗口恢复，远端写在窗口内、见过基线）才跟进
-   「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释 */
+   「远端缺基线条目」判为删除；软合并传 false，理由见调用处注释。
+   有墓碑的缺席条目不在这里删，留给 dropBuried 比版本（审查十二③）；缺席即删除只给旧格式快照或墓碑视界外的条目
+   （审查十三①：新格式远端写缺基线条目且无墓碑 → 远端没见过它，不是删了） */
 function mergeRemoteWindow(parsed, base, followDeletes){
   const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
   const baseMap = new Map(base.map((t) => [t.id, t]));
   const ourIds = new Set(todos.map((t) => t.id));
   const remoteMap = new Map(remote.map((t) => [t.id, t]));
   const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  adoptTombs(parsed);
   const merged = todos
-    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id))
+    .filter((t) => !followDeletes || !baseMap.has(t.id) || remoteMap.has(t.id) || keepAbsent(parsed, t))
     .map((t) => {
       const b = baseMap.get(t.id), r = remoteMap.get(t.id);
       if (!b || !r) return t;                 // 本页新增（不在基线）：本页赢
-      if (eq(t, b)) return { ...r };          // 我们没碰过 → 远端版
+      if (eq(t, b)) return withSameWriteMeta({ ...r }, t);   // 我们没碰过 → 远端版（值与写入戳；同一次写的副本并入本地元数据）
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
-      /* 双方都改：本页普通字段为准，但 pomodoros 取大、ClickUp 关联字段
-         哪边有哪边留——taskId/url 是外部系统回写，合并丢掉会断链 */
-      return { ...t,
-        pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
-        clickupTaskId: t.clickupTaskId || r.clickupTaskId,
-        clickupUrl: t.clickupUrl || r.clickupUrl };
+      return mergeThreeWay(t, b, r);
     });
+  const contested = [];
   for (const t of remote){
     if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
+    /* 审查六①：本页已删（基线有、内存无），远端却在基线之后改过它：记下远端最新版。
+       删除成立时撤销删除必须恢复这份远端最新版而不是历史快照。
+       审查十四④：本页删除留了墓碑 → 远端版进候选，由 dropBuried 比版本——远端编辑晚于删除时条目胜出，
+       与写盘成功时（applyExternal 走墓碑比较）结果一致 */
+    const b = baseMap.get(t.id);
+    if (!b || ourIds.has(t.id) || eq(t, b)) continue;
+    if (tombs.has(t.id)) contested.push(t);
+    else noteDeletedRemote(t);   // 审查九：挂到删掉它的撤销步上
   }
-  markRemoteAdopted(todos, merged);
-  todos = merged;
+  /* 候选按远端快照里的前一个邻居插回，不追加到末尾：删除落败、条目保留时它要留在原位置（审查十五③） */
+  let kept = dropBuried(contested.length ? insertAtNeighbors(merged, remote, new Set(contested.map((t) => t.id))) : merged);
+  if (contested.length){
+    const keptIds = new Set(kept.map((t) => t.id));
+    const revived = new Map();
+    for (const t of contested){
+      if (!keptIds.has(t.id)){ noteDeletedRemote(t); continue; }
+      /* 删除落败：本页删除前那份（含没落盘的改动）与远端版逐组取更新的写，本页窗口内的编辑不随删除一起丢 */
+      const e = ownerStepForDelete(t.id), s = e && e.todos.find((x) => x.id === t.id);
+      if (s) revived.set(t.id, restoreFromRemote(s, t));
+    }
+    if (revived.size) kept = kept.map((t) => revived.get(t.id) || t);
+  }
+  markRemoteAdopted(todos, kept);
+  todos = kept;
+  observePayload(parsed); observeStamps(remote);
   /* 远端快照的结算标记一并采纳：它和这份列表同源 */
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
+  /* 返回已采纳的远端版：调用方据此把合并基线前移 */
+  return remote;
 }
 
 /* 软合并：把被覆盖的远端快照并进内存，但绝不删条目、不盖本页更新——
    快照早于盘上写时，远端缺的条目分不清「没见到」还是「删了」，
    宁可多留（add-wins）也不能误删 */
-function mergeSoftRemote(parsed){
-  const remote = sanitizeList(Array.isArray(parsed) ? parsed : parsed.todos || []).todos;
-  const ourIds = new Set(todos.map((t) => t.id));
+/* plain=true：合并两份远端快照（都不是本页内存），只按戳挑胜者，不替别页的戳编造 over */
+function softMergeItem(t, r, plain){
+  /* 用户字段按用户编辑时间（updatedAt，系统回写不推它）整体取较新一方；
+     系统字段独立合并——ClickUp 回写/番茄入账不能让旧正文显得「更新」 */
+  const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
+  const out = { ...t, ...mergeSystemFields(t, r) };
+  /* 审查九/十③：逐组判定，写入戳跟着胜出的值走。任一边有戳 → 按戳链 rev 比较（remoteStampWins，无戳算 0）；
+     两边都没戳（旧数据）→ 沿用按 updatedAt 整条取较新一方。值相同戳不同 → 同样按 remoteStampWins 判定，
+     远端胜才换远端戳（同值旧快照不得盖掉更新的撤销/归属戳，否则之后的迟到快照凭旧戳复活已撤销的值）；本页胜且值不同 → 本页戳挂 over=远端值（撤销本页那步时露出它），
+     远端这次写不比链上已盖住的新时（陈旧快照）不换 over，免得撤销露出更旧的值 */
+  let tookTheirs = false, keptOurs = false;
+  USER_FIELD_GROUPS.forEach((g, gi) => {
+    const ts = stampOf(t, gi), rs = stampOf(r, gi);
+    if (stampEq(ts, rs) && groupEq(t, r, g)) return;
+    if (sameWrite(ts, rs) && groupEq(t, r, g)){ setStamp(out, gi, mergeSameWrite(ts, rs)); return; }
+    const remoteWins = ts || rs ? remoteStampWins(ts, rs) : w === r;
+    if (groupEq(t, r, g)){
+      if (plain){ if (remoteWins) setStamp(out, gi, rs); return; }
+      if (remoteWins && rs) setStamp(out, gi, rs);
+      /* 本页戳胜出：同值的远端独立写也挂进 over，撤销本页那步时不得抹掉它（审查十三②） */
+      else if (!remoteWins && ts && canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
+      return;
+    }
+    if (remoteWins){ copyGroup(out, r, gi); tookTheirs = true; return; }
+    keptOurs = true;
+    if (!plain && ts && canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
+  });
+  const ou = t.updatedAt || 0, tu = r.updatedAt || 0;
+  out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
+  return out;
+}
+function softMergeList(local, remote, plain){
+  const ourIds = new Set(local.map((t) => t.id));
   const remoteMap = new Map(remote.map((t) => [t.id, t]));
-  const merged = todos.map((t) => {
+  const merged = local.map((t) => {
     const r = remoteMap.get(t.id);
-    if (!r) return t;
-    const w = (r.updatedAt || 0) > (t.updatedAt || 0) ? r : t;
-    const l = w === r ? t : r;
-    /* 赢方普通字段为准，但 pomodoros 取大、ClickUp 关联字段哪边有哪边留 */
-    return { ...w,
-      pomodoros: Math.max(t.pomodoros || 0, r.pomodoros || 0),
-      clickupTaskId: w.clickupTaskId || l.clickupTaskId,
-      clickupUrl: w.clickupUrl || l.clickupUrl };
+    return r ? softMergeItem(t, r, plain) : t;
   });
   for (const t of remote){
     if (!ourIds.has(t.id)) merged.push(t);
   }
+  return merged;
+}
+/* 审查十③：采纳盘快照时条目集合跟盘走（删除照常生效），用户字段逐组按写入戳——只有两边都带戳、
+   且本地这组的写更新时才保留本地值，其余取盘；同值时本地写更新则只保留本地戳。交错覆盖/盘上 rev 回退冲掉的编辑因此不会跟着从内存消失 */
+function keepNewerLocalGroups(clean, local){
+  const localMap = new Map(local.map((t) => [t.id, t]));
+  return clean.map((r) => {
+    const t = localMap.get(r.id);
+    if (!t) return r;
+    let out = null, keptValue = false;
+    USER_FIELD_GROUPS.forEach((g, gi) => {
+      const ts = stampOf(t, gi), rs = stampOf(r, gi);
+      if (!ts || stampEq(ts, rs)) return;
+      if (sameWrite(ts, rs) && groupEq(t, r, g)){
+        const m = mergeSameWrite(ts, rs);
+        if (!stampEq(m, rs)){ if (!out) out = { ...r }; setStamp(out, gi, m); }
+        return;
+      }
+      if (remoteStampWins(ts, rs)) return;
+      /* 同值也按完整写入版本比较：盘上是同值的旧写时保留本地较新的戳（撤销戳/写入链），
+         否则之后的迟到快照凭旧戳复活已撤销的值 */
+      if (groupEq(t, r, g)){
+        if (!out) out = { ...r };
+        /* 盘上同值写若是别页的独立编辑，挂进本地戳的 over：撤销本地那步时保留它（审查十三②） */
+        setStamp(out, gi, rs && canAttachOver(ts, rs) ? withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts) : ts);
+        return;
+      }
+      if (!rs) return;
+      if (!out) out = { ...r };
+      copyGroup(out, t, gi);
+      keptValue = true;
+      if (canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
+    });
+    if (keptValue) out.updatedAt = Math.max(t.updatedAt || 0, r.updatedAt || 0);
+    return out || r;
+  });
+}
+/* 攒着的快照遇到另一份不同的快照：两份逐组按戳合成一份（不按 rev 取舍），条目 add-wins，结算标记取并集 */
+function combineSnapshots(a, b){
+  if (!a || sameSnapshot(a, b)) return b;
+  const la = sanitizeList(snapshotList(a)).todos, lb = sanitizeList(snapshotList(b)).todos;
+  const segsOf = (p) => { const s = p && !Array.isArray(p) ? (p.settledSegs || p.settledSeg) : null; return Array.isArray(s) ? s : typeof s === "string" ? [s] : []; };
+  const segs = [...segsOf(b), ...segsOf(a)].filter((s, i, arr) => typeof s === "string" && arr.indexOf(s) === i).slice(0, 20);
+  const ra = payloadRev(a), rb = payloadRev(b);
+  const rev = ra == null ? rb : rb == null ? ra : Math.max(ra, rb);
+  const meta = b && !Array.isArray(b) ? b : (a && !Array.isArray(a) ? a : {});
+  const out = { ...meta, todos: softMergeList(la, lb, true), settledSegs: segs };
+  if (rev != null) out.rev = rev; else delete out.rev;
+  const tb = new Map();
+  for (const [id, t] of [...payloadTombs(a), ...payloadTombs(b)]) putTomb(tb, id, t);
+  /* 两份都是新格式，合成的才算新格式（视界取大）；任一份是旧格式，缺席就可能是没留墓碑的删除 */
+  const ha = payloadTombHorizon(a), hb = payloadTombHorizon(b);
+  if (ha != null && hb != null){ out._tomb = Object.fromEntries(tb); out._tombH = Math.max(ha, hb); }
+  else {
+    delete out._tombH;
+    if (tb.size) out._tomb = Object.fromEntries(tb); else delete out._tomb;
+  }
+  return out;
+}
+function mergeSoftRemote(parsed){
+  const remote = sanitizeList(snapshotList(parsed)).todos;
+  adoptTombs(parsed);
+  const merged = dropBuried(softMergeList(todos, remote, false));
   markRemoteAdopted(todos, merged);
   todos = merged;
+  observePayload(parsed); observeStamps(remote);
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
 }
 
 function applyExternal(parsed){
   /* 内存领先于盘时绝不许远端快照覆盖（会丢掉没存下的改动）——
      攒回 pendingExternal，等恢复窗口合并 */
-  if (localDirty){ pendingExternal = parsed; return; }
-  const list = Array.isArray(parsed) ? parsed : parsed && parsed.todos;
-  const clean = sanitizeList(Array.isArray(list) ? list : []).todos;
+  if (isMergedSnapshot(parsed)) return;           // 审查十③：同一份 payload 重复投递，已合并过
+  if (localDirty){ pendingExternal = combineSnapshots(pendingExternal, parsed); return; }
+  const clean = sanitizeList(snapshotList(parsed)).todos;
+  /* 审查十③：修订号只当提示——不新于已合并过的 → 可能是迟到的旧快照，只软合并（不跟它删条目）；
+     否则按它采纳条目集合。两种都逐组按写入戳，本地更新的组不被盖掉 */
+  const r = payloadRev(parsed);
+  const maybeOld = r != null && r <= lastObservedRev;
   if (parsed && !Array.isArray(parsed)) adoptSettledSegs(parsed.settledSegs || parsed.settledSeg);
-  if (JSON.stringify(clean) === JSON.stringify(todos)) return;   // 内容与内存一致：套了也白套
-  markRemoteAdopted(todos, clean);
-  todos = clean;
+  adoptTombs(parsed);
+  const next = dropBuried(maybeOld ? softMergeList(todos, clean, false) : addTombContested(keepNewerLocalGroups(clean, todos), todos, parsed));
+  observePayload(parsed); observeStamps(clean);
+  /* 审查十三①：快照缺席、本页保留下来的条目要写回——否则盘上只有不含它的那份快照，本页关掉它就丢了 */
+  const cleanIds = new Set(clean.map((t) => t.id));
+  const keptAbsent = !maybeOld && next.some((t) => !cleanIds.has(t.id));
+  if (JSON.stringify(next) === JSON.stringify(todos)){
+    lastAppliedList = clean.map((t) => ({ ...t }));   // 内容与内存一致：套了也白套
+    if (keptAbsent) persist();
+    return;
+  }
+  markRemoteAdopted(todos, next);
+  todos = next;
   lastAppliedList = clean.map((t) => ({ ...t }));
+  if (keptAbsent) persist();
   reconcilePomoTask();
   render();
   play("r-peek");
@@ -2571,9 +3514,12 @@ window.addEventListener("storage", (e) => {
   if (!parsed || parsed.writer === TAB_ID) return;      // 自己写的不用回灌
   const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.todos) ? parsed.todos : null;
   if (!list) return;
+  /* 审查十③：不按修订号丢弃（同号/回退的快照里可能有没合并过的编辑），只跳过已合并过的同一份 payload；
+     陈旧内容交给逐组写入戳比较，它既不能让内存倒退，也不会顶掉攒着的快照（两份合成一份） */
+  if (isMergedSnapshot(parsed)) return;
   /* 先攒快照再决定：编辑中/脏窗口里都不能立刻套用——若紧接着的 persist
      把这份远端写覆盖掉，快照就是它唯一的幸存副本 */
-  pendingExternal = parsed;
+  pendingExternal = combineSnapshots(pendingExternal, parsed);
   if (editingId || localDirty) return;
   const r = syncTodosFromDisk();
   if (r === false) applyExternal(parsed);
@@ -2920,7 +3866,10 @@ function bindEvents(){
   pomoReset.addEventListener("click", resetSegment);
   pomoPreset.addEventListener("click", () => {
     const next = setPomoPreset((pomo.presetIdx + 1) % PRESETS.length);
-    if (next) toast(`时长已改为 ${next.label} 分钟`);
+    if (next){
+      const midSegment = pomo.running || pomo.leftMs != null;
+      toast(midSegment ? `时长已改为 ${next.label} 分钟（当前这段不变，下一段生效）` : `时长已改为 ${next.label} 分钟`);
+    }
   });
   pomoBell.addEventListener("click", async () => {
     if (!pomo.sound){
@@ -3055,6 +4004,8 @@ function seedIfFirstRun(){
     { id:uid(), text:"按 P 开始或暂停，按 F 对选中项专注", completed:false, priority:"low", category:"study", dueDate:null, createdAt:now-2e3, updatedAt:now-2e3, completedAt:null, pomodoros:0, clickupTaskId:null, clickupUrl:null },
     { id:uid(), text:"昨天做完的事会进「历史记录」", completed:true, priority:"medium", category:"work", dueDate:null, createdAt:yest-1e5, updatedAt:yest, completedAt:yest, pomodoros:2, clickupTaskId:null, clickupUrl:null },
   ];
+  const seedOp = newOpId();
+  for (const t of todos) stampWrite(t, ALL_GROUPS, seedOp);
   persist();
   try { store.set(SEED_KEY, "1"); } catch { /* 配额问题不阻塞首屏 */ }
 }
@@ -3229,7 +4180,8 @@ function agentInvoke(name, rawArgs){
         if (PRIORITIES.includes(args.priority)) patch.priority = args.priority;
         if (CATEGORIES.includes(args.category)) patch.category = args.category;
         if ("due_date" in args || "dueDate" in args){
-          let due = args.due_date ?? args.dueDate;
+          /* 按字段是否存在取值：显式 null 是「清除截止日期」，不能被 ?? 换成 undefined */
+          const due = "due_date" in args ? args.due_date : args.dueDate;
           if (due === null || due === "" || due === "null") patch.dueDate = null;
           else if (isISODate(due)) patch.dueDate = due;
           else return { ok:false, error:`日期无效：${due}` };
@@ -3242,6 +4194,7 @@ function agentInvoke(name, rawArgs){
         return { ok:true, todo: serializeTodo(next), message:`已更新：${next.text}` };
       }
       case "complete_todo": {
+        syncTodosFromDisk();   // 先灌盘上最新状态再匹配，别按过期的完成状态挑目标
         const found = findTodoByArgs(args, { scope: "active" });
         if (!found?.todo){
           return {
@@ -3251,12 +4204,15 @@ function agentInvoke(name, rawArgs){
             candidates: found?.candidates,
           };
         }
-        const t = found.todo;
-        if (t.completed) return { ok:true, todo: serializeTodo(t), message:"已经是完成状态" };
-        toggleTodo(t.id);
-        return { ok:true, todo: serializeTodo(todos.find((x) => x.id === t.id)), message:`已完成：${t.text}` };
+        const id = found.todo.id;
+        const r = setCompleted(id, true);
+        const now = todos.find((x) => x.id === id);
+        if (!r || !now) return { ok:false, error:"待办已被删除", code:"NOT_FOUND" };
+        if (r === "unchanged") return { ok:true, todo: serializeTodo(now), message:"已经是完成状态" };
+        return { ok:true, todo: serializeTodo(now), message:`已完成：${now.text}` };
       }
       case "uncomplete_todo": {
+        syncTodosFromDisk();   // 先灌盘上最新状态再匹配，别按过期的完成状态挑目标
         const found = findTodoByArgs(args, { scope: "completed" });
         if (!found?.todo){
           return {
@@ -3266,10 +4222,12 @@ function agentInvoke(name, rawArgs){
             candidates: found?.candidates,
           };
         }
-        const t = found.todo;
-        if (!t.completed) return { ok:true, todo: serializeTodo(t), message:"已经是进行中" };
-        toggleTodo(t.id);
-        return { ok:true, todo: serializeTodo(todos.find((x) => x.id === t.id)), message:`已恢复：${t.text}` };
+        const id = found.todo.id;
+        const r = setCompleted(id, false);
+        const now = todos.find((x) => x.id === id);
+        if (!r || !now) return { ok:false, error:"待办已被删除", code:"NOT_FOUND" };
+        if (r === "unchanged") return { ok:true, todo: serializeTodo(now), message:"已经是进行中" };
+        return { ok:true, todo: serializeTodo(now), message:`已恢复：${now.text}` };
       }
       case "delete_todo": {
         const found = findTodoByArgs(args, { scope: "any" });
@@ -3356,7 +4314,12 @@ function agentInvoke(name, rawArgs){
         const idx = Number(args.preset);
         const next = setPomoPreset(idx);
         if (!next) return { ok:false, error:"preset 只能是 0/1/2" };
-        return { ok:true, message:`预设已切换为 ${next.label}`, preset: next };
+        const midSegment = pomo.running || pomo.leftMs != null;
+        return {
+          ok:true,
+          message: midSegment ? `预设已切换为 ${next.label}（当前这段不变，下一段生效）` : `预设已切换为 ${next.label}`,
+          preset: next,
+        };
       }
       case "set_theme": {
         if (!THEME_IDS.includes(args.theme)) return { ok:false, error:"主题只能是 kanna/sakura/cafe" };
@@ -3378,8 +4341,12 @@ function agentInvoke(name, rawArgs){
       }
       case "undo": {
         if (!undoStack.length) return { ok:false, error:"没有可撤销的操作" };
-        undo();
-        return { ok:true, message:"已撤销上一步" };
+        if (!undo()) return { ok:false, error:"暂时读不到最新数据，为避免覆盖其他页面的改动，本次未撤销" };
+        /* 审查九：部分撤销照样 ok，但报告因别页写过而保留最新值的字段组 */
+        const skipped = lastUndoSkipped.map((x) => ({ id: x.id, field: x.field }));
+        return skipped.length
+          ? { ok:true, message:`已撤销上一步（${skipped.length} 处已被其他页面改过，保留了最新值）`, skipped }
+          : { ok:true, message:"已撤销上一步" };
       }
       case "get_app_status": {
         const active = todos.filter((t) => !t.completed).length;
@@ -3414,6 +4381,7 @@ const TOOL_LABELS = {
 
 function installChatBridge(){
   window.__luminaGetChatContext = () => buildChatContext();
+  window.__luminaExportSnapshot = () => exportSnapshot();
   window.__luminaGetThemeInfo = () => {
     const th = THEMES[currentTheme] || THEMES.kanna;
     return { id: currentTheme, charName: th.charName, brand: th.brand, name: th.name };

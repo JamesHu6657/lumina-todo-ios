@@ -10,6 +10,8 @@
 
   const DEFAULT_MAX_ROUNDS = 6;
   const TOOL_RESULT_MAX = 6000;
+  /** 允许执行工具调用的结束原因 */
+  const TOOL_SAFE_FINISH = new Set(["tool_calls", "function_call", "stop"]);
   const LIMIT_REACHED_TEXT =
     "已达 Agent 轮数上限，部分操作可能尚未完成。请再发一条继续。";
 
@@ -89,7 +91,15 @@
       for (const tc of toolCalls) {
         const id = typeof tc?.id === "string" ? tc.id.trim() : "";
         const name = tc?.function?.name || tc?.name || "";
-        if (!id || !name || seen.has(id)) {
+        // 审查五 B：键存在但类型不对（含显式 null）= 无效调用，整轮不执行
+        const own = (o, k) => !!o && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
+        const fn = tc?.function;
+        const badFn = own(tc, "function") && (!fn || typeof fn !== "object" || Array.isArray(fn));
+        const a = own(fn, "arguments") ? fn.arguments : undefined;
+        const badArgs = own(fn, "arguments") &&
+          typeof a !== "string" && (a === null || typeof a !== "object" || Array.isArray(a));
+        const badName = own(fn, "name") && typeof fn.name !== "string";
+        if (!id || !name || typeof name !== "string" || badFn || badArgs || badName || seen.has(id)) {
           const err = new Error("模型返回了无效或重复的工具调用，未执行任何操作");
           err.code = "INVALID_TOOL_CALLS";
           throw err;
@@ -97,6 +107,24 @@
         seen.add(id);
       }
       return toolCalls;
+    }
+
+    /**
+     * 审查四②：执行工具前再做一次结束状态闸门（桥接层之外的第二道防线）。
+     * 只有正常结束（tool_calls / function_call / stop，或桥接未提供）才执行；
+     * 截断（length）、过滤（content_filter）、未知或非字符串的结束原因一律不执行任何工具。
+     */
+    function assertTerminalAllowsTools(finishReason, toolCalls) {
+      if (!toolCalls.length) return;
+      if (finishReason == null) return;
+      if (typeof finishReason === "string" && TOOL_SAFE_FINISH.has(finishReason)) return;
+      const err = new Error(
+        "模型回复未正常结束（finish_reason=" +
+          (typeof finishReason === "string" ? finishReason.slice(0, 32) : typeof finishReason) +
+          "），未执行任何工具调用"
+      );
+      err.code = "UNSAFE_FINISH_REASON";
+      throw err;
     }
 
     async function pushToolResults(toolCalls) {
@@ -148,6 +176,7 @@
         const toolCalls = validateToolCalls(
           Array.isArray(streamed.toolCalls) ? streamed.toolCalls : []
         );
+        assertTerminalAllowsTools(streamed.finishReason ?? streamed.finish_reason, toolCalls);
 
         if (toolCalls.length && !isAborted()) {
           messages.push({
@@ -180,8 +209,9 @@
 
       const msg = res.message || {};
       const toolCalls = validateToolCalls(
-      Array.isArray(msg.tool_calls) ? msg.tool_calls : []
-    );
+        Array.isArray(msg.tool_calls) ? msg.tool_calls : []
+      );
+      assertTerminalAllowsTools(res.finish_reason, toolCalls);
       const content = (msg.content || "").trim();
 
       if (toolCalls.length) {

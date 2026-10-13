@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const args = process.argv.slice(2);
 const promptPath = args[args.indexOf("-f") + 1];
@@ -27,6 +29,8 @@ if (marker === "TIMEOUT") {
   await new Promise((resolve) => setTimeout(resolve, 50));
   process.stdout.write(line.subarray(cut));
 } else {
+  // 记录「droid 确实被启动过」，供断连测试检查（TMPDIR 由测试指定）
+  if (marker === "SPAWNLOG") fs.writeFileSync(path.join(os.tmpdir(), `stub-spawned-${process.pid}`), "1");
   if (marker === "SLOW") await new Promise((resolve) => setTimeout(resolve, 400));
   const results = {
     PLAIN: "plain reply",
