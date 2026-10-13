@@ -1106,12 +1106,63 @@
     return { system: system.join("\n\n"), messages: out };
   }
 
+  /**
+   * Anthropic 的 input_schema 顶层不接受 oneOf / allOf / anyOf（返回 400 invalid_request_error）。
+   * 发给 Claude 时去掉顶层组合关键字，"id 或 match_text 二选一"这类约束改写进描述；
+   * 本地执行前的 schema 校验仍用原始 parameters，不受影响。
+   */
+  const ANTHROPIC_TOP_LEVEL_COMBINATORS = ["oneOf", "allOf", "anyOf"];
+  function describeRequiredBranches(branches) {
+    if (!Array.isArray(branches)) return "";
+    const options = branches
+      .map((b) => (b && Array.isArray(b.required) ? b.required.join(" + ") : ""))
+      .filter(Boolean);
+    return options.length > 1 ? options.join(" 或 ") : "";
+  }
+  function toAnthropicInputSchema(parameters) {
+    const src =
+      parameters && typeof parameters === "object" && !Array.isArray(parameters)
+        ? parameters
+        : { type: "object", properties: {} };
+    const schema = { ...src };
+    const notes = [];
+    const mustHave = new Set(Array.isArray(src.required) ? src.required : []);
+    const branchRequired = (b) => (b && Array.isArray(b.required) ? b.required : []);
+    for (const key of ANTHROPIC_TOP_LEVEL_COMBINATORS) {
+      if (!(key in schema)) continue;
+      const branches = Array.isArray(schema[key]) ? schema[key] : [];
+      if (key === "allOf" || branches.length === 1) {
+        // allOf 各分支、单分支 anyOf/oneOf 都等价于"这些字段必填"，并进顶层 required
+        for (const b of branches) for (const f of branchRequired(b)) mustHave.add(f);
+        const extra = branches
+          .map((b) => (b && typeof b === "object" ? (({ required, ...rest }) => rest)(b) : null))
+          .filter((b) => b && Object.keys(b).length);
+        if (extra.length) notes.push(`另需满足：${JSON.stringify(extra)}`);
+      } else {
+        const pureRequired = branches.every(
+          (b) => b && Array.isArray(b.required) && Object.keys(b).length === 1
+        );
+        const hint = pureRequired ? describeRequiredBranches(branches) : "";
+        const label = key === "oneOf" ? "必须且只能满足其一" : "至少满足其一";
+        if (hint) notes.push(key === "oneOf" ? `必须且只能提供其一：${hint}` : `至少提供其一：${hint}`);
+        else if (branches.length) notes.push(`${label}：${JSON.stringify(branches)}`);
+      }
+      delete schema[key];
+    }
+    if (mustHave.size) schema.required = [...mustHave];
+    if (!schema.type) schema.type = "object";
+    return { schema, note: notes.join("；") };
+  }
   function toAnthropicTools(tools) {
-    return tools.map((t) => ({
-      name: String(t.function?.name || ""),
-      description: String(t.function?.description || ""),
-      input_schema: t.function?.parameters || { type: "object", properties: {} },
-    }));
+    return tools.map((t) => {
+      const { schema, note } = toAnthropicInputSchema(t.function?.parameters);
+      const desc = String(t.function?.description || "");
+      return {
+        name: String(t.function?.name || ""),
+        description: note ? (desc ? `${desc}（${note}）` : note) : desc,
+        input_schema: schema,
+      };
+    });
   }
 
   /**
