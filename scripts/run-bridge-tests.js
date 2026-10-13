@@ -4751,6 +4751,67 @@ async function main() {
   }
   ok("审查十四⑤ snapshotKey 纳入墓碑：只多带别页删除的同号合成快照不再被判成与盘相同而跳过，恢复写不复活已删任务");
 
+  /* ---- 审查十四⑥ stampWrite 保留自身前值的链和 gone：前值属于本页（不同 op）时新戳不能丢掉它的链与 gone，
+     否则 overRev=0、isKnownWrite 找不到，迟到的旧事件挂成 over，撤销露出已撤销或较旧的写。
+     A：B 创建 X=v0，A 改 a1 后撤销（gone 含 a1）；B 没收到 a1 事件就读盘改 b2，a1 事件迟到 → B 撤销应回 v0。
+     B：C 写 c1，A 见到后写无关改动覆盖盘；B 读盘写 b2、b3，C 的事件迟到 → B 撤销应回 b2 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const textOf = (P, id) => P.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === id).text;
+    for (const owner of ["B", "C"]) {
+      const tag = `撤销后重写：X 由 ${owner} 创建`;
+      const storage = sharedStorage();
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      const x = (owner === "B" ? B : C).invoke("add_todo", { text: "v0" }).todo;
+      const sV0 = storage.getItem(TODO_KEY);
+      const A = loadApp({ storage });
+      if (owner === "C") B.deliverStorage(TODO_KEY, sV0);
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: x.id, text: "a1" }).ok, true);
+      const sA1 = storage.getItem(TODO_KEY);
+      await sleep(3);
+      assert.equal(A.invoke("undo").ok, true);
+      const sAu = storage.getItem(TODO_KEY);
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "b2" }).ok, true);   // 读盘时已含 A 的撤销
+      B.deliverStorage(TODO_KEY, sA1);                 // 迟到的 a1 事件
+      B.deliverStorage(TODO_KEY, sAu);
+      await sleep(3);
+      assert.equal(B.invoke("undo").ok, true);
+      assert.equal(textOf(B, x.id), "v0", `${tag}：B 撤销不露出 A 已撤销的 a1`);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "v0", `${tag}：盘上回到 v0`);
+    }
+    for (const late of [false, true]) {
+      const tag = `连续自写：late=${late}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      await sleep(3);
+      assert.equal(C.invoke("update_todo", { id: x.id, text: "c1" }).ok, true);
+      const sC = storage.getItem(TODO_KEY);
+      A.deliverStorage(TODO_KEY, sC);
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);   // 覆盖 C 的快照
+      const sA = storage.getItem(TODO_KEY);
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "b2" }).ok, true);
+      await sleep(3);
+      assert.equal(B.invoke("update_todo", { id: x.id, text: "b3" }).ok, true);
+      if (late) { B.deliverStorage(TODO_KEY, sC); B.deliverStorage(TODO_KEY, sA); }
+      await sleep(3);
+      assert.equal(B.invoke("undo").ok, true);
+      assert.equal(textOf(B, x.id), "b2", `${tag}：B 撤销回到自己较新的 b2`);
+      assert.equal(diskTodos(storage).find((t) => t.id === x.id).text, "b2", `${tag}：盘上为 b2`);
+      assert.equal(B.invoke("undo").ok, true);
+      assert.equal(textOf(B, x.id), "c1", `${tag}：再撤销露出 C 的 c1`);
+    }
+  }
+  ok("审查十四⑥ stampWrite 保留自身前值的链和 gone：迟到的旧事件不再挂到本页重写过的组上，撤销不露出已撤销或较旧的写");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
