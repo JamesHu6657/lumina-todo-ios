@@ -1299,7 +1299,7 @@ async function main() {
     assert.equal(result.ok, true);
     assert.equal(request.url, "https://relay.example.com/v1/chat/completions");
     assert.equal(request.headers.Authorization, `Bearer ${key}`);
-    assert.equal(request.body.model, "deepseek-v4.1-flash");
+    assert.ok(!("model" in request.body), "未手动选模型时交由中转默认");
     ok("Factory 地址规范化并使用中转 URL、口令和模型");
   }
 
@@ -1362,7 +1362,7 @@ async function main() {
     assert.equal(result.ok, true);
     assert.equal(request.url, "https://old-relay.example.com/v1/chat/completions");
     assert.equal(request.headers.Authorization, `Bearer ${key}`);
-    assert.equal(request.body.model, "deepseek-v4.1-flash");
+    assert.ok(!("model" in request.body), "未手动选模型时交由中转默认");
     ok("Factory 请求在服务商和中转地址切换期间固定配置");
   }
 
@@ -5859,7 +5859,7 @@ async function main() {
       }
       return e;
     }
-    async function runSettings({ providerId = "factory", baseStore = true, current, staticModels, remote, source = "remote" }) {
+    async function runSettings({ providerId = "factory", baseStore = true, current, staticModels, remote, source = "remote", modelPicked = true }) {
       const els = new Map();
       const toasts = [];
       const toastMsg = makeEl("p");
@@ -5882,7 +5882,7 @@ async function main() {
           return els.get(id);
         },
       };
-      const entry = { id: providerId, label: providerId, model: current, defaultModel: staticModels[0].id, models: staticModels, keyHint: "key", baseStore, base: baseStore ? "https://relay.example" : "" };
+      const entry = { id: providerId, label: providerId, model: current, defaultModel: staticModels[0].id, modelPicked, models: staticModels, keyHint: "key", baseStore, base: baseStore ? "https://relay.example" : "" };
       const sandbox = {
         console,
         setTimeout,
@@ -5923,6 +5923,11 @@ async function main() {
     assert.deepEqual(s.toasts, []);
     // 非中转服务商的远端列表不作为白名单
     s = await runSettings({ providerId: "commandcode", baseStore: false, current: "claude-gone", staticModels, remote });
+    assert.equal(s.modelSel.value, "claude-gone");
+    assert.ok(!s.labels.some(([, l]) => /不可用/.test(l)), JSON.stringify(s.labels));
+    assert.deepEqual(s.toasts, []);
+    // 没手动选过：请求不带 model，内置默认不在中转列表里也不算不可用
+    s = await runSettings({ current: "claude-gone", staticModels, remote, modelPicked: false });
     assert.equal(s.modelSel.value, "claude-gone");
     assert.ok(!s.labels.some(([, l]) => /不可用/.test(l)), JSON.stringify(s.labels));
     assert.deepEqual(s.toasts, []);
@@ -6024,6 +6029,97 @@ async function main() {
     assert.equal(r2.source, "remote");
     assert.deepEqual(r2.models, [{ id: "chunked-model", label: "chunked-model" }]);
     ok("审查 PR8④ listModels 限长读取：超大响应停止读取并回落静态列表，正常分块列表照常解析");
+  }
+
+  /* ---- 审查 PR8 复审④：中转型服务商未手动选模型时不发送内置默认，交由中转 DROID_MODEL ---- */
+  {
+    const store = makeLocalStorage();
+    store.setItem("lumina-factory-base", "https://relay.example.com");
+    const sent = [];
+    const { ai } = loadBridge(store, async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      sent.push({ url, body });
+      // 模拟 DROID_MODEL=ALLOWED_MODELS=claude-opus-5-5 的中转：其它模型 400，省略时用默认
+      if ("model" in body && body.model !== "claude-opus-5-5") {
+        return {
+          ok: false,
+          status: 400,
+          async text() {
+            return JSON.stringify({ error: { message: `model "${body.model}" is not in ALLOWED_MODELS`, type: "invalid_request_error" } });
+          },
+        };
+      }
+      if (body.stream) {
+        const sse = [
+          { id: "c1", object: "chat.completion.chunk", model: "claude-opus-5-5", choices: [{ index: 0, delta: { content: "hi" } }] },
+          { id: "c1", object: "chat.completion.chunk", model: "claude-opus-5-5", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ].map((e) => "data: " + JSON.stringify(e) + "\n\n").join("") + "data: [DONE]\n\n";
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (k) => (/content-type/i.test(k) ? "text/event-stream" : null) },
+          body: null,
+          async text() {
+            return sse;
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ model: "claude-opus-5-5", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("factory").ok, true);
+    assert.equal((await ai.setApiKey("relay-token-" + "x".repeat(20))).ok, true);
+    const fx = () => ai.providers().list.find((x) => x.id === "factory");
+    assert.equal(fx().modelPicked, false);
+    assert.equal(fx().model, "deepseek-v4.1-flash", "设置里仍显示内置默认");
+
+    let start;
+    const done = await new Promise((resolve) => {
+      ai.chat({ messages: [{ role: "user", content: "hi" }] }, { onDone: resolve, onError: (e) => resolve({ error: e }) })
+        .then((s) => { start = s; });
+    });
+    assert.equal(done.error, undefined, JSON.stringify(done));
+    assert.ok(!("model" in sent[0].body), "未手动选模型时流式请求不得带 model：" + JSON.stringify(sent[0].body));
+    assert.equal(start.ok, true);
+    assert.equal(done.content, "hi");
+    assert.equal(done.model, "claude-opus-5-5", "应显示中转响应报告的模型");
+
+    const r = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: false });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.ok(!("model" in sent[1].body), "未手动选模型时 complete 不得带 model");
+    assert.equal(r.model, "claude-opus-5-5");
+
+    // 手动选过的模型照常发送（被中转拒绝就如实报错）
+    assert.equal(ai.setModel("claude-opus-5-5").ok, true);
+    assert.equal(fx().modelPicked, true);
+    const picked = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: false });
+    assert.equal(picked.ok, true, JSON.stringify(picked));
+    assert.equal(sent[2].body.model, "claude-opus-5-5");
+    assert.equal(ai.setModel("deepseek-v4.1-flash").ok, true);
+    const rejected = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: false });
+    assert.equal(sent[3].body.model, "deepseek-v4.1-flash", "手动选了内置默认也照常发送");
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error, /not in ALLOWED_MODELS/);
+
+    // 非中转服务商没选过模型时仍发送内置默认
+    const ocStore = makeLocalStorage();
+    let ocBody;
+    const { ai: oc } = loadBridge(ocStore, async (_url, opts) => {
+      ocBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, body: null, async text() { return JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }); } };
+    });
+    assert.equal(oc.setProvider("opencode").ok, true);
+    assert.equal((await oc.setApiKey("sk-" + "x".repeat(30))).ok, true);
+    const ocr = await oc.complete({ messages: [{ role: "user", content: "hi" }], tools: false });
+    assert.equal(ocr.ok, true, JSON.stringify(ocr));
+    assert.equal(ocBody.model, oc.providers().list.find((x) => x.id === "opencode").defaultModel);
+    ok("审查 PR8 复审④ 中转未手动选模型时省略 model 并显示中转报告的模型，手动选过的照常发送，其它服务商不变");
   }
 
   console.log("\n全部通过：", passed);

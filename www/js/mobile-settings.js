@@ -272,7 +272,9 @@
             if (r?.ok && r.source === "remote" && document.contains(modelSel)) {
               // previousModel 跟随用户在等待期间的改选，不能回退到发请求时的旧值
               const selected = previousModel || cur.model;
-              if (fillModels(r.models, selected, { authoritative: cur.baseStore })) {
+              // 没手动选过时请求不带 model（由中转用自己的默认），内置默认不在列表里也不会被拒
+              const sendsModel = cur.modelPicked !== false || selected !== cur.model;
+              if (fillModels(r.models, selected, { authoritative: cur.baseStore && sendsModel })) {
                 toast(`模型 ${selected} 不在中转允许的列表中，请改选其它模型`);
               }
             }

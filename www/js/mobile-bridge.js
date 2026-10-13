@@ -247,15 +247,28 @@
     });
   }
 
-  /** 当前服务商的已选模型；没选过用默认 */
-  function selectedModel(provider = currentProvider()) {
+  /** 用户手动选过的模型；没选过返回 null */
+  function pickedModel(provider = currentProvider()) {
     try {
       const stored = localStorage.getItem(MODEL_STORE_PREFIX + provider.id);
       if (stored && MODEL_ID_RE.test(stored)) return stored;
     } catch {
       /* ignore */
     }
-    return provider.model;
+    return null;
+  }
+
+  /** 当前服务商的已选模型；没选过用默认 */
+  function selectedModel(provider = currentProvider()) {
+    return pickedModel(provider) || provider.model;
+  }
+
+  /**
+   * 请求体里发送的模型。中转（baseStore）没手动选过时返回 null、省略 model：
+   * 中转按自己的 DROID_MODEL 跑，内置默认不一定在运营方的 ALLOWED_MODELS 里，发了会 400。
+   */
+  function requestModel(provider = currentProvider()) {
+    return provider.baseStore ? pickedModel(provider) : selectedModel(provider);
   }
 
   function setProviderModel(providerId, modelId) {
@@ -1344,7 +1357,7 @@
     timeoutMs,
     provider = currentProvider(),
     base = providerBase(provider),
-    model = selectedModel(provider),
+    model = requestModel(provider),
   }) {
     const style = apiStyle(provider, model);
     const endpoint = chatEndpoint(provider, base, model);
@@ -1396,7 +1409,7 @@
       }
     } else {
       body = {
-        model,
+        ...(model ? { model } : {}),
         messages: clipped,
         stream: Boolean(stream),
       };
@@ -2056,6 +2069,8 @@
           label: p.label,
           model: selectedModel(p),
           defaultModel: p.model,
+          // false：没手动选过；中转型服务商此时不发送 model，由中转用自己的默认模型
+          modelPicked: Boolean(pickedModel(p)),
           models: providerModels(p),
           keyHint: p.keyHint,
           baseStore: Boolean(p.baseStore),
@@ -2151,8 +2166,9 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求
-      const model = selectedModel(provider);
+      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求。
+      // null = 交由中转默认，返回值改用响应报告的模型
+      const model = requestModel(provider);
       const endpoint = chatEndpoint(provider, base, model);
       if (!base) return { requestId, ...noBaseError() };
       if (!(await resolveApiKey({ provider }))) {
@@ -2299,8 +2315,9 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求
-      const model = selectedModel(provider);
+      // 只读一次：请求体、日志端点与返回值必须是同一个模型，期间改设置不影响本次请求。
+      // null = 交由中转默认，返回值改用响应报告的模型
+      const model = requestModel(provider);
       const endpoint = chatEndpoint(provider, base, model);
 
       if (pending.has(requestId)) {
