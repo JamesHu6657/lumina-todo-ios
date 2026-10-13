@@ -11,7 +11,7 @@ HOST=127.0.0.1
 PORT=8787
 DROID_BIN=/usr/local/bin/droid
 DROID_MODEL=deepseek-v4.1-flash
-# ALLOWED_MODELS=deepseek-v4.1-flash   # 必须包含 DROID_MODEL，否则启动失败
+# ALLOWED_MODELS=deepseek-v4.1-flash,claude-opus-5-5   # 逗号分隔；必须包含 DROID_MODEL，否则启动失败；不在列表里的模型请求返回 400
 # DROID_REASONING=high
 # MAX_CONCURRENCY=2
 # MAX_REQUESTS_PER_MINUTE=30   # 每分钟最多启动的 droid 次数，0 表示不限
@@ -26,7 +26,7 @@ DROID_MODEL=deepseek-v4.1-flash
 
 ## 模型与生成参数
 
-请求省略 `model` 或给出不在 `ALLOWED_MODELS` 里的模型时，回退到 `DROID_MODEL`；启动时会校验 `DROID_MODEL` 属于允许列表，回退目标不会越过列表。
+请求省略 `model` 时使用 `DROID_MODEL`；启动时会校验 `DROID_MODEL` 属于允许列表。请求给出不在 `ALLOWED_MODELS` 里的模型时返回 400（`invalid_request_error`），不会静默换成默认模型，响应里的 `model` 始终是实际运行的模型。App 内置的 Factory 模型列表只是离线兜底，想在 App 里选用哪些模型，就要把它们写进 `ALLOWED_MODELS`；App 能连上中转时以 `/v1/models` 返回的列表为准。
 
 `droid exec` 只支持选择模型（`-m`）和推理强度（`-r`），没有 `temperature`、`max_tokens` 等采样参数，中转无法把它们传给上游。合法取值照常受理，但响应头 `X-Relay-Ignored-Params` 会列出本次被忽略的参数，`/v1/models` 的 `unsupported_params` 也声明了这一能力差异；取值非法（如 `max_tokens` 非正整数、`temperature` 超出 0–2、`n` 不为 1）返回 400。App 端的输出截断不等于上游的生成预算。
 

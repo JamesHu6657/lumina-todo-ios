@@ -268,6 +268,19 @@ function validateChatBody(body) {
   }
 }
 
+/**
+ * 省略 model 用默认模型（启动时已校验它在允许列表内）。给了不在列表里的模型直接 400：
+ * 静默换成默认模型会让 App 显示一个模型、实际由另一个模型回答。
+ */
+function resolveModel(body, config) {
+  if (body.model == null || body.model === "") return config.droidModel;
+  if (typeof body.model !== "string" || !config.allowedModels.includes(body.model)) {
+    const shown = typeof body.model === "string" ? ` ${JSON.stringify(body.model.slice(0, 128))}` : "";
+    throw new RelayError(400, `model${shown} is not in ALLOWED_MODELS`);
+  }
+  return body.model;
+}
+
 // droid exec 没有 temperature / max_tokens 之类的采样参数（只有 -m 与 -r），
 // 这些字段无法传给上游。合法值照常受理，但在响应头和 /v1/models 里如实声明「已忽略」；
 // 非法值直接 400，别让调用方以为参数生效了。
@@ -638,10 +651,7 @@ export function createRelayServer(config = loadConfig()) {
         const body = await readJson(req, config.maxBodyBytes, config.bodyTimeoutMs);
         validateChatBody(body);
         const ignoredParams = checkGenerationParams(body);
-        // 省略或不在允许列表里的模型回退到默认模型（启动时已校验默认模型在列表内）
-        const model = config.allowedModels.includes(body.model)
-          ? body.model
-          : config.droidModel;
+        const model = resolveModel(body, config);
         const tools = toolDefinitions(body.tools);
         const prompt = renderPrompt({
           messages: body.messages,

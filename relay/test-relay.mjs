@@ -224,18 +224,6 @@ await withRelay({}, async (relay) => {
     assert.ok(listed.unsupported_params.includes("temperature"));
   });
 
-  await test("unknown models fall back to the allowed default", async () => {
-    const response = await request(relay, "/v1/chat/completions", {
-      method: "POST",
-      body: { model: "not-allowed-model", messages: [{ role: "user", content: "STUB:CAPTURE" }] },
-    });
-    assert.equal(response.status, 200);
-    const parsed = await response.json();
-    assert.equal(parsed.model, "deepseek-v4.1-flash");
-    const captured = JSON.parse(parsed.choices[0].message.content);
-    assert.equal(captured.args[captured.args.indexOf("-m") + 1], "deepseek-v4.1-flash");
-  });
-
   await test("generation params are validated and declared as ignored", async () => {
     const ok = await request(relay, "/v1/chat/completions", {
       method: "POST",
@@ -500,6 +488,36 @@ await withRelay({}, async (relay) => {
     assert.equal(relay.child.exitCode, null);
     const health = await request(relay, "/healthz", { auth: null });
     assert.equal(health.status, 200);
+  });
+});
+
+// 独立实例：不占用上面共享实例的每分钟启动额度
+await withRelay({}, async (relay) => {
+  await test("models outside the allow list are rejected instead of silently swapped", async () => {
+    for (const model of ["not-allowed-model", 42, ["custom-model"]]) {
+      const response = await request(relay, "/v1/chat/completions", {
+        method: "POST",
+        body: { model, messages: [{ role: "user", content: "STUB:CAPTURE" }] },
+      });
+      assert.equal(response.status, 400, JSON.stringify(model));
+      const parsed = await response.json();
+      assert.equal(parsed.error.type, "invalid_request_error");
+      assert.match(parsed.error.message, /not in ALLOWED_MODELS/);
+    }
+  });
+
+  await test("omitted model uses the default and the response reports it", async () => {
+    for (const body of [
+      { messages: [{ role: "user", content: "STUB:CAPTURE" }] },
+      { model: null, messages: [{ role: "user", content: "STUB:CAPTURE" }] },
+    ]) {
+      const response = await request(relay, "/v1/chat/completions", { method: "POST", body });
+      assert.equal(response.status, 200);
+      const parsed = await response.json();
+      assert.equal(parsed.model, "deepseek-v4.1-flash");
+      const captured = JSON.parse(parsed.choices[0].message.content);
+      assert.equal(captured.args[captured.args.indexOf("-m") + 1], "deepseek-v4.1-flash");
+    }
   });
 });
 

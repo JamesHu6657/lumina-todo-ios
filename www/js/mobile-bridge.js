@@ -124,10 +124,11 @@
       id: "factory",
       label: "Factory（VPS 中转）",
       model: "deepseek-v4.1-flash",
-      // 与 VPS 上 droid exec --help 的可用模型一致；relais 的 ALLOWED_MODELS 同步此列表
+      // 离线兜底列表（取自 droid exec --help）；中转只接受其 ALLOWED_MODELS，其余模型返回 400，
+      // 能连上中转时以 /models 返回的列表为准
       models: [
         "auto|Auto Model（自动选模型）",
-        "claude-fable-5.1|Claude Fable 5.1",
+        "claude-fable-5-1|Claude Fable 5.1",
         "claude-fable-5|Claude Fable 5",
         "claude-opus-5-5|Claude Opus 5.5",
         "claude-opus-5|Claude Opus 5",
@@ -1508,6 +1509,11 @@
     let aborted = false;
     let timedOut = false;
     let streamChars = 0;
+    // 服务端声明的实际模型（Factory 中转回包里的 model 即实际运行的 droid 模型）
+    let respModel = "";
+    const noteModel = (m) => {
+      if (!respModel && typeof m === "string" && MODEL_ID_RE.test(m)) respModel = m;
+    };
 
     const consumeChars = (n) => {
       streamChars += n;
@@ -1632,6 +1638,7 @@
         throw streamProtocolError("数据事件不是对象");
       }
       if (parser.done) return; // [DONE] 之后的普通数据不再计入（错误事件已在上面拦截）
+      noteModel(json.type === "message_start" && isPlainObject(json.message) ? json.message.model : json.model);
       if (style === "anthropic") {
         try {
           const ev = anthropicEventDelta(json);
@@ -1686,7 +1693,7 @@
         const tool_calls = finalizeToolCalls(toolMap);
         assertFinishAllowsTools(finishReason, tool_calls);
         if (!finishReason) finishReason = tool_calls.length ? "tool_calls" : "stop";
-        return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut };
+        return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut, model: respModel };
       }
       let data;
       try {
@@ -1700,6 +1707,7 @@
         throw streamProtocolError("响应体不是对象");
       }
       if (style === "anthropic") data = anthropicToOpenAI(data);
+      noteModel(data.model);
       const choice = data?.choices?.[0];
       const msg = choice?.message || {};
       if (choice != null && (typeof choice !== "object" || Array.isArray(choice))) {
@@ -1806,7 +1814,7 @@
     if (!finishReason && !aborted) {
       finishReason = tool_calls.length ? "tool_calls" : "stop";
     }
-    return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut };
+    return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut, model: respModel };
   }
 
   /* ----------------------------- stream pending (preload 同形) ----------------------------- */
@@ -2131,7 +2139,7 @@
               return {
                 ok: true,
                 requestId,
-                model: call.model,
+                model: r.model || call.model,
                 message: {
                   role: "assistant",
                   content: r.content || "",
@@ -2343,6 +2351,7 @@
             reasoning: result.reasoning,
             tool_calls: result.tool_calls,
             finish_reason: result.finish_reason,
+            model: result.model || call.model,
             ...(result.aborted
               ? { aborted: true, reason: result.timedOut ? "timeout" : "user" }
               : {}),

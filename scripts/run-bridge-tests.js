@@ -5647,6 +5647,59 @@ async function main() {
     ok("Factory 选模型后仍走 /chat/completions 且不发送采样参数");
   }
 
+  /* ---- 审查 PR8②：Factory 返回中转实际运行的模型；中转拒绝的模型如实报错；内置 ID 写法一致 ---- */
+  {
+    const fx = (await loadBridge(makeLocalStorage()).ai.providers()).list.find((x) => x.id === "factory");
+    const claudeIds = fx.models.map((m) => m.id).filter((id) => /^claude-/.test(id));
+    assert.ok(claudeIds.length > 5);
+    for (const id of claudeIds) assert.match(id, /^claude-[a-z0-9-]+$/, `Factory 的 Claude ID 应统一用连字符：${id}`);
+    assert.ok(claudeIds.includes("claude-fable-5-1"));
+
+    const store = makeLocalStorage();
+    store.setItem("lumina-factory-base", "https://relay.example.com");
+    let mode = "sse";
+    const { ai } = loadBridge(store, async () => {
+      if (mode === "reject") {
+        return {
+          ok: false,
+          status: 400,
+          async text() {
+            return JSON.stringify({ error: { message: 'model "claude-opus-5" is not in ALLOWED_MODELS', type: "invalid_request_error" } });
+          },
+        };
+      }
+      const sse = [
+        { id: "c1", object: "chat.completion.chunk", model: "deepseek-v4.1-flash", choices: [{ index: 0, delta: { role: "assistant" } }] },
+        { id: "c1", object: "chat.completion.chunk", model: "deepseek-v4.1-flash", choices: [{ index: 0, delta: { content: "hi" } }] },
+        { id: "c1", object: "chat.completion.chunk", model: "deepseek-v4.1-flash", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ].map((e) => "data: " + JSON.stringify(e) + "\n\n").join("") + "data: [DONE]\n\n";
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (k) => (/content-type/i.test(k) ? "text/event-stream" : null) },
+        body: null,
+        async text() {
+          return sse;
+        },
+      };
+    });
+    assert.equal(ai.setProvider("factory").ok, true);
+    assert.equal((await ai.setApiKey("relay-token-" + "x".repeat(20))).ok, true);
+    assert.equal(ai.setModel("claude-opus-5").ok, true);
+    const done = await new Promise((resolve) => {
+      ai.chat({ messages: [{ role: "user", content: "hi" }] }, { onDone: resolve, onError: (e) => resolve({ error: e }) });
+    });
+    assert.equal(done.error, undefined, JSON.stringify(done));
+    assert.equal(done.content, "hi");
+    assert.equal(done.model, "deepseek-v4.1-flash", "onDone 应返回中转声明的实际模型");
+    mode = "reject";
+    const r = await ai.complete({ messages: [{ role: "user", content: "hi" }] });
+    assert.equal(r.ok, false);
+    assert.equal(r.status, 400);
+    assert.match(r.error, /not in ALLOWED_MODELS/);
+    ok("审查 PR8② Factory 流式结果带回中转实际模型，被中转拒绝的模型如实报错，Claude ID 写法一致");
+  }
+
   /* ---- listModels：远端列表优先，失败回落内置列表 ---- */
   {
     const store = makeLocalStorage();
