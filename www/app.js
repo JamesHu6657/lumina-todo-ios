@@ -3245,14 +3245,30 @@ function mergeRemoteWindow(parsed, base, followDeletes){
       if (eq(r, b)) return t;                 // 远端没碰过 → 本页版
       return mergeThreeWay(t, b, r);
     });
+  const contested = [];
   for (const t of remote){
     if (!baseMap.has(t.id) && !ourIds.has(t.id)) merged.push(t);
     /* 审查六①：本页已删（基线有、内存无），远端却在基线之后改过它：记下远端最新版。
-       删除仍然成立（本页赢），但撤销删除时必须恢复这份远端最新版而不是历史快照 */
+       删除成立时撤销删除必须恢复这份远端最新版而不是历史快照。
+       审查十四④：本页删除留了墓碑 → 远端版进候选，由 dropBuried 比版本——远端编辑晚于删除时条目胜出，
+       与写盘成功时（applyExternal 走墓碑比较）结果一致 */
     const b = baseMap.get(t.id);
-    if (b && !ourIds.has(t.id) && !eq(t, b)) noteDeletedRemote(t);   // 审查九：挂到删掉它的撤销步上
+    if (!b || ourIds.has(t.id) || eq(t, b)) continue;
+    if (tombs.has(t.id)){ merged.push(t); contested.push(t); }
+    else noteDeletedRemote(t);   // 审查九：挂到删掉它的撤销步上
   }
-  const kept = dropBuried(merged);
+  let kept = dropBuried(merged);
+  if (contested.length){
+    const keptIds = new Set(kept.map((t) => t.id));
+    const revived = new Map();
+    for (const t of contested){
+      if (!keptIds.has(t.id)){ noteDeletedRemote(t); continue; }
+      /* 删除落败：本页删除前那份（含没落盘的改动）与远端版逐组取更新的写，本页窗口内的编辑不随删除一起丢 */
+      const e = ownerStepForDelete(t.id), s = e && e.todos.find((x) => x.id === t.id);
+      if (s) revived.set(t.id, restoreFromRemote(s, t));
+    }
+    if (revived.size) kept = kept.map((t) => revived.get(t.id) || t);
+  }
   markRemoteAdopted(todos, kept);
   todos = kept;
   observePayload(parsed); observeStamps(remote);

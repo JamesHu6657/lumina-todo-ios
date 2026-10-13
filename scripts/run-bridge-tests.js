@@ -4661,6 +4661,58 @@ async function main() {
   }
   ok("审查十四③ 墓碑与 over 中的较新编辑比较：恢复合并保留本页值时，链上晚于删除的远端编辑让条目免于被较旧的删除删掉");
 
+  /* ---- 审查十四④ 写失败窗口内较新远端编辑可胜过本地删除：A 写盘失败时删除 X（墓碑 T），B 随后正常把 X 改成 b
+     （rB > T）后关闭。A 恢复写时基线有、本页已删的远端版也要进候选与墓碑比版本——否则 X 永久丢失，
+     而写盘成功或 B 仍开着时 X 都会带着 B 的编辑保留。对照：B 的编辑早于删除（rB < T）时删除仍胜出，撤销删除恢复 B 的版本 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (const editFirst of [false, true]) {
+      const tag = editFirst ? "编辑早于删除" : "编辑晚于删除";
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "v0" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      await sleep(3);
+      storage.failTodoWrites = true;
+      if (editFirst) {
+        A.invoke("update_todo", { id: y.id, text: "Y1" });    // A 先进入脏窗口
+        storage.failTodoWrites = false;
+        await sleep(3);
+        assert.equal(B.invoke("update_todo", { id: x.id, text: "b" }).ok, true);
+        await sleep(3);
+        storage.failTodoWrites = true;
+        assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+        storage.failTodoWrites = false;
+      } else {
+        assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+        storage.failTodoWrites = false;
+        await sleep(3);
+        assert.equal(B.invoke("update_todo", { id: x.id, text: "b" }).ok, true);
+      }
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));   // B 之后关闭，不再处理事件
+      await sleep(3);
+      assert.equal(A.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);   // 恢复写
+      const dx = diskTodos(storage).find((t) => t.id === x.id);
+      const ax = A.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === x.id);
+      const tomb = (JSON.parse(storage.getItem(TODO_KEY))._tomb || {})[x.id];
+      if (!editFirst) {
+        assert.ok(dx && dx.text === "b", `${tag}：盘上保留 B 较新的编辑`);
+        assert.ok(ax && ax.text === "b", `${tag}：A 内存保留 B 较新的编辑`);
+        assert.ok(!tomb, `${tag}：墓碑作废`);
+      } else {
+        assert.ok(!dx && !ax, `${tag}：较新的删除仍胜出`);
+        assert.ok(tomb, `${tag}：盘上留墓碑`);
+        const r = A.invoke("undo");   // 撤销恢复写那步（Y2）
+        assert.equal(r.ok, true);
+        assert.equal(A.invoke("undo").ok, true);   // 撤销删除
+        const back = A.invoke("list_todos", { status: "all", limit: 50 }).todos.find((t) => t.id === x.id);
+        assert.ok(back && back.text === "b", `${tag}：撤销删除恢复 B 的最新版`);
+      }
+    }
+  }
+  ok("审查十四④ 写失败窗口内较新远端编辑可胜过本地删除：恢复写把本页已删、远端改过的条目与墓碑比版本，较新的删除仍胜出且撤销删除恢复远端最新版");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
