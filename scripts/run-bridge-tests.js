@@ -3847,6 +3847,195 @@ async function main() {
   }
   ok("审查十③ 快照按字段写入戳合并、不按全局 rev 丢弃：同号交错快照（两种到达顺序）与盘上 rev 回退都不丢编辑，写回修订号单调");
 
+  /* ---- 审查十一① 同值旧快照不回退撤销戳：A 改 O→a→b 再撤销回 a（新戳）；C 载入撤销后的盘，
+     先收到值同为 a 的旧快照、再收到含 b 的迟到快照——旧戳不得盖掉撤销戳，b 不得复活 ---- */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b"], priority: ["low", "medium", "high"], dueDate: [null, "2030-01-02", "2030-03-04"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+    if (field !== "text") assert.equal(A.invoke("update_todo", { id: x.id, text: "a" }).ok, true);
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+    const sA = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+    const sB = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("undo").ok, true);
+    const undone = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(undone[field], vals[1], `${field}：前提：撤销回 ${vals[1]}`);
+    const undoRev = undone._fw[field].rev;
+    const C = loadApp({ storage });
+    C.deliverStorage(TODO_KEY, sA);                 // 同值旧快照
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id)._fw[field].rev, undoRev, `${field}：同值旧快照不得回退盘上撤销戳`);
+    C.deliverStorage(TODO_KEY, sB);                 // 含已撤销值的迟到快照
+    const mem = C.invoke("list_todos", {}).todos.find((t) => t.id === x.id);
+    assert.equal(mem[field], vals[1], `${field}：迟到快照不得在内存复活已撤销的值`);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx[field], vals[1], `${field}：已撤销的值不得写回盘`);
+    assert.equal(dx._fw[field].rev, undoRev, `${field}：撤销戳保留`);
+  }
+  ok("审查十一① 同值旧快照按完整写入版本比较：不回退撤销戳，迟到快照不复活已撤销的值（text / priority / dueDate）");
+
+  /* ---- 审查十一② 撤销链裁剪携带单调版本：A 改 O→a，B 改 a→b；A 撤销（保留 b，把 B 链上 a 那环裁成 O）；
+     C 载入裁剪后的盘，再收到裁剪前的 B 快照——旧链不得把 a 装回，B 撤销须回到 O ---- */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b"], priority: ["low", "medium", "high"], dueDate: [null, "2030-01-02", "2030-03-04"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    const cur = () => diskTodos(storage).find((t) => t.id === x.id)[field];
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(B.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+    const sB = storage.getItem(TODO_KEY);
+    A.deliverStorage(TODO_KEY, sB);
+    assert.equal(A.invoke("undo").ok, true);
+    assert.equal(cur(), vals[2], `${field}：前提：A 撤销保留 B 的写`);
+    const C = loadApp({ storage });
+    C.deliverStorage(TODO_KEY, sB);                 // 裁剪前的 B 快照迟到
+    const link = diskTodos(storage).find((t) => t.id === x.id)._fw[field].over;
+    assert.ok(link && link.v && (link.v[field] ?? null) === vals[0], `${field}：旧快照不得把已撤销的 ${vals[1]} 节点装回链上`);
+    B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(B.invoke("undo").ok, true);
+    assert.equal(cur(), vals[0], `${field}：B 撤销须回到初始值，不得恢复 A 已撤销的值`);
+    C.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+    assert.equal(C.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], vals[0], `${field}：C 内存随事件一致`);
+    // 再投递一次裁剪前的快照：值与链都不得倒退
+    C.deliverStorage(TODO_KEY, sB);
+    assert.equal(cur(), vals[0], `${field}：迟到快照不得复活已撤销的写`);
+  }
+  ok("审查十一② 撤销链裁剪携带单调版本：裁剪前的旧快照不能把已撤销节点装回，后续撤销回到初始值（text / priority / dueDate）");
+
+  /* ---- 审查十一③ 恢复别页的值保留其操作身份：
+     (1) A1 O→a，B1 a→b，A2 b→c；A 撤销 A2 露出 b（仍属 B1），B 撤销 B1 须回到 a，A 再撤销 A1 回到 O
+     (2) A 改 O→a，B 改 a→b，B 撤销回到 a（仍属 A 那步），A 撤销须回到 O ---- */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b", "c"], priority: ["low", "medium", "high", "low"], dueDate: [null, "2030-01-02", "2030-03-04", "2030-05-06"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const setup = () => {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+      const B = loadApp({ storage });
+      const cur = () => diskTodos(storage).find((t) => t.id === x.id)[field] ?? null;
+      /* 每步之间让出事件循环：撤销步按真实时序在微任务里封口，之后到达的远端写不再并进它的 before */
+      const settle = () => new Promise((r) => setTimeout(r, 0));
+      const edit = async (P, Q, v) => {
+        assert.equal(P.invoke("update_todo", { id: x.id, [param]: v }).ok, true);
+        await settle();
+        Q.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      };
+      const undo = async (P, Q) => {
+        assert.equal(P.invoke("undo").ok, true);
+        await settle();
+        Q.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      };
+      return { A, B, id: x.id, cur, edit, undo };
+    };
+    {
+      const { A, B, id, cur, edit, undo } = setup();
+      await edit(A, B, vals[1]);
+      await edit(B, A, vals[2]);
+      await edit(A, B, vals[3]);
+      await undo(A, B);
+      assert.equal(cur(), vals[2], `${field}：(1) A 撤销 A2 露出 B1 的值`);
+      await undo(B, A);
+      assert.equal(cur(), vals[1], `${field}：(1) B 撤销 B1 不得被跳过，须回到 A1 的值`);
+      await undo(A, B);
+      assert.equal(cur(), vals[0], `${field}：(1) A 再撤销 A1 回到初始值`);
+      assert.equal(B.invoke("list_todos", {}).todos.find((t) => t.id === id)[field] ?? null, vals[0], `${field}：(1) B 内存随事件一致`);
+    }
+    {
+      const { A, B, cur, edit, undo } = setup();
+      await edit(A, B, vals[1]);
+      await edit(B, A, vals[2]);
+      await undo(B, A);
+      assert.equal(cur(), vals[1], `${field}：(2) B 撤销回到 A 的值`);
+      await undo(A, B);
+      assert.equal(cur(), vals[0], `${field}：(2) A 撤销不得被跳过，须回到初始值`);
+    }
+  }
+  ok("审查十一③ 恢复别页的值保留其操作身份：撤销链可继续逐步回退（text / priority / dueDate）");
+
+  /* ---- 审查十一④ 删除写入版本化墓碑：B 改 Y（快照含未改的 X），A 删 X，C 随后收到 B 的迟到快照——
+     X 不得被补回内存或写回盘（C 收没收到 A 删除的 storage 事件都一样）；
+     A 撤销删除后，各页再收到删除前的旧快照或删除时的旧墓碑，都不得丢掉 X ---- */
+  {
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    const ids = (P) => P.invoke("list_todos", {}).todos.map((t) => t.id);
+    const setup = () => {
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "X" }).todo;
+      const y = A.invoke("add_todo", { text: "Y" }).todo;
+      const B = loadApp({ storage });
+      const C = loadApp({ storage });
+      assert.equal(B.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);
+      const lateB = storage.getItem(TODO_KEY);
+      assert.ok(JSON.parse(lateB).todos.some((t) => t.id === x.id), "B 的快照应含未改动的 X");
+      assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+      const afterDel = storage.getItem(TODO_KEY);
+      assert.ok(JSON.parse(afterDel)._tomb[x.id], "删除应把墓碑随快照落盘");
+      return { storage, A, B, C, x, y, lateB, afterDel };
+    };
+    for (const deliverDelete of [true, false]) {
+      const { storage, A, B, C, x, y, lateB, afterDel } = setup();
+      if (deliverDelete) C.deliverStorage(TODO_KEY, afterDel);
+      C.deliverStorage(TODO_KEY, lateB);
+      assert.ok(!ids(C).includes(x.id), `C 内存不得复活 X（deliverDelete=${deliverDelete}）`);
+      assert.ok(!diskTodos(storage).some((t) => t.id === x.id), `盘上不得复活 X（deliverDelete=${deliverDelete}）`);
+      A.deliverStorage(TODO_KEY, lateB);
+      /* B 不收自己快照的事件；没收到删除事件时它只是还没见到删除，下次写盘前的读盘会跟上 */
+      if (deliverDelete) B.deliverStorage(TODO_KEY, afterDel);
+      else assert.ok(B.invoke("add_todo", { text: "Z" }).ok);
+      for (const [n, P] of [["A", A], ["B", B], ["C", C]]) assert.ok(!ids(P).includes(x.id), `${n} 内存不得复活 X（deliverDelete=${deliverDelete}）`);
+      assert.ok(!diskTodos(storage).some((t) => t.id === x.id), `各页处理迟到快照后盘上仍无 X（deliverDelete=${deliverDelete}）`);
+      assert.equal(diskTodos(storage).find((t) => t.id === y.id).text, "Y2", "B 对 Y 的编辑保留");
+      /* 新开的页面从盘加载：墓碑随存储快照持久化 */
+      const D = loadApp({ storage });
+      D.deliverStorage(TODO_KEY, lateB);
+      assert.ok(!ids(D).includes(x.id), `重新加载的页面收到迟到快照也不复活 X（deliverDelete=${deliverDelete}）`);
+    }
+    {
+      const { storage, A, B, C, x, lateB, afterDel } = setup();
+      B.deliverStorage(TODO_KEY, afterDel);   // B 持有墓碑
+      await settle();
+      assert.equal(A.invoke("undo").ok, true);
+      const afterUndo = storage.getItem(TODO_KEY);
+      assert.ok(diskTodos(storage).some((t) => t.id === x.id), "撤销删除后盘上有 X");
+      await settle();
+      C.deliverStorage(TODO_KEY, lateB);      // 删除前的旧快照
+      C.deliverStorage(TODO_KEY, afterDel);   // 删除时的旧墓碑
+      B.deliverStorage(TODO_KEY, afterUndo);
+      B.deliverStorage(TODO_KEY, lateB);
+      A.deliverStorage(TODO_KEY, lateB);
+      A.deliverStorage(TODO_KEY, afterDel);
+      for (const [n, P] of [["A", A], ["B", B], ["C", C]]) assert.ok(ids(P).includes(x.id), `撤销删除后 ${n} 内存不得丢 X`);
+      assert.ok(diskTodos(storage).some((t) => t.id === x.id), "撤销删除后各页收到旧快照/旧墓碑，盘上仍有 X");
+      assert.ok(B.invoke("add_todo", { text: "Z" }).ok);
+      assert.ok(diskTodos(storage).some((t) => t.id === x.id), "持有旧墓碑的页面再写盘也不删 X");
+      const afterZ = storage.getItem(TODO_KEY);   // 含撤销删除后的 X
+      /* 撤销删除之后再删：新的删除照常胜出 */
+      assert.equal(C.invoke("delete_todo", { id: x.id }).ok, true);
+      A.deliverStorage(TODO_KEY, afterZ);
+      assert.ok(!ids(A).includes(x.id) && !diskTodos(storage).some((t) => t.id === x.id), "再次删除后，撤销删除时的旧快照不得复活 X");
+    }
+    {
+      /* 旧存档没有 _tomb：照常加载、合并 */
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "X" }).todo;
+      const raw = JSON.parse(storage.getItem(TODO_KEY));
+      delete raw._tomb;
+      storage.setItem(TODO_KEY, JSON.stringify(raw));
+      const B = loadApp({ storage });
+      assert.ok(ids(B).includes(x.id), "无 _tomb 的旧数据照常加载");
+    }
+  }
+  ok("审查十一④ 删除写入版本化墓碑：迟到快照不再复活已删任务；撤销删除生成新版本，旧快照/旧墓碑不丢任务");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
