@@ -5448,11 +5448,23 @@ async function main() {
       for (const k of ["temperature", "top_p", "top_k"]) assert.equal(Object.prototype.hasOwnProperty.call(b, k), false, `${model} 不得发送 ${k}`);
       assert.ok(b.max_tokens >= 16000, `${model} max_tokens 应留出思考预算：${b.max_tokens}`);
       assert.equal(b.tool_choice.type, "auto");
+    }
+    /* 审查 PR8 复审②：只有拒绝强制工具的型号对 required 失败关闭，其余映射为 any */
+    for (const model of ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-mythos-5-1"]) {
+      assert.equal(ai.setModel(model).ok, true);
       sent.length = 0;
       const req = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true, tool_choice: "required" });
       assert.equal(req.ok, false, `${model} required 应失败关闭`);
       assert.equal(req.code, "UNSUPPORTED_TOOL_CHOICE");
       assert.equal(sent.length, 0, "失败关闭时不发请求");
+    }
+    for (const model of ["claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-haiku-5-5"]) {
+      assert.equal(ai.setModel(model).ok, true);
+      sent.length = 0;
+      const req = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true, temperature: 0.2, tool_choice: "required" });
+      assert.equal(req.ok, true, model + JSON.stringify(req));
+      assert.deepEqual(sent[0].body.tool_choice, { type: "any" }, `${model} required 应映射为 any`);
+      assert.equal(Object.prototype.hasOwnProperty.call(sent[0].body, "temperature"), false, `${model} 仍不得发送 temperature`);
     }
     for (const model of ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"]) {
       assert.equal(ai.setModel(model).ok, true);
@@ -5466,7 +5478,7 @@ async function main() {
       assert.equal(b.max_tokens, 1500);
       assert.deepEqual(b.tool_choice, { type: "any" });
     }
-    ok("审查 PR8① 新款 Claude 不发采样参数且放宽 max_tokens；required 仅旧款映射为 any，其余失败关闭");
+    ok("审查 PR8① 新款 Claude 不发采样参数且放宽 max_tokens；复审② required 仅对拒绝强制工具的型号失败关闭");
   }
 
   /* ---- Anthropic 流式事件（text_delta/input_json_delta/message_delta）---- */

@@ -1102,17 +1102,26 @@
   }
 
   /**
-   * 只有这些旧款 Claude 接受 temperature 与 tool_choice:any。更新的型号（Opus 4.7 起、Fable、
-   * Sonnet/Haiku 5.x）对任何非默认 temperature 返回 400，且常开思考，强制工具调用同样会被拒绝。
+   * 只有这些旧款 Claude 接受 temperature。更新的型号（Opus 4.7 起、Fable、Sonnet/Haiku 5.x）
+   * 对任何非默认 temperature 返回 400。
    */
   const ANTHROPIC_LEGACY_SAMPLING = /^claude-(?:sonnet-4-6|haiku-4-5)(?:-\d{8})?$/i;
   function anthropicAcceptsSampling(model) {
     return ANTHROPIC_LEGACY_SAMPLING.test(String(model || ""));
   }
 
+  /**
+   * 与采样参数是两张独立的表：只有这些型号对 tool_choice any/tool 返回 400，
+   * 其余（含 Opus 5、Fable 5、Opus 4.8/4.7、Sonnet 5、Haiku 5.5）照常接受强制工具调用。
+   */
+  const ANTHROPIC_REJECTS_FORCED_TOOL = /^claude-(?:fable-5-1|opus-5-5|sonnet-5-5|mythos-5-1)(?:-\d{8})?$/i;
+  function anthropicRejectsForcedTool(model) {
+    return ANTHROPIC_REJECTS_FORCED_TOOL.test(String(model || ""));
+  }
+
   function toAnthropicToolChoice(choice, model) {
     if (choice === "required") {
-      if (anthropicAcceptsSampling(model)) return { type: "any" };
+      if (!anthropicRejectsForcedTool(model)) return { type: "any" };
       // 降级成 auto 会悄悄改变语义：调用方要求必须调工具，模型却可以直接回文字
       const err = new Error(`${model} 不支持强制工具调用（tool_choice: required）`);
       err.code = "UNSUPPORTED_TOOL_CHOICE";
