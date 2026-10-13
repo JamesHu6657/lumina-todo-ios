@@ -15,6 +15,7 @@
       label: "OpenCode Zen",
       base: "https://opencode.ai/zen/go/v1",
       model: "deepseek-v4-flash",
+      models: ["deepseek-v4-flash"],
       keyStore: "lumina-api-key",
       keyHint: "sk-…",
       keyPattern: /^sk-/,
@@ -24,6 +25,97 @@
       label: "Command Code",
       base: "https://api.commandcode.ai/provider/v1",
       model: "deepseek/deepseek-v4.1-flash",
+      // Claude 系列只走 Anthropic /messages 接口（官方文档），claude-* 自动切换协议
+      anthropic: true,
+      models: [
+        "claude-sonnet-5-5|Claude Sonnet 5.5",
+        "claude-sonnet-5|Claude Sonnet 5",
+        "claude-sonnet-4-6|Claude Sonnet 4.6",
+        "claude-fable-5-1|Claude Fable 5.1",
+        "claude-fable-5|Claude Fable 5",
+        "claude-opus-5-5|Claude Opus 5.5",
+        "claude-opus-5|Claude Opus 5",
+        "claude-opus-4-8|Claude Opus 4.8",
+        "claude-opus-4-7|Claude Opus 4.7",
+        "claude-haiku-5-5|Claude Haiku 5.5",
+        "claude-haiku-4-5-20251001|Claude Haiku 4.5",
+        "gpt-6-astra|GPT-6 Astra",
+        "gpt-6.1-sol|GPT-6.1 Sol",
+        "gpt-6-sol|GPT-6 Sol",
+        "gpt-6-luna|GPT-6 Luna",
+        "gpt-5.6-sol|GPT-5.6 Sol",
+        "gpt-5.6-terra|GPT-5.6 Terra",
+        "gpt-5.6-luna|GPT-5.6 Luna",
+        "gpt-5.5|GPT-5.5",
+        "gpt-5.4|GPT-5.4",
+        "gpt-5.3-codex|GPT-5.3 Codex",
+        "gpt-5.4-mini|GPT-5.4 Mini",
+        "deepseek/deepseek-v4-pro|DeepSeek V4 Pro (latest)",
+        "deepseek/deepseek-v4-flash|DeepSeek V4 Flash (latest)",
+        "deepseek/deepseek-v4-flash-vision-exp|DeepSeek V4 Flash Vision (exp)",
+        "deepseek/deepseek-v4-flash-fast|DeepSeek V4 Flash Fast",
+        "deepseek/deepseek-v4.1-flash|DeepSeek V4.1 Flash",
+        "deepseek/deepseek-v4.1-flash-fast|DeepSeek V4.1 Flash Fast",
+        "moonshotai/Kimi-K3|Kimi K3",
+        "moonshotai/Kimi-K2.7-Code|Kimi K2.7 Code",
+        "moonshotai/Kimi-K2.7-Code-Highspeed|Kimi K2.7 Code HighSpeed",
+        "moonshotai/Kimi-K2.6|Kimi K2.6",
+        "moonshotai/Kimi-K2.5|Kimi K2.5",
+        "z-ai/glm-5.3-flash|GLM-5.3 Flash",
+        "z-ai/glm-5.3-flashx|GLM-5.3 FlashX",
+        "zai-org/GLM-5.3|GLM-5.3",
+        "zai-org/GLM-5.2|GLM-5.2",
+        "zai-org/GLM-5.2-Fast|GLM-5.2 Fast",
+        "zai-org/GLM-5.1|GLM-5.1",
+        "zai-org/GLM-5|GLM-5",
+        "MiniMaxAI/MiniMax-M3|MiniMax M3",
+        "MiniMaxAI/MiniMax-M2.7|MiniMax M2.7",
+        "MiniMaxAI/MiniMax-M2.5|MiniMax M2.5",
+        "xiaomi/mimo-v2.6-pro|MiMo V2.6 Pro",
+        "xiaomi/mimo-v2.6-pro-ultraspeed|MiMo V2.6 Pro UltraSpeed",
+        "xiaomi/mimo-v2.6-flash|MiMo V2.6 Flash",
+        "xiaomi/mimo-v2.5-pro|MiMo V2.5 Pro",
+        "xiaomi/mimo-v2.5|MiMo V2.5",
+        "Qwen/Qwen3.8-Omni-Flash|Qwen 3.8 Omni Flash",
+        "Qwen/Qwen3.8-Max-0902|Qwen 3.8 Max 0902",
+        "Qwen/Qwen3.8-Max|Qwen 3.8 Max",
+        "Qwen/Qwen3.8-27B|Qwen 3.8 27B",
+        "Qwen/Qwen3.8-Flash|Qwen 3.8 Flash",
+        "Qwen/Qwen3.7-Max|Qwen 3.7 Max",
+        "Qwen/Qwen3.7-Plus|Qwen 3.7 Plus",
+        "Qwen/Qwen3.7-Flash|Qwen 3.7 Flash",
+        "Qwen/Qwen3.6-Max-Preview|Qwen 3.6 Max Preview",
+        "Qwen/Qwen3.6-Plus|Qwen 3.6 Plus",
+        "meituan/LongCat-2.0|LongCat 2.0",
+        "stepfun/Step-5-Preview|Step 5 Preview",
+        "stepfun/Step-3.7-Flash|Step 3.7 Flash",
+        "stepfun/Step-3.5-Flash|Step 3.5 Flash",
+        "tencent/hy3-paid|Tencent Hy3",
+        "tencent/hy4-preview|Tencent Hy4 Preview",
+        "google/gemini-3.8-flash|Gemini 3.8 Flash",
+        "google/gemini-3.7-flash|Gemini 3.7 Flash",
+        "google/gemini-3.6-flash|Gemini 3.6 Flash",
+        "google/gemini-3.5-flash|Gemini 3.5 Flash",
+        "google/gemini-3.5-flash-lite|Gemini 3.5 Flash Lite",
+        "google/gemini-3.1-flash-lite|Gemini 3.1 Flash Lite",
+        "sakana/fugu-ultra|Fugu Ultra",
+        "nvidia/nemotron-3-ultra-550b-a55b|Nemotron 3 Ultra",
+        "thinkingmachines/inkling|Inkling",
+        "thinkingmachines/inkling-small|Inkling Small",
+        "stealth/glyph-cluster:free|Glyph Cluster",
+        "poolside/laguna-s-2.1-free|Laguna S 2.1",
+        "inclusionai/ling-3.0-flash-sante:free|Ling 3.0 Flash Sante",
+        "inclusionai/ling-3.1-flash:free|Ling 3.1 Flash",
+        "meta/muse-spark-1.1|Muse Spark 1.1",
+        "meta/muse-spark-1.2|Muse Spark 1.2",
+        "meta/muse-spark-1.2-contributor|Muse Spark 1.2 Contributor",
+        "meta/muse-spark-1.3|Muse Spark 1.3",
+        "meta/muse-spark-1.3-contributor|Muse Spark 1.3 Contributor",
+        "xai/grok-4.5|Grok 4.5",
+        "xai/grok-4.6|Grok 4.6",
+        "xai/grok-4.7|Grok 4.7",
+        "mistral/mistral-large-4|Mistral Large 4",
+      ],
       keyStore: "lumina-api-key-commandcode",
       keyHint: "Studio 生成的 API Key",
       keyPattern: null,
@@ -32,6 +124,59 @@
       id: "factory",
       label: "Factory（VPS 中转）",
       model: "deepseek-v4.1-flash",
+      // 与 VPS 上 droid exec --help 的可用模型一致；relais 的 ALLOWED_MODELS 同步此列表
+      models: [
+        "auto|Auto Model（自动选模型）",
+        "claude-fable-5.1|Claude Fable 5.1",
+        "claude-fable-5|Claude Fable 5",
+        "claude-opus-5-5|Claude Opus 5.5",
+        "claude-opus-5|Claude Opus 5",
+        "claude-opus-5-fast|Claude Opus 5 Fast",
+        "claude-opus-4-8|Claude Opus 4.8",
+        "claude-opus-4-8-fast|Claude Opus 4.8 Fast",
+        "claude-opus-4-7|Claude Opus 4.7",
+        "claude-opus-4-6|Claude Opus 4.6",
+        "claude-opus-4-5-20251101|Claude Opus 4.5",
+        "claude-sonnet-5|Claude Sonnet 5",
+        "claude-sonnet-4-6|Claude Sonnet 4.6",
+        "claude-sonnet-4-5-20250929|Claude Sonnet 4.5",
+        "claude-haiku-4-5-20251001|Claude Haiku 4.5",
+        "gpt-6-astra|GPT-6 Astra",
+        "gpt-6-sol|GPT-6 Sol",
+        "gpt-6-luna|GPT-6 Luna",
+        "gpt-5.6-sol|GPT-5.6 Sol",
+        "gpt-5.6-sol-fast|GPT-5.6 Sol Fast",
+        "gpt-5.6-terra|GPT-5.6 Terra",
+        "gpt-5.6-luna|GPT-5.6 Luna",
+        "gpt-5.5|GPT-5.5",
+        "gpt-5.5-fast|GPT-5.5 Fast",
+        "gpt-5.5-pro|GPT-5.5 Pro",
+        "gpt-5.4|GPT-5.4",
+        "gpt-5.4-fast|GPT-5.4 Fast",
+        "gpt-5.4-mini|GPT-5.4 Mini",
+        "gpt-5.4-mini-fast|GPT-5.4 Mini Fast",
+        "gpt-5.3-codex|GPT-5.3-Codex",
+        "gpt-5.3-codex-fast|GPT-5.3-Codex Fast",
+        "gpt-5.2|GPT-5.2",
+        "gemini-3.1-pro-preview|Gemini 3.1 Pro",
+        "gemini-3.8-flash|Gemini 3.8 Flash",
+        "gemini-3.7-flash|Gemini 3.7 Flash",
+        "gemini-3.6-flash|Gemini 3.6 Flash",
+        "gemini-3.5-flash|Gemini 3.5 Flash",
+        "gemini-3-flash-preview|Gemini 3 Flash",
+        "inkling|Inkling",
+        "mistral-medium-3.5|Mistral Medium 3.5",
+        "glm-5.3-flash|GLM-5.3-Flash",
+        "glm-5.3|GLM-5.3",
+        "glm-5.2|GLM-5.2",
+        "kimi-k3|Kimi K3",
+        "qwen3.8-max|Qwen3.8 Max",
+        "nemotron-3-ultra|Nemotron 3 Ultra",
+        "deepseek-v4.1-flash|DeepSeek V4.1 Flash",
+        "grok-4.7|Grok 4.7",
+        "grok-4.6|Grok 4.6",
+        "grok-4.5|Grok 4.5",
+      ],
       keyStore: "lumina-api-key-factory",
       keyHint: "中转口令",
       keyPattern: null,
@@ -46,6 +191,8 @@
   };
   const DEFAULT_PROVIDER = "opencode";
   const PROVIDER_STORE = "lumina-api-provider";
+  const MODEL_STORE_PREFIX = "lumina-api-model:";
+  const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
   const MIN_KEY = 20;
 
   function currentProvider() {
@@ -90,7 +237,55 @@
   }
   const aiEndpoint = (provider = currentProvider(), base = providerBase(provider)) =>
     base ? `${base}/chat/completions` : "";
-  const aiModel = () => currentProvider().model;
+
+  /** 服务商的内置模型列表："id|label" → {id, label}；label 缺省用 id */
+  function providerModels(provider) {
+    return (provider.models || []).map((entry) => {
+      const [id, ...rest] = String(entry).split("|");
+      return { id: id.trim(), label: (rest.join("|").trim() || id.trim()) };
+    });
+  }
+
+  /** 当前服务商的已选模型；没选过用默认 */
+  function selectedModel(provider = currentProvider()) {
+    try {
+      const stored = localStorage.getItem(MODEL_STORE_PREFIX + provider.id);
+      if (stored && MODEL_ID_RE.test(stored)) return stored;
+    } catch {
+      /* ignore */
+    }
+    return provider.model;
+  }
+
+  function setProviderModel(providerId, modelId) {
+    const p = AI_PROVIDERS[providerId];
+    if (!p) return { ok: false, error: "未知服务商：" + providerId };
+    const m = String(modelId || "").trim();
+    if (!MODEL_ID_RE.test(m)) return { ok: false, error: "模型 ID 不合法" };
+    try {
+      localStorage.setItem(MODEL_STORE_PREFIX + p.id, m);
+    } catch {
+      /* ignore */
+    }
+    if (selectedModel(p) !== m) {
+      return { ok: false, error: "无法保存模型选择（存储不可用）" };
+    }
+    return { ok: true, model: m };
+  }
+
+  /** claude-* 在 Command Code 上必须走 Anthropic Messages 接口 */
+  function apiStyle(provider, model) {
+    return provider.anthropic && /^claude/i.test(String(model || ""))
+      ? "anthropic"
+      : "openai";
+  }
+
+  function chatEndpoint(provider, base, model = selectedModel(provider)) {
+    if (!base) return "";
+    return apiStyle(provider, model) === "anthropic" ? `${base}/messages` : aiEndpoint(provider, base);
+  }
+
+  const aiModel = (provider = currentProvider()) => selectedModel(provider);
 
   const LIMITS = {
     maxActiveRequests: 8,
@@ -114,6 +309,7 @@
     maxToolCallsPerResponse: 32,
     maxCompleteResponseChars: 256 * 1024,
     maxErrorResponseChars: 8 * 1024,
+    maxListedModels: 500,
     apiKeyCacheMs: 60000,
   };
 
@@ -837,6 +1033,199 @@
     }
   }
 
+  /* ---------------------- Anthropic Messages 适配（claude-*） ---------------------- */
+
+  /** OpenAI messages → Anthropic {system, messages}；tool 结果并入相邻 user 消息 */
+  function toAnthropicMessages(messages) {
+    const system = [];
+    const out = [];
+    const textBlocks = (content) => [{ type: "text", text: String(content ?? "") }];
+    for (const m of messages) {
+      if (m.role === "system") {
+        system.push(String(m.content || ""));
+        continue;
+      }
+      if (m.role === "tool") {
+        const block = {
+          type: "tool_result",
+          tool_use_id: String(m.tool_call_id || ""),
+          content: String(m.content ?? ""),
+        };
+        const last = out[out.length - 1];
+        if (last?.role === "user" && last.__toolResults) {
+          last.content.push(block);
+        } else {
+          out.push({ role: "user", content: [block], __toolResults: true });
+        }
+        continue;
+      }
+      if (m.role === "assistant") {
+        const blocks = [];
+        if (m.content) blocks.push({ type: "text", text: String(m.content) });
+        for (const tc of m.tool_calls || []) {
+          let input = {};
+          try {
+            input = JSON.parse(tc.function?.arguments || "{}");
+          } catch {
+            /* 保持空对象 */
+          }
+          blocks.push({
+            type: "tool_use",
+            id: String(tc.id || ""),
+            name: String(tc.function?.name || ""),
+            input,
+          });
+        }
+        out.push({ role: "assistant", content: blocks.length ? blocks : textBlocks("") });
+        continue;
+      }
+      out.push({ role: "user", content: textBlocks(m.content) });
+    }
+    for (const m of out) delete m.__toolResults;
+    return { system: system.join("\n\n"), messages: out };
+  }
+
+  function toAnthropicTools(tools) {
+    return tools.map((t) => ({
+      name: String(t.function?.name || ""),
+      description: String(t.function?.description || ""),
+      input_schema: t.function?.parameters || { type: "object", properties: {} },
+    }));
+  }
+
+  function toAnthropicToolChoice(choice) {
+    if (choice === "required") return { type: "any" };
+    if (choice === "none") return { type: "none" };
+    return { type: "auto" };
+  }
+
+  // pause_turn 不在表里：原样透传，按“未知结束原因”处理——文本照常返回，工具调用失败关闭
+  const ANTHROPIC_STOP = {
+    end_turn: "stop",
+    stop_sequence: "stop",
+    tool_use: "tool_calls",
+    max_tokens: "length",
+    refusal: "content_filter",
+  };
+
+  /** stop_reason → OpenAI finish_reason；非字符串交给 normalizeFinishReason 判协议异常 */
+  function anthropicFinish(raw) {
+    if (typeof raw === "string" && hasOwn(ANTHROPIC_STOP, raw)) return ANTHROPIC_STOP[raw];
+    return raw;
+  }
+
+  function isPlainObject(v) {
+    return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+  }
+
+  /** 校验 tool_use 块的 id / name；结构不对就整轮失败，绝不拼出半截调用去执行 */
+  function assertToolUseBlock(block) {
+    if (typeof block.id !== "string" || typeof block.name !== "string" || !block.name) {
+      throw streamProtocolError("tool_use 块结构异常");
+    }
+  }
+
+  /**
+   * Anthropic 非流式 JSON → OpenAI choices 形状，让现有解析与校验路径复用。
+   * 调用方已排除错误体与非对象；这里对块结构失败关闭。
+   */
+  function anthropicToOpenAI(data) {
+    if (!Array.isArray(data.content)) throw streamProtocolError("content 结构异常");
+    const texts = [];
+    let reasoning = "";
+    const calls = [];
+    for (const b of data.content) {
+      if (!isPlainObject(b)) throw streamProtocolError("content 块结构异常");
+      if (b.type === "text") {
+        if (typeof b.text !== "string") throw streamProtocolError("text 块类型异常");
+        texts.push(b.text);
+      } else if (b.type === "thinking") {
+        if (hasOwn(b, "thinking") && typeof b.thinking !== "string") {
+          throw streamProtocolError("thinking 块类型异常");
+        }
+        reasoning += b.thinking || "";
+      } else if (b.type === "tool_use") {
+        assertToolUseBlock(b);
+        const input = b.input == null ? {} : b.input;
+        if (!isPlainObject(input)) throw streamProtocolError("工具参数类型异常");
+        calls.push({
+          id: b.id,
+          type: "function",
+          function: { name: b.name, arguments: JSON.stringify(input) },
+        });
+      }
+      // redacted_thinking / server_tool_use 等：不含客户端可执行内容，忽略
+    }
+    const msg = { role: "assistant", content: texts.join(""), tool_calls: calls };
+    if (reasoning) msg.reasoning_content = reasoning;
+    return {
+      model: typeof data.model === "string" ? data.model : undefined,
+      choices: [{ message: msg, finish_reason: anthropicFinish(data.stop_reason) }],
+    };
+  }
+
+  const ANTHROPIC_STREAM_END = { done: true };
+
+  /**
+   * Anthropic SSE 事件 → OpenAI delta 形状，喂给 applyDelta（其中的 validateToolDelta /
+   * 大小上限照常生效）。message_stop 等价于 [DONE]；字段类型不对一律协议异常。
+   * 返回 null 表示与本客户端无关的事件（message_start / content_block_stop / ping / 新增类型）。
+   */
+  function anthropicEventDelta(evt) {
+    if (evt.type === "message_stop") return ANTHROPIC_STREAM_END;
+    if (evt.type === "content_block_start") {
+      const block = evt.content_block;
+      if (!isPlainObject(block)) throw streamProtocolError("content_block 结构异常");
+      if (block.type === "tool_use") {
+        assertToolUseBlock(block);
+        return {
+          delta: {
+            tool_calls: [{
+              index: evt.index,
+              id: block.id,
+              type: "function",
+              function: { name: block.name },
+            }],
+          },
+        };
+      }
+      if (block.type === "text") {
+        if (hasOwn(block, "text") && typeof block.text !== "string") {
+          throw streamProtocolError("text 块类型异常");
+        }
+        return block.text ? { delta: { content: block.text } } : null;
+      }
+      return null;
+    }
+    if (evt.type === "content_block_delta") {
+      const d = evt.delta;
+      if (!isPlainObject(d)) throw streamProtocolError("delta 结构异常");
+      if (d.type === "text_delta") {
+        if (typeof d.text !== "string") throw streamProtocolError("text_delta 类型异常");
+        return { delta: { content: d.text } };
+      }
+      if (d.type === "thinking_delta") {
+        if (typeof d.thinking !== "string") throw streamProtocolError("thinking_delta 类型异常");
+        return { delta: { reasoning_content: d.thinking } };
+      }
+      if (d.type === "input_json_delta") {
+        // 没有 index 的参数片段无法归属到具体调用：validateToolDelta 会判协议异常
+        return {
+          delta: {
+            tool_calls: [{ index: evt.index, function: { arguments: d.partial_json } }],
+          },
+        };
+      }
+      return null; // signature_delta 等
+    }
+    if (evt.type === "message_delta") {
+      const d = evt.delta == null ? {} : evt.delta;
+      if (!isPlainObject(d)) throw streamProtocolError("message_delta 结构异常");
+      return { delta: {}, finish: anthropicFinish(d.stop_reason) };
+    }
+    return null;
+  }
+
   /* ----------------------------- active requests ----------------------------- */
   const active = new Map();
   let seq = 0;
@@ -911,7 +1300,9 @@
     provider = currentProvider(),
     base = providerBase(provider),
   }) {
-    const endpoint = aiEndpoint(provider, base);
+    const model = selectedModel(provider);
+    const style = apiStyle(provider, model);
+    const endpoint = chatEndpoint(provider, base, model);
     if (!base) {
       const err = new Error("未设置 Factory 中转地址，请在设置里填写 https:// 开头的地址。");
       err.code = "NO_BASE";
@@ -931,23 +1322,42 @@
       err.code = "EMPTY_MESSAGES";
       throw err;
     }
-    const body = {
-      model: provider.model,
-      messages: clipped,
-      stream: Boolean(stream),
-    };
-    if (provider.samplingParams !== false) {
-      body.temperature = clampNumber(temperature, 0, 2, 0.4);
-      body.max_tokens = clampNumber(
-        max_tokens,
-        LIMITS.maxTokens.min,
-        LIMITS.maxTokens.max,
-        LIMITS.maxTokens.default
-      );
-    }
-    if (tools?.length) {
-      body.tools = tools;
-      body.tool_choice = tool_choice || "auto";
+    const maxTokens = clampNumber(
+      max_tokens,
+      LIMITS.maxTokens.min,
+      LIMITS.maxTokens.max,
+      LIMITS.maxTokens.default
+    );
+    let body;
+    if (style === "anthropic") {
+      const { system, messages: converted } = toAnthropicMessages(clipped);
+      // Anthropic Messages 规定 max_tokens 必填
+      body = {
+        model,
+        messages: converted,
+        stream: Boolean(stream),
+        max_tokens: maxTokens,
+      };
+      if (provider.samplingParams !== false) body.temperature = clampNumber(temperature, 0, 2, 0.4);
+      if (system) body.system = system;
+      if (tools?.length) {
+        body.tools = toAnthropicTools(tools);
+        body.tool_choice = toAnthropicToolChoice(tool_choice);
+      }
+    } else {
+      body = {
+        model,
+        messages: clipped,
+        stream: Boolean(stream),
+      };
+      if (provider.samplingParams !== false) {
+        body.temperature = clampNumber(temperature, 0, 2, 0.4);
+        body.max_tokens = maxTokens;
+      }
+      if (tools?.length) {
+        body.tools = tools;
+        body.tool_choice = tool_choice || "auto";
+      }
     }
 
     const linkAc = new AbortController();
@@ -974,6 +1384,11 @@
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     };
+    // Anthropic 网关要求 x-api-key + anthropic-version；Bearer 一并带上兼容代理
+    if (style === "anthropic") {
+      headers["x-api-key"] = key;
+      headers["anthropic-version"] = "2023-06-01";
+    }
     // Accept 为 CORS 安全列表头，不单独触发 preflight；流式时声明 SSE 偏好
     if (stream) headers.Accept = "text/event-stream";
 
@@ -1029,6 +1444,8 @@
 
     return {
       res,
+      style,
+      model,
       dispose() {
         if (timer) clearTimeout(timer);
         if (signal) signal.removeEventListener("abort", onParent);
@@ -1060,7 +1477,7 @@
   }
 
   async function consumeStream(res, onDelta, ctx = {}) {
-    const { signal, onStall } = ctx;
+    const { signal, onStall, style } = ctx;
     const reader = res.body?.getReader?.();
     let content = "";
     let reasoning = "";
@@ -1193,6 +1610,19 @@
         throw streamProtocolError("数据事件不是对象");
       }
       if (parser.done) return; // [DONE] 之后的普通数据不再计入（错误事件已在上面拦截）
+      if (style === "anthropic") {
+        try {
+          const ev = anthropicEventDelta(json);
+          if (ev === ANTHROPIC_STREAM_END) {
+            parser.done = true;
+            return;
+          }
+          if (ev) applyDelta(ev.delta, ev.finish);
+        } catch (err) {
+          throw normalizeStreamError(err);
+        }
+        return;
+      }
       if (json.choices == null) return; // usage 等无 choices 的块
       if (!Array.isArray(json.choices)) throw streamProtocolError("choices 结构异常");
       const choice = json.choices[0];
@@ -1247,6 +1677,7 @@
       if (!data || typeof data !== "object" || Array.isArray(data)) {
         throw streamProtocolError("响应体不是对象");
       }
+      if (style === "anthropic") data = anthropicToOpenAI(data);
       const choice = data?.choices?.[0];
       const msg = choice?.message || {};
       if (choice != null && (typeof choice !== "object" || Array.isArray(choice))) {
@@ -1465,7 +1896,7 @@
       return {
         ...noBaseError(),
         provider: provider.id,
-        model: provider.model,
+        model: selectedModel(provider),
         base,
         agent: true,
         tools,
@@ -1486,7 +1917,7 @@
       return {
         ok: false,
         provider: provider.id,
-        model: provider.model,
+        model: selectedModel(provider),
         base,
         agent: true,
         tools,
@@ -1501,7 +1932,7 @@
     return {
       ok: true,
       provider: provider.id,
-      model: provider.model,
+      model: selectedModel(provider),
       base,
       agent: true,
       tools,
@@ -1538,7 +1969,9 @@
         list: Object.values(AI_PROVIDERS).map((p) => ({
           id: p.id,
           label: p.label,
-          model: p.model,
+          model: selectedModel(p),
+          defaultModel: p.model,
+          models: providerModels(p),
           keyHint: p.keyHint,
           baseStore: Boolean(p.baseStore),
           base: providerBase(p),
@@ -1564,7 +1997,58 @@
       }
       const p = currentProvider();
       warmApiKey(p).catch(() => {});
-      return { ok: true, provider: p.id, model: p.model };
+      return { ok: true, provider: p.id, model: selectedModel(p) };
+    },
+    setModel(modelId) {
+      const p = currentProvider();
+      const r = setProviderModel(p.id, modelId);
+      return r.ok ? { ok: true, provider: p.id, model: r.model } : r;
+    },
+    async listModels(providerId) {
+      const p = AI_PROVIDERS[providerId];
+      if (!p) return { ok: false, error: "未知服务商：" + providerId };
+      const base = providerBase(p);
+      if (!base) {
+        return { ok: true, models: providerModels(p), source: "static" };
+      }
+      const headers = { "Content-Type": "application/json" };
+      try {
+        const key = await resolveApiKey({ provider: p });
+        if (key) headers.Authorization = `Bearer ${key}`;
+      } catch {
+        /* 无 key 也能拿公开列表 */
+      }
+      const ac = new AbortController();
+      const timer = setTimeout(
+        () => ac.abort(new DOMException("请求超时", "TimeoutError")),
+        LIMITS.connectTimeoutMs
+      );
+      try {
+        const res = await fetch(`${base}/models`, { method: "GET", headers, signal: ac.signal });
+        if (!res.ok) {
+          return { ok: true, models: providerModels(p), source: "static", status: res.status };
+        }
+        const data = await res.json();
+        const arr = Array.isArray(data?.data) ? data.data.slice(0, LIMITS.maxListedModels) : [];
+        const remote = arr
+          .filter((m) => m && typeof m === "object" && typeof m.id === "string")
+          .map((m) => ({
+            id: m.id,
+            label: (typeof m.name === "string" && m.name ? m.name : m.id).slice(0, 128),
+          }))
+          .filter((m) => MODEL_ID_RE.test(m.id));
+        if (!remote.length) {
+          return { ok: true, models: providerModels(p), source: "static" };
+        }
+        // 用内置列表里的中文别名；列表里没有的远端模型用远端名字
+        const known = new Map(providerModels(p).map((m) => [m.id, m.label]));
+        const merged = remote.map((m) => ({ id: m.id, label: known.get(m.id) || m.label }));
+        return { ok: true, models: merged, source: "remote" };
+      } catch {
+        return { ok: true, models: providerModels(p), source: "static" };
+      } finally {
+        clearTimeout(timer);
+      }
     },
 
     async complete(payload) {
@@ -1578,7 +2062,7 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      const endpoint = aiEndpoint(provider, base);
+      const endpoint = chatEndpoint(provider, base);
       if (!base) return { requestId, ...noBaseError() };
       if (!(await resolveApiKey({ provider }))) {
         return { requestId, ...noKeyError(provider) };
@@ -1620,12 +2104,12 @@
               const r = await consumeStream(
                 { body: null, headers: call.res.headers, text: async () => text },
                 null,
-                {}
+                { style: call.style }
               );
               return {
                 ok: true,
                 requestId,
-                model: provider.model,
+                model: call.model,
                 message: {
                   role: "assistant",
                   content: r.content || "",
@@ -1647,6 +2131,7 @@
             if (!data || typeof data !== "object" || Array.isArray(data)) {
               throw streamProtocolError("响应体不是对象");
             }
+            if (call.style === "anthropic") data = anthropicToOpenAI(data);
             if (data.choices != null && !Array.isArray(data.choices)) {
               throw streamProtocolError("choices 结构异常");
             }
@@ -1665,7 +2150,7 @@
             return {
               ok: true,
               requestId,
-              model: data.model || provider.model,
+              model: typeof data.model === "string" && data.model ? data.model : call.model,
               message: {
                 role: "assistant",
                 content: msg.content || "",
@@ -1722,7 +2207,7 @@
       }
       const provider = currentProvider();
       const base = providerBase(provider);
-      const endpoint = aiEndpoint(provider, base);
+      const endpoint = chatEndpoint(provider, base);
 
       if (pending.has(requestId)) {
         const message = "requestId 正在使用中";
@@ -1824,6 +2309,7 @@
               },
               {
                 signal: call.signal,
+                style: call.style,
                 onStall: () =>
                   entry.ac.abort(new DOMException("流已停顿", "TimeoutError")),
               }
@@ -1870,7 +2356,7 @@
         }
       })();
 
-      return { ok: true, requestId, model: provider.model };
+      return { ok: true, requestId, model: selectedModel(provider) };
     },
 
     async abort(requestId) {

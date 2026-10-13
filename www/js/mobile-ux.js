@@ -25,7 +25,11 @@
   function setVVH() {
     const vv = window.visualViewport;
     const h = vv?.height || window.innerHeight;
+    const top = vv?.offsetTop || 0;
     root.style.setProperty("--vvh", `${h}px`);
+    root.style.setProperty("--vvt", `${top}px`);
+    root.style.setProperty("--vvb", `${Math.max(0, window.innerHeight - h - top)}px`);
+    root.classList.toggle("kb-compact", h <= 320);
     // 无 Capacitor Keyboard 事件时，用 layout vs visual 差估键盘高度
     if (!kbFromPlugin) {
       const layoutH = window.innerHeight;
@@ -33,6 +37,8 @@
       // 小于 80 多半是地址栏伸缩，不当作键盘
       setKeyboardHeight(estimate >= 80 ? estimate : 0, false);
     }
+    const active = document.activeElement;
+    if (isEditableTarget(active)) focusScrollIntoView(active);
   }
 
   function setKeyboardHeight(px, fromPlugin) {
@@ -352,23 +358,31 @@
   function focusScrollIntoView(el) {
     if (!el || el.disabled) return;
     const run = () => {
+      if (document.activeElement !== el || !el.isConnected) return;
+      if (el.id === "chatInput") {
+        if (el.selectionStart === el.value.length && el.selectionEnd === el.selectionStart) {
+          el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        }
+        return;
+      }
       try {
-        // 先滚最近可滚动祖先，再滚自身
         const scroller =
-          el.closest(".settings-body, .chat-log, .scroller, .chat-drawer") ||
-          el.closest(".main") ||
-          null;
+          el.closest(".settings-body, .scroller, .main");
         if (scroller && typeof scroller.scrollTop === "number") {
           const er = el.getBoundingClientRect();
           const sr = scroller.getBoundingClientRect();
-          const vvH = window.visualViewport?.height || window.innerHeight;
-          const visibleBottom = Math.min(sr.bottom, vvH - 8);
-          if (er.bottom > visibleBottom - 12 || er.top < sr.top + 8) {
-            const delta = er.top - sr.top - Math.max(24, (visibleBottom - sr.top) * 0.28);
-            scroller.scrollTop += delta;
+          const vv = window.visualViewport;
+          const top = vv?.offsetTop || 0;
+          const visibleTop = Math.max(sr.top, top) + 12;
+          const visibleBottom = Math.min(sr.bottom, top + (vv?.height || window.innerHeight)) - 12;
+          if (er.bottom > visibleBottom) {
+            scroller.scrollTop += er.bottom - visibleBottom;
+          } else if (er.top < visibleTop) {
+            scroller.scrollTop -= visibleTop - er.top;
           }
+        } else {
+          el.scrollIntoView({ block: "nearest" });
         }
-        el.scrollIntoView({ block: "center", behavior: "smooth" });
       } catch {
         try {
           el.scrollIntoView(true);
@@ -439,24 +453,24 @@
       await KB.addListener("keyboardWillShow", (info) => {
         const h = info?.keyboardHeight ?? info?.height ?? 0;
         setKeyboardHeight(h, true);
-        const a = document.activeElement;
-        if (isEditableTarget(a)) focusScrollIntoView(a);
+        setVVH();
       });
       await KB.addListener("keyboardDidShow", (info) => {
         const h = info?.keyboardHeight ?? info?.height ?? 0;
         setKeyboardHeight(h, true);
-        const a = document.activeElement;
-        if (isEditableTarget(a)) focusScrollIntoView(a);
+        setVVH();
       });
       await KB.addListener("keyboardWillHide", () => {
         kbFromPlugin = false;
         setKeyboardHeight(0, true);
         kbFromPlugin = false;
+        setVVH();
       });
       await KB.addListener("keyboardDidHide", () => {
         kbFromPlugin = false;
         setKeyboardHeight(0, true);
         kbFromPlugin = false;
+        setVVH();
       });
     } catch {
       /* ignore — 回退 visualViewport 估算 */

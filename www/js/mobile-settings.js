@@ -104,6 +104,8 @@
           <label class="settings-label" for="setProvider">服务商</label>
           <select class="settings-input" id="setProvider"></select>
           <p class="settings-hint" id="setProviderHint"></p>
+          <label class="settings-label" for="setModel">模型</label>
+          <select class="settings-input" id="setModel"></select>
           <div id="setFactoryBaseRow" hidden>
             <label class="settings-label" for="setFactoryBase">中转地址</label>
             <input class="settings-input" id="setFactoryBase" type="text" autocomplete="url" spellcheck="false" placeholder="https://relay.你的域名" enterkeyhint="done">
@@ -219,7 +221,78 @@
 
     // 服务商下拉：填充并记住当前项
     const providerSel = document.getElementById("setProvider");
+    const modelSel = document.getElementById("setModel");
     let previousProvider = providerSel?.value || "";
+    let previousModel = modelSel?.value || "";
+
+    function fillModels(models, current) {
+      if (!modelSel) return;
+      modelSel.innerHTML = "";
+      for (const m of models || []) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.label;
+        modelSel.appendChild(opt);
+      }
+      // 当前选中的不在列表里（比如换过模型名）也显示出来，避免下拉闪到别的模型
+      const present = [...modelSel.options].some((o) => o.value === current);
+      if (!present && current) {
+        const opt = document.createElement("option");
+        opt.value = current;
+        opt.textContent = current;
+        modelSel.appendChild(opt);
+      }
+      if (current) modelSel.value = current;
+      previousModel = modelSel.value || "";
+    }
+
+    let modelsGen = 0;
+    async function refreshModels() {
+      const bridge = window.luminaAI;
+      if (!bridge?.providers || !modelSel) return;
+      const gen = ++modelsGen;
+      try {
+        const pv = await bridge.providers();
+        if (gen !== modelsGen) return;
+        const cur = pv?.list?.find((x) => x.id === pv.current);
+        if (!cur) return;
+        fillModels(cur.models, cur.model);
+        // 后台拉一次在线列表，成功就用最新模型刷新下拉（不动用户已选）；
+        // 期间切换过服务商则丢弃旧结果，避免把上一家的模型填进来
+        bridge
+          .listModels?.(cur.id)
+          ?.then((r) => {
+            if (gen !== modelsGen) return;
+            if (r?.ok && r.source === "remote" && document.contains(modelSel)) {
+              // previousModel 跟随用户在等待期间的改选，不能回退到发请求时的旧值
+              fillModels(r.models, previousModel || cur.model);
+            }
+          })
+          .catch(() => {});
+      } catch {
+        /* ignore */
+      }
+    }
+
+    modelSel?.addEventListener("change", async () => {
+      const id = modelSel.value;
+      try {
+        const r = await window.luminaAI?.setModel?.(id);
+        if (r?.ok) {
+          previousModel = id;
+          toast(`模型已切换为 ${id}`);
+          refreshMasks();
+          document.getElementById("chatRecheck")?.click();
+        } else {
+          modelSel.value = previousModel;
+          toast(r?.error || "切换失败");
+        }
+      } catch (err) {
+        modelSel.value = previousModel;
+        toast(err?.message || "切换失败");
+      }
+    });
+
     (async () => {
       try {
         const pv = await window.luminaAI?.providers?.();
@@ -228,11 +301,12 @@
         for (const it of pv.list) {
           const opt = document.createElement("option");
           opt.value = it.id;
-          opt.textContent = `${it.label}（${it.model}）`;
+          opt.textContent = it.label;
           providerSel.appendChild(opt);
         }
         providerSel.value = pv.current;
         previousProvider = pv.current;
+        refreshModels();
       } catch {
         /* ignore */
       }
@@ -246,6 +320,7 @@
           document.getElementById("setApiKey").value = "";
           toast(`已切换为 ${providerSel.options[providerSel.selectedIndex]?.textContent || id}`);
           refreshMasks();
+          refreshModels();
           document.getElementById("chatRecheck")?.click();
         } else {
           providerSel.value = previousProvider;

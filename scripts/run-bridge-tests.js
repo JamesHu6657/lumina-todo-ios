@@ -5305,6 +5305,323 @@ async function main() {
   }
   ok("审查七② 建任务响应丢失后 marker 找回：回执落盘后仍回查标题/清单/状态，改名则按标题重查，回查不确定暂停提交且不新建");
 
+  /* ---- 模型选择：providers 返回模型列表，setModel 按服务商独立持久化 ---- */
+  {
+    const store = makeLocalStorage();
+    const { ai } = loadBridge(store);
+    let pv = await ai.providers();
+    const cc = pv.list.find((x) => x.id === "commandcode");
+    const fx = pv.list.find((x) => x.id === "factory");
+    assert.ok(cc.models.length > 10, "commandcode 应有模型列表");
+    assert.ok(fx.models.length > 10, "factory 应有模型列表");
+    assert.ok(
+      cc.models.some((m) => m.id === "claude-sonnet-5-5"),
+      "列表应包含 Claude"
+    );
+    // 合法 id 允许自定义（不只限于列表），且只作用在当前服务商上
+    assert.equal((await ai.setModel("some-custom-model")).ok, true);
+    pv = await ai.providers();
+    assert.equal(pv.list.find((x) => x.id === "opencode").model, "some-custom-model");
+    assert.equal(pv.list.find((x) => x.id === "factory").model, "deepseek-v4.1-flash");
+    assert.equal((await ai.setModel("bad id with space")).ok, false);
+    ok("providers 返回模型列表，setModel 按服务商独立持久化");
+  }
+
+  /* ---- setModel 持久化 + 请求体带上所选模型 ---- */
+  {
+    const store = makeLocalStorage();
+    let sent = null;
+    const { ai } = loadBridge(store, async (_url, opts) => {
+      sent = { url: _url, body: JSON.parse(opts.body), headers: opts.headers };
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ choices: [{ message: { content: "ok" } }] });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("commandcode").ok, true);
+    assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+    const sm = ai.setModel("deepseek/deepseek-v4-pro");
+    assert.equal(sm.ok, true);
+    const pv = await ai.providers();
+    assert.equal(pv.list.find((x) => x.id === "commandcode").model, "deepseek/deepseek-v4-pro");
+    // 别的服务商的模型不被影响
+    assert.equal(pv.list.find((x) => x.id === "factory").model, "deepseek-v4.1-flash");
+    const result = await ai.complete({ messages: [{ role: "user", content: "hi" }] });
+    assert.equal(result.ok, true);
+    assert.equal(sent.body.model, "deepseek/deepseek-v4-pro");
+    assert.match(sent.url, /\/chat\/completions$/);
+    assert.equal(sent.headers["anthropic-version"], undefined);
+    ok("模型选择持久化且非 Claude 模型走 OpenAI 协议");
+  }
+
+  /* ---- Command Code 的 claude-* 自动走 Anthropic /messages ---- */
+  {
+    const store = makeLocalStorage();
+    let sent = null;
+    const { ai } = loadBridge(store, async (url, opts) => {
+      sent = { url, body: JSON.parse(opts.body), headers: opts.headers };
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({
+            model: "claude-sonnet-5-5",
+            stop_reason: "tool_use",
+            content: [
+              { type: "text", text: "我帮你建待办" },
+              {
+                type: "tool_use",
+                id: "toolu_1",
+                name: "todo_add",
+                input: { title: "买牛奶" },
+              },
+            ],
+          });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("commandcode").ok, true);
+    assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+    assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+    const result = await ai.complete({
+      messages: [
+        { role: "system", content: "SYS" },
+        { role: "user", content: "加个买牛奶" },
+        { role: "assistant", content: "好", tool_calls: [{ id: "t1", type: "function", function: { name: "todo_add", arguments: "{\"title\":\"x\"}" } }] },
+        { role: "tool", tool_call_id: "t1", content: "done" },
+      ],
+      tools: true,
+    });
+    assert.equal(result.ok, true);
+    assert.match(sent.url, /\/messages$/, "claude 应打到 /messages");
+    assert.equal(sent.headers["anthropic-version"], "2023-06-01");
+    assert.equal(sent.headers["x-api-key"].slice(0, 6), "cc-key");
+    assert.equal(sent.body.model, "claude-sonnet-5-5");
+    assert.equal(sent.body.system, "SYS", "system 应置顶为 system 字段");
+    assert.equal(sent.body.messages.length, 3, "system 剔除后剩 3 条");
+    assert.equal(sent.body.messages[1].role, "assistant");
+    assert.equal(sent.body.messages[1].content[1].type, "tool_use");
+    assert.equal(sent.body.messages[2].content[0].type, "tool_result");
+    assert.equal(sent.body.messages[2].content[0].tool_use_id, "t1");
+    assert.equal(sent.body.tool_choice.type, "auto");
+    assert.ok(sent.body.tools.every((t) => t.input_schema && !t.function), "tools 应为 Anthropic input_schema 形");
+    assert.equal(result.message.content, "我帮你建待办");
+    assert.equal(result.message.tool_calls[0].function.name, "todo_add");
+    assert.equal(result.message.tool_calls[0].function.arguments, JSON.stringify({ title: "买牛奶" }));
+    assert.equal(result.finish_reason, "tool_calls");
+    ok("claude-* 走 /messages，请求与响应完成 Anthropic 双向转换");
+  }
+
+  /* ---- Anthropic 流式事件（text_delta/input_json_delta/message_delta）---- */
+  {
+    const store = makeLocalStorage();
+    const encoder = (s) => Buffer.from(s, "utf8");
+    const events = [
+      "data: " + JSON.stringify({ type: "message_start", message: { model: "claude-sonnet-5-5" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "你好" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_stop", index: 0 }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_2", name: "todo_list" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"lim" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "it\":5}" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "content_block_stop", index: 1 }) + "\n\n",
+      "data: " + JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" } }) + "\n\n",
+      "data: " + JSON.stringify({ type: "message_stop" }) + "\n\n",
+    ];
+    let i = 0;
+    const { ai } = loadBridge(store, async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          async read() {
+            if (i >= events.length) return { done: true };
+            return { done: false, value: encoder(events[i++]) };
+          },
+          async cancel() {},
+        }),
+      },
+      async text() {
+        return "{}";
+      },
+    }));
+    assert.equal(ai.setProvider("commandcode").ok, true);
+    assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+    assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+    const done = await new Promise((resolve) => {
+      ai.chat(
+        { messages: [{ role: "user", content: "hi" }], tools: true },
+        { onDone: resolve, onError: (e) => resolve({ error: e }) }
+      );
+    });
+    assert.equal(done.error, undefined);
+    assert.equal(done.content, "你好");
+    assert.equal(done.finish_reason, "tool_calls");
+    assert.equal(done.tool_calls[0].function.name, "todo_list");
+    assert.equal(done.tool_calls[0].function.arguments, "{\"limit\":5}");
+    ok("Anthropic SSE 事件正确翻译为 OpenAI delta");
+  }
+
+  /* ---- Anthropic 协议同样失败关闭：断流 / 截断 / 错误事件 / 残缺 tool_use 都不执行工具 ---- */
+  {
+    const sse = (evts) => evts.map((e) => "data: " + JSON.stringify(e) + "\n\n").join("");
+    const toolStart = { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_9", name: "todo_add" } };
+    const toolArgs = { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"title\":\"x\"}" } };
+    async function runClaudeStream(chunks) {
+      let i = 0;
+      const { ai } = loadBridge(makeLocalStorage(), async () => ({
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            async read() {
+              if (i >= chunks.length) return { done: true };
+              return { done: false, value: Buffer.from(chunks[i++], "utf8") };
+            },
+            async cancel() {},
+          }),
+        },
+        async text() {
+          return "";
+        },
+      }));
+      assert.equal(ai.setProvider("commandcode").ok, true);
+      assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+      assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+      return new Promise((resolve) => {
+        ai.chat(
+          { messages: [{ role: "user", content: "hi" }], tools: true },
+          { onDone: (d) => resolve({ done: d }), onError: (e) => resolve({ error: String(e) }) }
+        );
+      });
+    }
+    // 没有 message_delta / message_stop 就 EOF：断流，工具不得执行
+    let r = await runClaudeStream([sse([toolStart, toolArgs])]);
+    assert.ok(r.error && /意外中断/.test(r.error), JSON.stringify(r));
+    // stop_reason=max_tokens：工具参数可能残缺
+    r = await runClaudeStream([sse([toolStart, toolArgs, { type: "message_delta", delta: { stop_reason: "max_tokens" } }, { type: "message_stop" }])]);
+    assert.ok(r.error && /截断/.test(r.error), JSON.stringify(r));
+    // pause_turn 不等同于正常结束
+    r = await runClaudeStream([sse([toolStart, toolArgs, { type: "message_delta", delta: { stop_reason: "pause_turn" } }, { type: "message_stop" }])]);
+    assert.ok(r.error && /结束状态异常/.test(r.error), JSON.stringify(r));
+    // Anthropic error 事件
+    r = await runClaudeStream([
+      sse([toolStart, toolArgs]) +
+        "event: error\ndata: " + JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }) + "\n\n",
+    ]);
+    assert.ok(r.error && /Overloaded/.test(r.error), JSON.stringify(r));
+    // tool_use 块缺 name
+    r = await runClaudeStream([sse([{ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_x" } }, { type: "message_delta", delta: { stop_reason: "tool_use" } }, { type: "message_stop" }])]);
+    assert.ok(r.error && /格式异常/.test(r.error), JSON.stringify(r));
+    // 参数片段没有 index：无法归属，判协议异常
+    r = await runClaudeStream([sse([toolStart, { type: "content_block_delta", delta: { type: "input_json_delta", partial_json: "{}" } }, { type: "message_delta", delta: { stop_reason: "tool_use" } }, { type: "message_stop" }])]);
+    assert.ok(r.error && /格式异常/.test(r.error), JSON.stringify(r));
+    // 正常结束仍然成功
+    r = await runClaudeStream([sse([toolStart, toolArgs, { type: "message_delta", delta: { stop_reason: "tool_use" } }, { type: "message_stop" }])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(r.done.tool_calls.length, 1);
+    ok("Anthropic 流式与 OpenAI 同一套失败关闭：断流/截断/pause_turn/错误事件/残缺 tool_use 都不执行工具");
+  }
+
+  /* ---- Anthropic 非流式响应同样校验 ---- */
+  {
+    async function runClaudeComplete(payload) {
+      const { ai } = loadBridge(makeLocalStorage(), async () => ({
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify(payload);
+        },
+      }));
+      assert.equal(ai.setProvider("commandcode").ok, true);
+      assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+      assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+      return ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true });
+    }
+    const tool = { type: "tool_use", id: "toolu_1", name: "todo_add", input: { title: "x" } };
+    let r = await runClaudeComplete({ stop_reason: "max_tokens", content: [tool] });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "STREAM_TRUNCATED");
+    r = await runClaudeComplete({ type: "error", error: { type: "api_error", message: "boom" } });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "STREAM_ERROR");
+    r = await runClaudeComplete({ stop_reason: "tool_use", content: [{ type: "tool_use", id: 7, name: "todo_add", input: {} }] });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "STREAM_ERROR");
+    r = await runClaudeComplete({ stop_reason: "tool_use", content: [{ ...tool, input: ["bad"] }] });
+    assert.equal(r.ok, false);
+    r = await runClaudeComplete({ stop_reason: "end_turn", content: "not-an-array" });
+    assert.equal(r.ok, false);
+    r = await runClaudeComplete({ stop_reason: { evil: 1 }, content: [{ type: "text", text: "hi" }] });
+    assert.equal(r.ok, false);
+    r = await runClaudeComplete({ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }] });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.message.content, "hi");
+    assert.equal(r.finish_reason, "stop");
+    ok("Anthropic 非流式：截断/错误体/字段类型异常一律失败关闭，正常回复照常");
+  }
+
+  /* ---- Factory 选模型后仍不发送采样参数 ---- */
+  {
+    const store = makeLocalStorage();
+    store.setItem("lumina-factory-base", "https://relay.example.com");
+    let sent = null;
+    const { ai } = loadBridge(store, async (url, opts) => {
+      sent = { url, body: JSON.parse(opts.body) };
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+        },
+      };
+    });
+    assert.equal(ai.setProvider("factory").ok, true);
+    assert.equal((await ai.setApiKey("relay-token-" + "x".repeat(20))).ok, true);
+    assert.equal(ai.setModel("claude-opus-5").ok, true);
+    const r = await ai.complete({ messages: [{ role: "user", content: "hi" }], temperature: 1, max_tokens: 100 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.match(sent.url, /\/chat\/completions$/, "Factory 中转的 claude-* 仍走 OpenAI 兼容接口");
+    assert.equal(sent.body.model, "claude-opus-5");
+    assert.equal(sent.body.temperature, undefined);
+    assert.equal(sent.body.max_tokens, undefined);
+    ok("Factory 选模型后仍走 /chat/completions 且不发送采样参数");
+  }
+
+  /* ---- listModels：远端列表优先，失败回落内置列表 ---- */
+  {
+    const store = makeLocalStorage();
+    const { ai } = loadBridge(store, async (url) => {
+      assert.match(url, /\/models$/);
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { data: [{ id: "brand-new-model", name: "Brand New" }] };
+        },
+      };
+    });
+    const r = await ai.listModels("commandcode");
+    assert.equal(r.ok, true);
+    assert.equal(r.source, "remote");
+    assert.deepEqual(r.models, [{ id: "brand-new-model", label: "Brand New" }]);
+    const { ai: ai2 } = loadBridge(makeLocalStorage(), async () => {
+      throw new Error("offline");
+    });
+    const r2 = await ai2.listModels("factory");
+    assert.equal(r2.ok, true);
+    assert.equal(r2.source, "static");
+    assert.ok(r2.models.length > 10);
+    ok("listModels 远端成功用远端，失败回落静态列表");
+  }
+
   console.log("\n全部通过：", passed);
 }
 
