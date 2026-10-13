@@ -1614,6 +1614,14 @@ function pruneTombs(list){
   }
 }
 function tombsPayload(){ return tombs.size ? Object.fromEntries(tombs) : undefined; }
+/* 审查十二④：内存墓碑与盘上不同（新增、版本更新、作废）也算待落盘的变化——只合并了墓碑、列表与盘相同时不写，
+   重开页面后墓碑就丢了，迟到的新增快照会复活已删条目。先按 persist 的规则裁剪再比，免得过期墓碑引发无谓写盘 */
+function tombsDifferFrom(p){
+  pruneTombs(todos);
+  const sig = (entries) => JSON.stringify(entries.map(([id, tb]) => [id, tb.rev, tb.by, tb.op, tb.at])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+  return sig([...tombs]) !== sig(payloadTombs(p));
+}
 /* 撤销删除插回的条目：只推一枚戳的 mrev（值归属 by/op/rev 不变），让它比删除墓碑新——否则持有墓碑的页面会再次删掉它 */
 const REVIVE_GROUP = FW_KEYS.indexOf("createdAt");
 function reviveItem(t){
@@ -3070,8 +3078,9 @@ function syncTodosFromDisk(){
     pendingExternal = null;
   }
   const same = JSON.stringify(todos) === before;
-  /* 内存比盘多了编辑：读过最新盘、合并后再写回（persist 的修订号取 max(盘, 已见, 已写)+1，单调） */
-  if (JSON.stringify(todos) !== JSON.stringify(clean)){
+  /* 内存比盘多了编辑：读过最新盘、合并后再写回（persist 的修订号取 max(盘, 已见, 已写)+1，单调）。
+     墓碑同样算：读盘合并、攒着的快照软合并都可能只带来墓碑；恢复写之后 parsed 是重读的盘，墓碑一致不会再写 */
+  if (JSON.stringify(todos) !== JSON.stringify(clean) || tombsDifferFrom(parsed)){
     if (!persist()) return false;   // merged 在内存，内容没丢
     if (!same) mergedFromDirty = true;
   }

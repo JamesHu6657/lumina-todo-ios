@@ -4297,6 +4297,39 @@ async function main() {
   }
   ok("审查十二③ 先合并候选再比较墓碑：较新编辑压过较旧删除（含写盘失败后的恢复窗口），较新删除仍胜出，旧格式缺席即删除不变");
 
+  /* ---- 审查十二④ 仅合并墓碑时也持久化：C 没见过 X；A 新增再删除 X，随后盘被交错写回不含 X、也不含墓碑的旧版。
+     C 收到删除事件只采纳了墓碑、列表与盘相同——墓碑仍须落盘，重开页面后迟到的新增快照不得复活 X ---- */
+  {
+    const ids = (P) => P.invoke("list_todos", {}).todos.map((t) => t.id);
+    const diskTomb = (storage, id) => ((JSON.parse(storage.getItem(TODO_KEY)) || {})._tomb || {})[id];
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const y = A.invoke("add_todo", { text: "Y" }).todo;
+    const C = loadApp({ storage });
+    const s0 = storage.getItem(TODO_KEY);
+    const x = A.invoke("add_todo", { text: "X" }).todo;
+    const addSnap = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("delete_todo", { id: x.id }).ok, true);
+    const delSnap = storage.getItem(TODO_KEY);
+    assert.ok(JSON.parse(delSnap)._tomb[x.id], "前提：删除带墓碑落盘");
+    storage.setItem(TODO_KEY, s0);   // 交错写：盘回到不含 X、不含墓碑的版本
+    C.deliverStorage(TODO_KEY, delSnap);
+    assert.deepEqual(ids(C), [y.id], "前提：C 的列表不变");
+    assert.deepEqual(diskTodos(storage).map((t) => t.id), [y.id], "盘上列表不变");
+    assert.ok(diskTomb(storage, x.id), "只采纳了墓碑也要写盘");
+    /* 墓碑已与盘一致：再读盘不应无谓写盘 */
+    const persisted = storage.getItem(TODO_KEY);
+    A.deliverStorage(TODO_KEY, persisted);
+    assert.equal(storage.getItem(TODO_KEY), persisted, "墓碑与列表都和盘一致时不写盘");
+    /* 重新打开页面：从盘重建状态，再收到迟到的新增快照 */
+    const D = loadApp({ storage });
+    D.deliverStorage(TODO_KEY, addSnap);
+    assert.ok(!ids(D).includes(x.id), "重开页面后迟到的新增快照不得复活 X");
+    assert.ok(!diskTodos(storage).some((t) => t.id === x.id), "盘上不得复活 X");
+    assert.ok(diskTomb(storage, x.id), "墓碑仍在盘上");
+  }
+  ok("审查十二④ 仅合并墓碑时也持久化：列表不变、只采纳新墓碑，重开页面后墓碑仍在，迟到的新增快照不复活任务");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {
