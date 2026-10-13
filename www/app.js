@@ -1464,6 +1464,8 @@ const UNDO_OP_PREFIX = "undo>";
 function undoStamp(restored){
   if (!restored) return makeStamp(TAB_ID, "undo", nextStampRev());
   const st = { ...makeStamp(restored.by, restored.op, nextStampRev()), over: restored.over, cut: restored.cut };
+  /* 撤销也盖 mrev：撤销这一刻已见过的写（含刚撤销的那次）版本都不大于它，迟到快照据此不得再挂回链上 */
+  st.mrev = st.rev;
   if (restored.by !== TAB_ID) st.wby = TAB_ID;
   /* 还原值底下的写入链照带：链上更早的写（含别页的）之后撤销时还要靠它找到自己、露出它盖住的值 */
   return chainStamp(st, 0);
@@ -1677,6 +1679,12 @@ function overRev(st){
   let m = 0;
   for (let o = st && st.over; o && o.st; o = o.st.over) m = Math.max(m, stampVer(o.st));
   return m;
+}
+/* 远端写 rs 能否挂成本地戳 ts 的 over：须比链上每一环都新，也须比 ts 自己的 mrev（撤销/裁剪时盖的版本）新——
+   不比 mrev 新的写在撤销那一刻已被见过并处理掉（撤销或裁出链），旧快照不得把它重新引入 */
+function canAttachOver(ts, rs){
+  const cut = Math.max(overRev(ts), ts && Number.isFinite(ts.mrev) ? ts.mrev : 0);
+  return foreignStamp(rs) && stampVer(rs) > cut;
 }
 /* 远端这组的写是否比本地新：比整条链的最大版本（rev 与 mrev）；平手时盖住对方的一方胜（对方戳就是本方链上那一环），否则偏向远端 */
 function remoteStampWins(ts, rs){
@@ -3095,9 +3103,9 @@ function mergeThreeWay(ours, base, theirs){
       return;
     }
     /* 值不同：本页胜出（策略不变），被盖住的远端值挂在本页戳的 over 上——撤销本页这步时露出它。
-       每次合并都以最新的远端值覆盖 over，远端之后的独立写也会换掉整枚戳，所以它始终是最新的 */
+       比链上已有各环与本页撤销/裁剪版本（mrev）都新的远端写才覆盖 over，远端之后的独立写也会换掉整枚戳，所以它始终是最新的 */
     /* 远端这份是本页自己更早写的（带本页戳的回显）：不是别页的写，不挂 over */
-    if (os && (!ts || foreignStamp(ts))) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
+    if (os && (!ts || canAttachOver(os, ts))) setStamp(out, gi, withMrev(makeStamp(os.by, os.op, os.rev, { v: pickGroup(theirs, g), st: chainStamp(ts, 1) }), os));
   });
   Object.assign(out, mergeSystemFields(ours, theirs));
   const ou = ours.updatedAt || 0, tu = theirs.updatedAt || 0;
@@ -3171,7 +3179,7 @@ function softMergeItem(t, r, plain){
     }
     if (remoteWins){ copyGroup(out, r, gi); tookTheirs = true; return; }
     keptOurs = true;
-    if (!plain && ts && foreignStamp(rs) && stampVer(rs) > overRev(ts)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
+    if (!plain && ts && canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
   });
   const ou = t.updatedAt || 0, tu = r.updatedAt || 0;
   out.updatedAt = tookTheirs && keptOurs ? Math.max(ou, tu) : tookTheirs ? tu : ou;
@@ -3211,7 +3219,7 @@ function keepNewerLocalGroups(clean, local){
       if (!out) out = { ...r };
       copyGroup(out, t, gi);
       keptValue = true;
-      if (foreignStamp(rs) && stampVer(rs) > overRev(ts)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
+      if (canAttachOver(ts, rs)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
     });
     if (keptValue) out.updatedAt = Math.max(t.updatedAt || 0, r.updatedAt || 0);
     return out || r;

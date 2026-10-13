@@ -3967,6 +3967,90 @@ async function main() {
   }
   ok("审查十一② 撤销链裁剪携带单调版本：裁剪前的旧快照不能把已撤销节点装回，后续撤销回到初始值（text / priority / dueDate）");
 
+  /* ---- 审查十二② 撤销版本约束链挂接：
+     (1) A 改 O→a，B 改 a→b（链 b→a），A 撤销把链裁成 b→O；之后 A 改 a 时的旧快照迟到——
+         B 本页、或新页 C 写回盘，都不得把 a 重新挂回链上，B 撤销须回到 O
+     (2) A 改 O→a，B 改 a→b，B 撤销回到 a；之后含已撤销 b 的旧快照迟到——
+         A 本页、或新页 C 写回盘，都不得把 b 挂进链，A 撤销须回到 O ---- */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b"], priority: ["low", "medium", "high"], dueDate: [null, "2030-01-02", "2030-03-04"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    const chainVals = (st) => { const out = []; for (let o = st && st.over; o && o.st; o = o.st.over) out.push(o.v[field] ?? null); return out; };
+    for (const viaC of [false, true]) {
+      const tag = `${field}${viaC ? "（经新页 C 写回盘）" : "（本页）"}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+      const B = loadApp({ storage });
+      const cur = () => diskTodos(storage).find((t) => t.id === x.id)[field] ?? null;
+      const memOf = (P) => P.invoke("list_todos", {}).todos.find((t) => t.id === x.id);
+      assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+      const sA = storage.getItem(TODO_KEY);
+      await settle();
+      /* B 经 D 之后的快照见到 a，而不是 sA 本身：sA 之后迟到时不会被当成已合并的重复投递跳过 */
+      const D = loadApp({ storage });
+      assert.equal(D.invoke("add_todo", { text: "Y" }).ok, true);
+      await settle();
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(B.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+      await settle();
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(A.invoke("undo").ok, true);
+      await settle();
+      assert.equal(cur(), vals[2], `${tag}：(1) 前提：A 撤销保留 B 的写`);
+      assert.deepEqual(chainVals(diskTodos(storage).find((t) => t.id === x.id)._fw[field]), [vals[0]], `${tag}：(1) 前提：链裁成 b→O`);
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      if (viaC) {
+        const C = loadApp({ storage });
+        C.deliverStorage(TODO_KEY, sA);               // 裁掉的 a 那次写的旧快照迟到
+        assert.ok(!chainVals(diskTodos(storage).find((t) => t.id === x.id)._fw[field]).includes(vals[1]), `${tag}：(1) 旧快照不得把已裁掉的 ${vals[1]} 写回盘上链`);
+        B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      } else {
+        B.deliverStorage(TODO_KEY, sA);               // 裁掉的 a 那次写的旧快照迟到
+      }
+      const bm = memOf(B);
+      assert.equal(bm[field] ?? null, vals[2], `${tag}：(1) 旧快照不得盖掉 B 的值`);
+      assert.equal(B.invoke("undo").ok, true);   // 旧快照把 a 挂回 B 的链时，这里会露出 a
+      assert.equal(cur(), vals[0], `${tag}：(1) B 撤销须回到 O，不得恢复已裁掉的 ${vals[1]}`);
+    }
+    for (const viaC of [false, true]) {
+      const tag = `${field}${viaC ? "（经新页 C 写回盘）" : "（本页）"}`;
+      const storage = sharedStorage();
+      const A = loadApp({ storage });
+      const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+      const B = loadApp({ storage });
+      const cur = () => diskTodos(storage).find((t) => t.id === x.id)[field] ?? null;
+      const memOf = (P) => P.invoke("list_todos", {}).todos.find((t) => t.id === x.id);
+      assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+      await settle();
+      B.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      assert.equal(B.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+      const sB = storage.getItem(TODO_KEY);
+      await settle();
+      /* A 不收 sB，直接见到撤销后的盘：sB 之后迟到时不会被当成已合并的重复投递跳过 */
+      assert.equal(B.invoke("undo").ok, true);
+      await settle();
+      assert.equal(cur(), vals[1], `${tag}：(2) 前提：B 撤销回到 ${vals[1]}`);
+      A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      if (viaC) {
+        const C = loadApp({ storage });
+        C.deliverStorage(TODO_KEY, sB);               // 已撤销的 b 那次写的旧快照迟到
+        const dx = diskTodos(storage).find((t) => t.id === x.id);
+        assert.equal(dx[field] ?? null, vals[1], `${tag}：(2) 迟到快照不得复活已撤销的 ${vals[2]}`);
+        assert.ok(!chainVals(dx._fw[field]).includes(vals[2]), `${tag}：(2) 已撤销的 ${vals[2]} 不得写回盘上链`);
+        A.deliverStorage(TODO_KEY, storage.getItem(TODO_KEY));
+      } else {
+        A.deliverStorage(TODO_KEY, sB);               // 已撤销的 b 那次写的旧快照迟到
+      }
+      const am = memOf(A);
+      assert.equal(am[field] ?? null, vals[1], `${tag}：(2) 迟到快照不得复活已撤销的 ${vals[2]}`);
+      assert.equal(A.invoke("undo").ok, true);   // 已撤销的 b 挂进 A 的链时，这里会露出 b
+      assert.equal(cur(), vals[0], `${tag}：(2) A 撤销须回到 O，不得露出已撤销的 ${vals[2]}`);
+    }
+  }
+  ok("审查十二② 撤销/裁剪版本约束链挂接：迟到旧快照不得把已裁掉或已撤销的节点重新挂回链，后续撤销回到初始值（text / priority / dueDate）");
+
   /* ---- 审查十一③ 恢复别页的值保留其操作身份：
      (1) A1 O→a，B1 a→b，A2 b→c；A 撤销 A2 露出 b（仍属 B1），B 撤销 B1 须回到 a，A 再撤销 A1 回到 O
      (2) A 改 O→a，B 改 a→b，B 撤销回到 a（仍属 A 那步），A 撤销须回到 O ---- */
