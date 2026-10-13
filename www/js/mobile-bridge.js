@@ -937,7 +937,11 @@
     return /^\uFEFF?\s*(data|event|id|retry)\s*:|^\uFEFF?\s*:/.test(String(text || "").slice(0, 64));
   }
 
-  function finalizeToolCalls(toolMap) {
+  /**
+   * emptyArgs：一个参数片段都没累计到时的取值。Anthropic 的 tool_use 必有 input（缺省即 {}），
+   * 无参数工具只发 start.input={} 加空片段或不发片段，必须补成 "{}" 才与非流式路径一致。
+   */
+  function finalizeToolCalls(toolMap, emptyArgs = "") {
     return Object.keys(toolMap)
       .map(Number)
       .sort((a, b) => a - b)
@@ -950,7 +954,7 @@
           type: tc.type || "function",
           function: {
             name: tc.function.name,
-            arguments: tc.function?.arguments || "",
+            arguments: tc.function?.arguments || emptyArgs,
           },
         };
       });
@@ -1200,7 +1204,8 @@
         const input = block.input == null ? {} : block.input;
         if (!isPlainObject(input)) throw streamProtocolError("工具参数类型异常");
         const fn = { name: block.name };
-        // 有的网关在 start 里直接给完整 input、不再发 input_json_delta
+        // 有的网关在 start 里直接给完整 input、不再发 input_json_delta。
+        // input 为 {} 时不预填：后续非空片段才是完整参数；一个都没有时由 finalizeToolCalls 补 "{}"
         if (Object.keys(input).length) {
           fn.arguments = JSON.stringify(input);
           state.seededTools.add(evt.index);
@@ -1731,7 +1736,7 @@
           err.code = "STREAM_INCOMPLETE";
           throw err;
         }
-        const tool_calls = finalizeToolCalls(toolMap);
+        const tool_calls = finalizeToolCalls(toolMap, style === "anthropic" ? "{}" : "");
         assertFinishAllowsTools(finishReason, tool_calls);
         if (!finishReason) finishReason = tool_calls.length ? "tool_calls" : "stop";
         return { content, reasoning, tool_calls, finish_reason: finishReason, aborted, timedOut, model: respModel };
@@ -1849,7 +1854,7 @@
       }
     }
 
-    const tool_calls = finalizeToolCalls(toolMap);
+    const tool_calls = finalizeToolCalls(toolMap, style === "anthropic" ? "{}" : "");
     // 用户停止/超时的流本来就不会执行工具（agent-loop 硬闸门）；其余一律校验结束状态
     if (!aborted) assertFinishAllowsTools(finishReason, tool_calls);
     if (!finishReason && !aborted) {

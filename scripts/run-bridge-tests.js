@@ -5601,6 +5601,48 @@ async function main() {
     assert.equal(r.error, undefined, JSON.stringify(r));
     assert.equal(r.done.tool_calls[0].function.arguments, "{\"title\":\"y\"}");
     ok("审查 PR8③ 流式 tool_use 的 start.input 作为初始参数，冲突片段与非对象 input 失败关闭");
+
+    /* 审查 PR8 复审①：无参数工具流式调用的参数为 "{}"，与非流式一致 */
+    const zeroArg = { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_z", name: "get_app_status", input: {} } };
+    const emptyDelta = { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "" } };
+    for (const [label, evts] of [
+      ["start.input={} + 空片段", [zeroArg, emptyDelta, ...end]],
+      ["start.input={} 无片段", [zeroArg, ...end]],
+      ["start 缺 input", [{ ...zeroArg, content_block: { type: "tool_use", id: "toolu_z", name: "get_app_status" } }, ...end]],
+      ["无 content_block_stop", [zeroArg, emptyDelta, ...end.slice(1)]],
+    ]) {
+      r = await runClaudeStream([sse(evts)]);
+      assert.equal(r.error, undefined, label + JSON.stringify(r));
+      assert.equal(r.done.tool_calls.length, 1, label);
+      assert.equal(r.done.tool_calls[0].function.arguments, "{}", label);
+      assert.deepEqual(JSON.parse(r.done.tool_calls[0].function.arguments), {}, label);
+    }
+    // {} 起步后的非空片段是完整参数，不算冲突，也不与 "{}" 拼接
+    r = await runClaudeStream([sse([zeroArg, emptyDelta, { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"a\":" } }, { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "1}" } }, ...end])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(r.done.tool_calls[0].function.arguments, "{\"a\":1}");
+    // 多个调用：无参数的补 "{}"，有参数的不受影响
+    r = await runClaudeStream([sse([zeroArg, { type: "content_block_stop", index: 0 }, { ...toolStart, content_block: { ...toolStart.content_block, input: {} } }, toolArgs, ...end.slice(1)])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.deepEqual(r.done.tool_calls.map((t) => t.function.arguments), ["{}", "{\"title\":\"x\"}"]);
+    // 非流式同一回复同样是 "{}"
+    {
+      const { ai } = loadBridge(makeLocalStorage(), async () => ({
+        ok: true,
+        status: 200,
+        body: null,
+        async text() {
+          return JSON.stringify({ content: [{ type: "tool_use", id: "toolu_z", name: "get_app_status", input: {} }], stop_reason: "tool_use" });
+        },
+      }));
+      assert.equal(ai.setProvider("commandcode").ok, true);
+      assert.equal((await ai.setApiKey("cc-key-" + "x".repeat(20))).ok, true);
+      assert.equal(ai.setModel("claude-sonnet-5-5").ok, true);
+      const c = await ai.complete({ messages: [{ role: "user", content: "hi" }], tools: true });
+      assert.equal(c.ok, true, JSON.stringify(c));
+      assert.equal(c.message.tool_calls[0].function.arguments, "{}");
+    }
+    ok("审查 PR8 复审① 流式无参数工具调用参数为 \"{}\"，{} 起步后的非空片段作为完整参数");
   }
 
   /* ---- Anthropic 非流式响应同样校验 ---- */
