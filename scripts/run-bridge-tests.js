@@ -4713,6 +4713,44 @@ async function main() {
   }
   ok("审查十四④ 写失败窗口内较新远端编辑可胜过本地删除：恢复写把本页已删、远端改过的条目与墓碑比版本，较新的删除仍胜出且撤销删除恢复远端最新版");
 
+  /* ---- 审查十四⑤ snapshotKey 纳入墓碑：C 删除 X（墓碑），B 没见到删除、交错写出同 rev 且仍含 X 的快照并最后落盘。
+     脏页 A 攒下的 combine(sC, sB) 与 sB 同号、同写入页、同列表，只多了 C 的墓碑——不得判成同一份跳过软合并，
+     否则 A 的恢复写把 X 写回盘并抹掉墓碑。B、C 之后都不再处理事件 ---- */
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "X" }).todo;   // 最早新增 → 列表末尾，合成快照的条目顺序与 sB 相同
+    const y = A.invoke("add_todo", { text: "Y" }).todo;
+    const z = A.invoke("add_todo", { text: "Z" }).todo;
+    const B = loadApp({ storage });
+    const C = loadApp({ storage });
+    await sleep(3);
+    const pre = storage.getItem(TODO_KEY);
+    storage.failTodoWrites = true;
+    A.invoke("update_todo", { id: z.id, text: "Z2" });    // A 进入脏窗口
+    storage.failTodoWrites = false;
+    await sleep(3);
+    assert.equal(C.invoke("delete_todo", { id: x.id }).ok, true);
+    const sC = storage.getItem(TODO_KEY);
+    storage.setItem(TODO_KEY, pre);                       // B 读到删除前的盘
+    await sleep(3);
+    assert.equal(B.invoke("update_todo", { id: y.id, text: "Y2" }).ok, true);
+    const sB = storage.getItem(TODO_KEY);
+    assert.equal(JSON.parse(sB).rev, JSON.parse(sC).rev, "前提：两份快照同 rev");
+    A.deliverStorage(TODO_KEY, sC);
+    A.deliverStorage(TODO_KEY, sB);
+    await sleep(3);
+    assert.equal(A.invoke("update_todo", { id: z.id, text: "Z3" }).ok, true);   // 恢复写
+    const d = JSON.parse(storage.getItem(TODO_KEY));
+    assert.ok(!d.todos.some((t) => t.id === x.id), "恢复写不把已删的 X 写回盘");
+    assert.ok(d._tomb && d._tomb[x.id], "盘上保留 C 的墓碑");
+    assert.ok(!A.invoke("list_todos", { status: "all", limit: 50 }).todos.some((t) => t.id === x.id), "A 内存采纳删除");
+    assert.equal(d.todos.find((t) => t.id === y.id).text, "Y2", "B 的编辑保留");
+    assert.equal(d.todos.find((t) => t.id === z.id).text, "Z3", "A 的编辑保留");
+  }
+  ok("审查十四⑤ snapshotKey 纳入墓碑：只多带别页删除的同号合成快照不再被判成与盘相同而跳过，恢复写不复活已删任务");
+
   /* ---- 审查六② 完成回执未能证明落盘时，任何清理都不得清掉唯一的「已确认」记录 ---- */
   for (const mode of ["throw", "silent"]) {
     const mk = () => {

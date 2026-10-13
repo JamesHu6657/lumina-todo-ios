@@ -1738,7 +1738,8 @@ const ALL_GROUPS = USER_FIELD_GROUPS.map((_, gi) => gi);
 function payloadRev(p){ return p && !Array.isArray(p) && Number.isFinite(p.rev) ? p.rev : null; }
 /* 审查十③：全局修订号只是提示，绝不据此整份丢弃快照——两页交错「读-改-写」会写出同号快照，盘上修订号也会回退，
    按号丢弃会吞掉含未合并编辑的那份。只有「同号、同写入页、同内容」（同一份 payload 重复投递）才算已合并而跳过；
-   其余一律逐组按写入戳合并，陈旧内容在戳比较里自然落败 */
+   其余一律逐组按写入戳合并，陈旧内容在戳比较里自然落败。
+   内容含墓碑（_tomb/_tombH）：合成快照可能与盘上那份同号同写入页同列表、只多带别页的删除，不能当成同一份跳过（审查十四⑤） */
 const MERGED_SNAPSHOT_KEEP = 32;
 const mergedSnapshotKeys = [];
 function hashStr(s){
@@ -1749,7 +1750,7 @@ function hashStr(s){
 function snapshotKey(p){
   const r = payloadRev(p);
   if (r == null || !Array.isArray(p.todos)) return null;
-  return r + "\u0000" + (p.writer || "") + "\u0000" + hashStr(JSON.stringify(p.todos));
+  return r + "\u0000" + (p.writer || "") + "\u0000" + hashStr(JSON.stringify([p.todos, p._tomb ?? null, p._tombH ?? null]));
 }
 function sameSnapshot(a, b){ const k = snapshotKey(a); return k != null && k === snapshotKey(b); }
 function isMergedSnapshot(p){ const k = snapshotKey(p); return k != null && mergedSnapshotKeys.includes(k); }
