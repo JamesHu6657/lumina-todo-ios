@@ -1801,7 +1801,8 @@ function restoreFromRemote(s, r){
     const ss = stampOf(s, gi), rs = stampOf(r, gi);
     if (stampEq(ss, rs) && groupEq(s, r, g)) return;
     if (groupEq(s, r, g)){
-      setStamp(out, gi, sameWrite(ss, rs) ? (remoteStampWins(ss, rs) ? rs : ss) : foreignStamp(rs) ? rs : (ss || rs));
+      /* 同值也比完整写入版本：远端同值的旧写不得盖掉本页较新的戳 */
+      setStamp(out, gi, sameWrite(ss, rs) || foreignStamp(rs) ? (remoteStampWins(ss, rs) ? rs : ss) : (ss || rs));
       return;
     }
     if ((!ss && !rs) || stampVer(rs) >= stampVer(ss)){ copyGroup(out, r, gi); tookTheirs = true; return; }
@@ -3088,7 +3089,7 @@ function mergeThreeWay(ours, base, theirs){
     if (groupEq(ours, theirs, g)){
       /* 同值：远端独立写下了它——采用远端戳，撤销本页那步不得把它改回 before（审查九①） */
       if (sameWrite(os, ts)){ if (remoteStampWins(os, ts)) setStamp(out, gi, ts); }   // 同一次写、只差写入链：链版本新者胜
-      else if (foreignStamp(ts)) setStamp(out, gi, ts);
+      else if (foreignStamp(ts)){ if (remoteStampWins(os, ts)) setStamp(out, gi, ts); }   // 同值也比完整写入版本：盘上同值旧写不得盖掉本页较新的戳
       else if (!ts && os) setStamp(out, gi, makeStamp("remote", "unknown", stampRev(os)));   // 远端是无戳旧版：标成「非本页」
       /* ts 是本页自己更早的戳（回显）：没有别页写过，保留本页戳 */
       return;
@@ -3189,21 +3190,30 @@ function softMergeList(local, remote, plain){
   return merged;
 }
 /* 审查十③：采纳盘快照时条目集合跟盘走（删除照常生效），用户字段逐组按写入戳——只有两边都带戳、
-   且本地这组的写更新时才保留本地值，其余取盘。交错覆盖/盘上 rev 回退冲掉的编辑因此不会跟着从内存消失 */
+   且本地这组的写更新时才保留本地值，其余取盘；同值时本地写更新则只保留本地戳。交错覆盖/盘上 rev 回退冲掉的编辑因此不会跟着从内存消失 */
 function keepNewerLocalGroups(clean, local){
   const localMap = new Map(local.map((t) => [t.id, t]));
   return clean.map((r) => {
     const t = localMap.get(r.id);
     if (!t) return r;
-    let out = null;
+    let out = null, keptValue = false;
     USER_FIELD_GROUPS.forEach((g, gi) => {
       const ts = stampOf(t, gi), rs = stampOf(r, gi);
-      if (!ts || !rs || groupEq(t, r, g) || remoteStampWins(ts, rs)) return;
+      if (!ts || stampEq(ts, rs) || remoteStampWins(ts, rs)) return;
+      /* 同值也按完整写入版本比较：盘上是同值的旧写时保留本地较新的戳（撤销戳/写入链），
+         否则之后的迟到快照凭旧戳复活已撤销的值 */
+      if (groupEq(t, r, g)){
+        if (!out) out = { ...r };
+        setStamp(out, gi, ts);
+        return;
+      }
+      if (!rs) return;
       if (!out) out = { ...r };
       copyGroup(out, t, gi);
+      keptValue = true;
       if (foreignStamp(rs) && stampVer(rs) > overRev(ts)) setStamp(out, gi, withMrev(makeStamp(ts.by, ts.op, ts.rev, { v: pickGroup(r, g), st: chainStamp(rs, 1) }), ts));
     });
-    if (out) out.updatedAt = Math.max(t.updatedAt || 0, r.updatedAt || 0);
+    if (keptValue) out.updatedAt = Math.max(t.updatedAt || 0, r.updatedAt || 0);
     return out || r;
   });
 }

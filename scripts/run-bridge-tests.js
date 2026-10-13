@@ -3876,6 +3876,65 @@ async function main() {
   }
   ok("审查十一① 同值旧快照按完整写入版本比较：不回退撤销戳，迟到快照不复活已撤销的值（text / priority / dueDate）");
 
+  /* ---- 审查十二① 同值旧快照真正覆盖磁盘后读盘：A 改 O→a→b 再撤销回 a（新戳）；C 载入撤销后的盘，
+     随后值同为 a 的旧快照真正写到盘上（别页的陈旧写）——C 读盘不得采用旧戳，须保留撤销戳并写回；
+     之后含 b 的迟到快照不得复活已撤销的值 ---- */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b"], priority: ["low", "medium", "high"], dueDate: [null, "2030-01-02", "2030-03-04"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+    if (field !== "text") assert.equal(A.invoke("update_todo", { id: x.id, text: "a" }).ok, true);
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+    const sA = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+    const sB = storage.getItem(TODO_KEY);
+    assert.equal(A.invoke("undo").ok, true);
+    const undone = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(undone[field], vals[1], `${field}：前提：撤销回 ${vals[1]}`);
+    const undoStamp = JSON.stringify(undone._fw[field]);
+    const C = loadApp({ storage });
+    storage.setItem(TODO_KEY, sA);                  // 同值旧快照真正覆盖磁盘
+    assert.notEqual(JSON.stringify(diskTodos(storage).find((t) => t.id === x.id)._fw[field]), undoStamp, `${field}：前提：盘上换成旧戳`);
+    C.deliverStorage(TODO_KEY, sA);
+    assert.equal(JSON.stringify(diskTodos(storage).find((t) => t.id === x.id)._fw[field]), undoStamp, `${field}：读盘同值不得采用旧戳，较新的撤销戳写回盘`);
+    C.deliverStorage(TODO_KEY, sB);                 // 含已撤销值的迟到快照
+    assert.equal(C.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], vals[1], `${field}：迟到快照不得在内存复活已撤销的值`);
+    const dx = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(dx[field], vals[1], `${field}：已撤销的值不得写回盘`);
+    assert.equal(dx._fw[field].rev, JSON.parse(undoStamp).rev, `${field}：撤销戳保留`);
+  }
+  /* 脏窗口恢复路径（三方合并）：B 改 O→a，A 改 a→b，A 撤销回 a（写失败，戳仍归 B、rev 更新）；
+     B 的同值旧快照真正覆盖磁盘，A 恢复写读盘时不得采用旧戳，迟到的 b 快照不得复活 */
+  for (const field of ["text", "priority", "dueDate"]) {
+    const vals = { text: ["O", "a", "b"], priority: ["low", "medium", "high"], dueDate: [null, "2030-01-02", "2030-03-04"] }[field];
+    const param = field === "dueDate" ? "due_date" : field;
+    const storage = sharedStorage();
+    const A = loadApp({ storage });
+    const x = A.invoke("add_todo", { text: "O", priority: "low" }).todo;
+    const B = loadApp({ storage });
+    assert.equal(B.invoke("update_todo", { id: x.id, [param]: vals[1] }).ok, true);
+    const sBa = storage.getItem(TODO_KEY);
+    A.deliverStorage(TODO_KEY, sBa);
+    assert.equal(A.invoke("update_todo", { id: x.id, [param]: vals[2] }).ok, true);
+    const sAb = storage.getItem(TODO_KEY);
+    storage.failTodoWrites = true;
+    assert.equal(A.invoke("undo").ok, true);
+    storage.failTodoWrites = false;
+    storage.setItem(TODO_KEY, sBa);                 // 同值旧快照真正覆盖磁盘
+    A.deliverStorage(TODO_KEY, sBa);
+    assert.equal(A.invoke("add_todo", { text: "Z" }).ok, true);   // 触发恢复写
+    const staleRev = JSON.parse(sBa).todos.find((t) => t.id === x.id)._fw[field].rev;
+    const rec = diskTodos(storage).find((t) => t.id === x.id);
+    assert.equal(rec[field], vals[1], `${field}：前提：恢复写保留撤销后的值`);
+    assert.ok(rec._fw[field].rev > staleRev, `${field}：恢复写同值不得采用旧戳`);
+    A.deliverStorage(TODO_KEY, sAb);                // 含已撤销值的迟到快照
+    assert.equal(A.invoke("list_todos", {}).todos.find((t) => t.id === x.id)[field], vals[1], `${field}：迟到快照不得在内存复活已撤销的值`);
+    assert.equal(diskTodos(storage).find((t) => t.id === x.id)[field], vals[1], `${field}：已撤销的值不得写回盘`);
+  }
+  ok("审查十二① 同值旧快照真正覆盖磁盘后读盘：按完整写入版本保留撤销戳并写回，迟到快照不复活已撤销的值（text / priority / dueDate）");
+
   /* ---- 审查十一② 撤销链裁剪携带单调版本：A 改 O→a，B 改 a→b；A 撤销（保留 b，把 B 链上 a 那环裁成 O）；
      C 载入裁剪后的盘，再收到裁剪前的 B 快照——旧链不得把 a 装回，B 撤销须回到 O ---- */
   for (const field of ["text", "priority", "dueDate"]) {
