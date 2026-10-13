@@ -1189,20 +1189,28 @@
    * 大小上限照常生效）。message_stop 等价于 [DONE]；字段类型不对一律协议异常。
    * 返回 null 表示与本客户端无关的事件（message_start / content_block_stop / ping / 新增类型）。
    */
-  function anthropicEventDelta(evt) {
+  function anthropicEventDelta(evt, state = { seededTools: new Set() }) {
     if (evt.type === "message_stop") return ANTHROPIC_STREAM_END;
     if (evt.type === "content_block_start") {
       const block = evt.content_block;
       if (!isPlainObject(block)) throw streamProtocolError("content_block 结构异常");
       if (block.type === "tool_use") {
         assertToolUseBlock(block);
+        const input = block.input == null ? {} : block.input;
+        if (!isPlainObject(input)) throw streamProtocolError("工具参数类型异常");
+        const fn = { name: block.name };
+        // 有的网关在 start 里直接给完整 input、不再发 input_json_delta
+        if (Object.keys(input).length) {
+          fn.arguments = JSON.stringify(input);
+          state.seededTools.add(evt.index);
+        }
         return {
           delta: {
             tool_calls: [{
               index: evt.index,
               id: block.id,
               type: "function",
-              function: { name: block.name },
+              function: fn,
             }],
           },
         };
@@ -1227,6 +1235,10 @@
         return { delta: { reasoning_content: d.thinking } };
       }
       if (d.type === "input_json_delta") {
+        // start 已给完整参数时再来非空片段，拼接只会得到两份 JSON：判冲突、失败关闭
+        if (state.seededTools.has(evt.index) && d.partial_json !== "") {
+          throw streamProtocolError("工具参数与 content_block_start.input 冲突");
+        }
         // 没有 index 的参数片段无法归属到具体调用：validateToolDelta 会判协议异常
         return {
           delta: {
@@ -1511,6 +1523,7 @@
     let streamChars = 0;
     // 服务端声明的实际模型（Factory 中转回包里的 model 即实际运行的 droid 模型）
     let respModel = "";
+    const anthropicState = { seededTools: new Set() };
     const noteModel = (m) => {
       if (!respModel && typeof m === "string" && MODEL_ID_RE.test(m)) respModel = m;
     };
@@ -1641,7 +1654,7 @@
       noteModel(json.type === "message_start" && isPlainObject(json.message) ? json.message.model : json.model);
       if (style === "anthropic") {
         try {
-          const ev = anthropicEventDelta(json);
+          const ev = anthropicEventDelta(json, anthropicState);
           if (ev === ANTHROPIC_STREAM_END) {
             parser.done = true;
             return;

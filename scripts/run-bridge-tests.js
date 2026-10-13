@@ -5578,6 +5578,29 @@ async function main() {
     assert.equal(r.error, undefined, JSON.stringify(r));
     assert.equal(r.done.tool_calls.length, 1);
     ok("Anthropic 流式与 OpenAI 同一套失败关闭：断流/截断/pause_turn/错误事件/残缺 tool_use 都不执行工具");
+
+    /* 审查 PR8③：content_block_start.input 非空时作为初始参数，冲突片段失败关闭 */
+    const seeded = { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "todo_add", input: { title: "买牛奶" } } };
+    const end = [{ type: "content_block_stop", index: 0 }, { type: "message_delta", delta: { stop_reason: "tool_use" } }, { type: "message_stop" }];
+    r = await runClaudeStream([sse([seeded, ...end])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(r.done.tool_calls.length, 1);
+    assert.equal(r.done.tool_calls[0].function.arguments, JSON.stringify({ title: "买牛奶" }));
+    // 空片段不算冲突
+    r = await runClaudeStream([sse([seeded, { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "" } }, ...end])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(r.done.tool_calls[0].function.arguments, JSON.stringify({ title: "买牛奶" }));
+    // 已有完整参数还来非空片段：冲突
+    r = await runClaudeStream([sse([seeded, { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"title\":\"x\"}" } }, ...end])]);
+    assert.ok(r.error && /格式异常/.test(r.error), JSON.stringify(r));
+    // input 不是对象：失败关闭
+    r = await runClaudeStream([sse([{ ...seeded, content_block: { ...seeded.content_block, input: ["bad"] } }, ...end])]);
+    assert.ok(r.error && /格式异常/.test(r.error), JSON.stringify(r));
+    // 常规形态：start 带空 input，参数靠片段拼出
+    r = await runClaudeStream([sse([{ ...seeded, content_block: { ...seeded.content_block, input: {} } }, { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"title\":\"y\"}" } }, ...end])]);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(r.done.tool_calls[0].function.arguments, "{\"title\":\"y\"}");
+    ok("审查 PR8③ 流式 tool_use 的 start.input 作为初始参数，冲突片段与非对象 input 失败关闭");
   }
 
   /* ---- Anthropic 非流式响应同样校验 ---- */
