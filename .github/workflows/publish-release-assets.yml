@@ -1,0 +1,36 @@
+# 手动把某次 Build Unsigned IPA 运行的产物附加到已有 Release。
+name: Publish IPA to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build Unsigned IPA 的运行 ID"
+        required: true
+      tag:
+        description: "目标 Release 的 tag（如 v1.0.8）"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n App-unsigned-ipa -D out
+          ls -l out
+          cd out && sha256sum App-unsigned.ipa > App-unsigned.ipa.sha256 && cat App-unsigned.ipa.sha256
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ inputs.tag }}" out/App-unsigned.ipa out/App-unsigned.ipa.sha256 -R "${{ github.repository }}" --clobber
